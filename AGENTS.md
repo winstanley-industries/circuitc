@@ -5,8 +5,9 @@ This file governs work throughout the repository.
 ## Read before changing code
 
 1. Read `docs/architecture.md`.
-2. Read the accepted decisions under `docs/adr/` that touch the change.
-3. Read the versioned schema contract under `schemas/` before changing an IR.
+2. Read the active or planned epic under `docs/epics/` that owns the outcome.
+3. Read the accepted decisions under `docs/adr/` that touch the change.
+4. Read the versioned schema contract under `schemas/` before changing an IR.
 
 Record intentional changes to compiler boundaries, authority, determinism, or
 backend ownership in an ADR or the architecture document. Do not let an

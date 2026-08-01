@@ -16,8 +16,10 @@ Rust simulation library, while APGAR remains a C++/CUDA routing library behind
 a versioned Board IR boundary. Bazel is the only supported build interface, so
 the repository does not carry a competing Cargo workspace.
 
-See [the architecture](docs/architecture.md) and
-[ADR-0001](docs/adr/0001-rust-bazel-compiler-core.md) for the full rationale.
+See [the architecture](docs/architecture.md), [the epic
+roadmap](docs/epics/README.md), and
+[ADR-0001](docs/adr/0001-rust-bazel-compiler-core.md) for the rationale and
+planned outcomes.
 
 ## Build and test
 

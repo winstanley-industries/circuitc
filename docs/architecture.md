@@ -182,6 +182,11 @@ available, and their findings are mapped back to CircuitC identities.
 
 ## 9. Milestones
 
+Durable requirements, dependencies, vertical outcomes, and completion evidence
+for these milestones are tracked in the [epic index](epics/README.md). The
+architecture remains authoritative for system boundaries; epics may not
+silently redefine them.
+
 ### M0: executable architecture spine
 
 - Rust/Bazel compiler library;
