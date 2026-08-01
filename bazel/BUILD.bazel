@@ -1,0 +1,9 @@
+load("@rules_python//python:py_library.bzl", "py_library")
+
+package(default_visibility = ["//visibility:private"])
+
+py_library(
+    name = "package",
+    srcs = ["__init__.py"],
+    visibility = ["//bazel/lint:__pkg__"],
+)

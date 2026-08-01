@@ -7,7 +7,6 @@ import pathlib
 import sys
 from typing import Any
 
-
 DRC_SCHEMA = "https://schemas.kicad.org/drc.v1.json"
 LIBRARY_WARNING_DESCRIPTION = (
     "The current configuration does not include the footprint library 'CircuitC'"
@@ -30,11 +29,7 @@ def _canonical_items(items: list[Any]) -> list[dict[str, Any]]:
     for item in items:
         if not isinstance(item, dict) or not isinstance(item.get("description"), str):
             raise ValidationError("every KiCad violation item must have a description")
-        normalized_item = {
-            key: value
-            for key, value in item.items()
-            if key not in {"path", "file"}
-        }
+        normalized_item = {key: value for key, value in item.items() if key not in {"path", "file"}}
         normalized.append(normalized_item)
     return sorted(
         normalized,
@@ -65,9 +60,7 @@ def normalize(
         raise ValidationError(f"KiCad reported {len(unconnected)} unconnected item(s)")
     schematic_parity = _require_list(report, "schematic_parity")
     if schematic_parity:
-        raise ValidationError(
-            f"KiCad reported {len(schematic_parity)} schematic parity issue(s)"
-        )
+        raise ValidationError(f"KiCad reported {len(schematic_parity)} schematic parity issue(s)")
 
     normalized_violations = []
     observed_library_references = []
@@ -138,9 +131,7 @@ def normalize(
         "unconnected_items": [],
         "violations": sorted(
             normalized_violations,
-            key=lambda value: json.dumps(
-                value, sort_keys=True, separators=(",", ":")
-            ),
+            key=lambda value: json.dumps(value, sort_keys=True, separators=(",", ":")),
         ),
     }
 
@@ -158,9 +149,7 @@ def main() -> int:
             report = json.load(source)
         if not isinstance(report, dict):
             raise ValidationError("KiCad DRC report root must be an object")
-        normalized = normalize(
-            report, args.expected_major, args.allow_library_warning
-        )
+        normalized = normalize(report, args.expected_major, args.allow_library_warning)
     except (OSError, json.JSONDecodeError, ValidationError) as error:
         print(f"CircuitC KiCad validation failed: {error}", file=sys.stderr)
         return 1

@@ -80,12 +80,12 @@ sh_test(
         "$(location :frontend_equivalence)",
     ],
     data = [
-        ":frontend_equivalence",
-        ":voltage_divider",
-        "//cmd/circuitc",
         "examples/voltage_divider.circuitc",
         "tools/frontend/fixtures/duplicate_net.circuitc",
         "tools/frontend/fixtures/duplicate_net.json",
+        ":frontend_equivalence",
+        ":voltage_divider",
+        "//cmd/circuitc",
     ],
 )
 
@@ -116,10 +116,10 @@ sh_test(
         "$(location examples/voltage_divider.circuitc)",
     ],
     data = [
-        ":voltage_divider",
-        "//cmd/circuitc",
         "examples/voltage_divider.circuitc",
         "tools/kicad/normalize_drc.py",
+        ":voltage_divider",
+        "//cmd/circuitc",
     ],
     tags = [
         "local",

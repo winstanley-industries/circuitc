@@ -25,11 +25,25 @@ planned outcomes.
 ## Build and test
 
 ```sh
+bazel lint //...
 bazel build //...
 bazel test //...
 bazel test --lockfile_mode=error //...
 bazel mod graph --lockfile_mode=error
 ```
+
+`bazel lint` is provided by the repository's Bazelisk wrapper and runs the
+Bazel-pinned rustfmt, Clippy, Buildifier, Ruff, and ShellCheck gates. Use
+`bazel lint --fix` to apply supported formatters, or select one check while
+iterating, for example `bazel lint --only clippy` or
+`bazel lint --only buildifier`.
+
+GitHub Actions runs these gates on Linux for pull requests, merge queues, and
+pushes to `main`. After the Linux gate passes on a same-repository pull request,
+Claude Code performs an architecture-aware review and requires one fresh formal
+verdict for that exact PR head. The review job uses the
+`CLAUDE_CODE_OAUTH_TOKEN` Actions secret; fork and Dependabot pull requests do
+not consume the token.
 
 Compile the reference source design:
 

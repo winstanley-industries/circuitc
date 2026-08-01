@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly REPO_ROOT
+
+if [[ -z "${BAZEL_REAL:-}" ]]; then
+  echo "CircuitC's Bazel wrapper must be launched through Bazelisk." >&2
+  echo "Install Bazelisk, then run: bazel ${*:-help}" >&2
+  exit 2
+fi
+
+if [[ "${1:-}" == "lint" ]]; then
+  shift
+  exec "${BAZEL_REAL}" run \
+    --run_env="CIRCUITC_BAZEL_REAL=${BAZEL_REAL}" \
+    --run_env="CIRCUITC_REPO_ROOT=${REPO_ROOT}" \
+    //bazel/lint:lint -- "$@"
+fi
+
+exec "${BAZEL_REAL}" "$@"
