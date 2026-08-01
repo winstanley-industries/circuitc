@@ -41,9 +41,23 @@ jobs:
       - name: Verify complete module graph lock
         run: bazel mod graph --lockfile_mode=error
 
+  zizmor:
+    name: zizmor (workflow security)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Run zizmor
+        run: pipx run zizmor==1.25.2 --persona=regular .github/workflows/
+        env:
+          GH_TOKEN: ${{ github.token }}
+
   pr-review:
     name: Claude Code review
-    needs: [linux]
+    needs: [linux, zizmor]
     if: >-
       ${{ always() && github.event_name == 'pull_request' &&
           github.event.pull_request.head.repo.full_name == github.repository }}
@@ -60,18 +74,19 @@ jobs:
       - name: Gate review on CI result
         id: gate
         env:
-          CI_RESULT: ${{ needs.linux.result }}
+          LINUX_RESULT: ${{ needs.linux.result }}
+          ZIZMOR_RESULT: ${{ needs.zizmor.result }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         run: |
           if [ "$PR_AUTHOR" = "dependabot[bot]" ]; then
             echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "Dependabot-authored PR; the Linux CI gate is sufficient."
-          elif [ "$CI_RESULT" = success ]; then
+            echo "Dependabot-authored PR; the Linux and zizmor CI gates are sufficient."
+          elif [ "$LINUX_RESULT" = success ] && [ "$ZIZMOR_RESULT" = success ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
-            echo "Linux CI passed; running Claude Code review."
+            echo "Linux and zizmor CI passed; running Claude Code review."
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "Linux CI did not pass (result=$CI_RESULT); skipping token-backed review."
+            echo "CI did not pass (linux=$LINUX_RESULT zizmor=$ZIZMOR_RESULT); skipping token-backed review."
           fi
 
       - name: Check out repository
