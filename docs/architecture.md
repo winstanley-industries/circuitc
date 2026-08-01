@@ -1,0 +1,250 @@
+# CircuitC Architecture
+
+## 1. Purpose
+
+CircuitC is a headless compiler for electronic systems. One source model should
+be able to express and check:
+
+- hierarchical electrical intent and connectivity;
+- exact part identity, pins, symbols, footprints, and models;
+- dimensional values, tolerances, assertions, and selection constraints;
+- simulation analyses and acceptance criteria;
+- board stack-up, outline, placement, geometry, and route constraints; and
+- generated schematic, layout, routing, reports, and manufacturing artifacts.
+
+KiCad 10 is the first EDA output. CircuitC is not a KiCad plugin and does not
+require a running editor. KiCad remains a host validator and a useful viewer of
+generated artifacts, but it is not the source of truth.
+
+## 2. Architectural thesis
+
+CircuitC is a compiler and orchestrator, not a new monolithic EDA kernel.
+Electrical intent, physical geometry, and simulation are related views with
+different correctness domains. They share stable identity and connectivity,
+but they do not share one catch-all object model.
+
+```text
+CircuitC source or API
+        |
+        v
+parse -> resolve -> elaborate -> solve/check constraints
+        |
+        v
+Canonical Design IR (identity, hierarchy, parts, pins, nets, intent)
+        |
+        +--> KiCad view ------> .kicad_sch / .kicad_pcb -> KiCad ERC/DRC
+        |
+        +--> Simulation view -> SPICE / Ohmnivore ------> assertions/results
+        |
+        +--> Physical view ---> APGAR Board IR ---------> validated routes
+        |
+        +--> Product view ----> BOM / assembly / manufacturing outputs
+```
+
+The arrows are explicit lowering passes. A backend may reject semantics it
+cannot represent; it may not silently discard or reinterpret them.
+
+## 3. Authority and ownership
+
+1. CircuitC source is the human-authored authority.
+2. The canonical Design IR is the compiler authority for one elaborated build.
+3. Specialized backend IRs are disposable, versioned compiled artifacts.
+4. KiCad files, SPICE files, and CircuitC-normalized reports are deterministic
+   build outputs. Raw host-tool reports are ephemeral validation evidence and
+   may contain timestamps, absolute paths, or other host metadata.
+5. KiCad ERC/DRC is authoritative for whether the KiCad output is accepted by
+   the supported host version.
+6. Ohmnivore or another selected simulator is authoritative for its numerical
+   result, while CircuitC owns model mapping and assertion semantics.
+7. APGAR owns route search and exact routing validation within its declared
+   rule subset. KiCad DRC still gates committed KiCad routes.
+
+Edits made only to generated KiCad files are not round-tripped. Code-authored
+placement and routing belong in CircuitC source. A future importer may help
+transcribe an existing project, but import is an adapter, not a second source
+of truth.
+
+## 4. Canonical Design IR
+
+The Design IR contains concepts common to all useful views:
+
+- source-stable identity and source spans;
+- module and instance hierarchy;
+- typed interfaces, ports, pins, and nets;
+- exact dimensional quantities, ranges, and tolerances;
+- explicit part, symbol, footprint, and simulation-model bindings;
+- assertions with proof status rather than unchecked annotations; and
+- physical and simulation intent attached through typed extensions.
+
+It deliberately does not embed:
+
+- KiCad s-expression nodes or editor object pointers;
+- APGAR C++ object layouts, compiled fields, or GPU handles;
+- Ohmnivore MNA matrices or solver descriptors; or
+- floating-point PCB coordinates.
+
+Version 1 of the unreleased bootstrap contract is documented in
+`schemas/design_ir/v1.md`. Until the first schema release, the Design IR and
+pre-language Rust construction API evolve in place without version bumps,
+backwards-compatibility guarantees, or migrations. Semantic changes are still
+recorded in the schema and ADRs.
+
+## 5. Exactness and determinism
+
+- Board coordinates use signed integer nanometres. KiCad's documented
+  six-decimal-place millimetre resolution is therefore represented exactly.
+- APGAR lowering multiplies nanometres by two for its current 2,000,000
+  database-units-per-millimetre contract, with checked arithmetic.
+- Electrical quantities are signed decimal coefficients plus a base-ten
+  exponent and physical dimension. A simulator converts them to floating
+  point only at its adapter boundary.
+- Entity identity is stable across identical builds. The bootstrap derives
+  RFC 9562 UUIDv8 identifiers from the design namespace and typed,
+  length-delimited semantic identity fields. The source language will also
+  support explicit identities for rename-stable objects. Backends check global
+  emitted-identity uniqueness before writing artifacts.
+- Output order is canonical. Wall-clock time, random UUIDs, absolute paths,
+  network lookups, and hash-map iteration order may not affect artifacts.
+
+## 6. Component integrations
+
+### 6.1 KiCad
+
+CircuitC writes documented s-expression files and identifies itself as the
+generator. The first slice emits a KiCad 10 PCB. Schematic emission, project
+configuration, symbol libraries, and footprint ingestion are the next backend
+milestone.
+
+Every backend integration test has three levels:
+
+1. CircuitC structural and golden tests;
+2. repeat-build byte comparison; and
+3. host parsing plus structured `kicad-cli` ERC or DRC output.
+
+Host validation is entered through Bazel even though the installed KiCad host
+is necessarily platform-local. CircuitC parses the raw report, enforces an
+explicit finding policy, and emits a normalized deterministic summary. A
+successful `kicad-cli` exit status alone is not acceptance evidence.
+
+The KiCad IPC API is not the primary headless boundary for versions 9 and 10
+because it requires a running GUI. It may later support interactive preview or
+transactional host validation without entering the compiler core.
+
+### 6.2 Ohmnivore
+
+Ohmnivore currently exposes a Rust SPICE parser, circuit IR, compiler, and
+analysis functions. CircuitC first integrates through deterministic SPICE plus
+result files. This keeps the contract differential-testable against ngspice
+and avoids making Ohmnivore's solver-oriented IR canonical.
+
+Once the model and result schemas settle, CircuitC may call Ohmnivore as a
+Bazel Rust dependency. Model coverage and numerical tolerances remain explicit
+capabilities; unsupported devices are compile errors, not approximate
+substitutions.
+
+CircuitC net and component identities are not constrained to SPICE's token or
+case rules. The SPICE lowering owns a deterministic, injective name map,
+reserves simulator ground aliases, and exposes the reversible mapping needed
+to associate results with canonical Design IR identities.
+
+### 6.3 APGAR
+
+APGAR remains a C++/CUDA Bazel library with a CAD-neutral, exact Board IR.
+CircuitC lowers placed physical connectivity and rules into a versioned APGAR
+request, then imports immutable route candidates or selected routes.
+
+The initial boundary should be a checksummed serialized request/result and a
+process-level integration test. An in-process C ABI or `cxx` bridge is only
+worth adding after the schema stabilizes. APGAR's exact validation and KiCad
+DRC both gate a route; neither is bypassed for convenience.
+
+## 7. Parts and libraries
+
+Production builds are offline and hermetic:
+
+- symbols, footprints, 3D models, and simulation models are vendored or fetched
+  through checksum-pinned Bazel repositories;
+- a part binds manufacturer and part number separately from logical device
+  type;
+- pin-to-pad, pin-to-symbol, and pin-to-model mappings are explicit and
+  validated; and
+- remote catalog search may assist authoring but can never be required to
+  rebuild a committed design.
+
+This directly avoids hosted-backend availability becoming a build dependency.
+
+## 8. Compiler diagnostics
+
+Diagnostics carry a stable code, semantic path, message, and eventually a
+source span plus related locations. Unsupported capability is a first-class
+diagnostic category. Backend tools are invoked with structured output where
+available, and their findings are mapped back to CircuitC identities.
+
+## 9. Milestones
+
+### M0: executable architecture spine
+
+- Rust/Bazel compiler library;
+- validated Design IR v1 subset;
+- exact quantities and coordinates;
+- deterministic KiCad 10 PCB and SPICE emitters;
+- code-authored voltage-divider fixture; and
+- Bazel format, lint, build, and unit-test gates.
+
+### M0.1: compiler-boundary closure
+
+- total Design IR validation over public bootstrap values;
+- explicit route identity and logical-pin-to-pad bindings;
+- injective KiCad UUID and SPICE name lowering;
+- Bazel-owned KiCad 10 DRC policy with normalized evidence; and
+- complete strict Bazel module-lock validation.
+
+### M1A: file-authored design through existing backends
+
+- a minimal declarative CircuitC language with source spans;
+- stable machine-readable parser and elaboration diagnostics;
+- a headless compile CLI;
+- lowering of the voltage-divider source fixture through the existing Design
+  IR, KiCad PCB, and SPICE backends; and
+- source-order and process-level deterministic golden tests.
+
+### M1B: useful KiCad project compiler
+
+- hierarchy, typed interfaces, explicit no-connects, and electrical pin types;
+- vendored KiCad symbol and footprint ingestion;
+- deterministic `.kicad_sch`, `.kicad_pcb`, and project emission;
+- placement and route syntax; and
+- clean-checkout KiCad ERC/DRC integration tests.
+
+### M2: simulation as a checked compiler phase
+
+- simulation model binding and capability checking;
+- DC, AC, and transient analysis declarations;
+- Ohmnivore execution through Bazel;
+- ngspice differential fixtures for overlapping device coverage; and
+- assertions that fail the build on numerical or model-coverage violations.
+
+### M3: routing integration
+
+- physical-design lowering to APGAR's exact Board IR;
+- versioned request, route, provenance, and replay schemas;
+- selected-route import into KiCad output;
+- APGAR exact validation followed by KiCad DRC; and
+- deterministic CPU reference fixtures before GPU performance work.
+
+### M4: product and manufacturing closure
+
+- part selection constraints and lifecycle data;
+- variants, BOM, placement, fabrication, and assembly outputs;
+- board-level signal/power analysis adapters; and
+- reproducible release manifests tying every artifact to source and toolchain
+  identities.
+
+## 10. Immediate non-goals
+
+- a CircuitC GUI;
+- a general-purpose constraint solver before the language and IR are proven;
+- silently preserving arbitrary manual edits in generated KiCad files;
+- rewriting APGAR or Ohmnivore inside this repository; and
+- claiming production schematic, DRC, routing, or simulator coverage from the
+  M0 fixture.

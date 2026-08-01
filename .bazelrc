@@ -1,0 +1,4 @@
+test --test_output=errors
+
+build:debug --compilation_mode=dbg
+build:release --compilation_mode=opt

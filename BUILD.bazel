@@ -1,0 +1,89 @@
+load(
+    "@rules_rust//rust:defs.bzl",
+    "rust_binary",
+    "rust_clippy",
+    "rust_library",
+    "rust_test",
+    "rustfmt_test",
+)
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+package(default_visibility = ["//visibility:private"])
+
+RUSTC_FLAGS = ["-Dwarnings"]
+
+rust_library(
+    name = "circuitc",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "circuitc",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    rustc_flags = RUSTC_FLAGS,
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "circuitc_test",
+    crate = ":circuitc",
+    rustc_flags = RUSTC_FLAGS,
+)
+
+rust_binary(
+    name = "voltage_divider",
+    srcs = ["examples/voltage_divider.rs"],
+    crate_name = "voltage_divider",
+    edition = "2024",
+    rustc_flags = RUSTC_FLAGS,
+    deps = [":circuitc"],
+)
+
+rustfmt_test(
+    name = "rustfmt_test",
+    targets = [
+        ":circuitc",
+        ":voltage_divider",
+    ],
+)
+
+rust_clippy(
+    name = "clippy",
+    testonly = True,
+    deps = [
+        ":circuitc",
+        ":voltage_divider",
+    ],
+)
+
+sh_test(
+    name = "kicad_report_normalizer_test",
+    srcs = ["tools/kicad/normalize_drc_test.sh"],
+    args = [
+        "$(location tools/kicad/normalize_drc.py)",
+        "$(location tools/kicad/fixtures/drc-first.json)",
+        "$(location tools/kicad/fixtures/drc-second.json)",
+        "$(location tools/kicad/fixtures/drc-unexpected.json)",
+    ],
+    data = [
+        "tools/kicad/fixtures/drc-first.json",
+        "tools/kicad/fixtures/drc-second.json",
+        "tools/kicad/fixtures/drc-unexpected.json",
+        "tools/kicad/normalize_drc.py",
+    ],
+)
+
+sh_test(
+    name = "kicad10_drc_test",
+    srcs = ["tools/kicad/kicad10_drc_test.sh"],
+    args = [
+        "$(location :voltage_divider)",
+        "$(location tools/kicad/normalize_drc.py)",
+    ],
+    data = [
+        ":voltage_divider",
+        "tools/kicad/normalize_drc.py",
+    ],
+    tags = [
+        "local",
+        "manual",
+    ],
+)
