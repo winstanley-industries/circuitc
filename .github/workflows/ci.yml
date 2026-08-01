@@ -1,0 +1,208 @@
+name: CI
+
+on:
+  merge_group:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux
+    runs-on: ${{ vars.CIRCUITC_LINUX_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Configure Bazel
+        uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # v0.19.0
+        with:
+          bazelisk-cache: true
+          cache-save: ${{ github.event_name != 'pull_request' }}
+          disk-cache: ${{ github.workflow }}-${{ runner.os }}-${{ runner.arch }}
+          repository-cache: true
+      - name: Lint and static analysis
+        run: bazel lint //...
+      - name: Build
+        run: bazel build --lockfile_mode=error //...
+      - name: Test
+        run: bazel test --lockfile_mode=error //...
+      - name: Verify complete module graph lock
+        run: bazel mod graph --lockfile_mode=error
+
+  pr-review:
+    name: Claude Code review
+    needs: [linux]
+    if: >-
+      ${{ always() && github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency:
+      group: claude-pr-review-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    steps:
+      - name: Gate review on CI result
+        id: gate
+        env:
+          CI_RESULT: ${{ needs.linux.result }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          if [ "$PR_AUTHOR" = "dependabot[bot]" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Dependabot-authored PR; the Linux CI gate is sufficient."
+          elif [ "$CI_RESULT" = success ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "Linux CI passed; running Claude Code review."
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Linux CI did not pass (result=$CI_RESULT); skipping token-backed review."
+          fi
+
+      - name: Check out repository
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Prepare immutable review context
+        if: steps.gate.outputs.run == 'true'
+        id: review_context
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          metadata_file="$RUNNER_TEMP/claude-pr-review-metadata.json"
+          diff_file="$RUNNER_TEMP/claude-pr-review.diff"
+          baseline_file="$RUNNER_TEMP/claude-pr-review-baseline.json"
+
+          head_before=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq '.headRefOid')
+          gh pr view "$PR" --repo "$REPO" \
+            --json number,title,body,state,isDraft,url,baseRefName,headRefName,headRefOid,author \
+            > "$metadata_file"
+          gh pr diff "$PR" --repo "$REPO" --color=never > "$diff_file"
+          gh api --paginate "repos/$REPO/pulls/$PR/reviews?per_page=100" \
+            | jq -s 'if length == 1 and (.[0] | type) == "array" then .[0] else add end' \
+            > "$baseline_file"
+          head_after=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq '.headRefOid')
+
+          if [ "$head_before" != "$head_after" ]; then
+            echo "::error::PR head changed while review context was captured; rerun on the new head."
+            exit 1
+          fi
+
+          echo "head_sha=$head_before" >> "$GITHUB_OUTPUT"
+          echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          echo "metadata_file=$metadata_file" >> "$GITHUB_OUTPUT"
+          echo "diff_file=$diff_file" >> "$GITHUB_OUTPUT"
+          echo "baseline_file=$baseline_file" >> "$GITHUB_OUTPUT"
+
+      - name: Run Claude Code review
+        if: steps.gate.outputs.run == 'true'
+        uses: anthropics/claude-code-action@e90deca47693f9457b72f2b53c17d7c445a87342 # v1.0.171
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: >-
+            /pr-review ${{ github.event.pull_request.html_url }} --comment
+            --metadata ${{ steps.review_context.outputs.metadata_file }}
+            --diff ${{ steps.review_context.outputs.diff_file }}
+          settings: |
+            {
+              "env": {
+                "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"
+              }
+            }
+          claude_args: |
+            --allowedTools "Agent,Read,Grep,Glob,mcp__github_inline_comment__create_inline_comment,Bash(gh pr review:*)"
+            --model "claude-opus-4-8"
+
+      - name: Gate on fresh Claude verdict
+        if: ${{ always() && steps.gate.outputs.run == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          EXPECTED_HEAD: ${{ steps.review_context.outputs.head_sha }}
+          REVIEW_STARTED_AT: ${{ steps.review_context.outputs.started_at }}
+          BASELINE_REVIEWS: ${{ steps.review_context.outputs.baseline_file }}
+        run: |
+          set -euo pipefail
+          if [ -z "$EXPECTED_HEAD" ] || [ -z "$REVIEW_STARTED_AT" ] \
+            || [ -z "$BASELINE_REVIEWS" ] || [ ! -f "$BASELINE_REVIEWS" ]; then
+            echo "::error::Review context was not prepared; Claude review cannot be verified."
+            exit 1
+          fi
+
+          current_head=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq '.headRefOid')
+          if [ "$current_head" != "$EXPECTED_HEAD" ]; then
+            echo "::error::PR head changed during review; rerun on the new head."
+            exit 1
+          fi
+
+          reviews_file="$RUNNER_TEMP/claude-pr-review-after.json"
+          gh api --paginate "repos/$REPO/pulls/$PR/reviews?per_page=100" \
+            | jq -s 'if length == 1 and (.[0] | type) == "array" then .[0] else add end' \
+            > "$reviews_file"
+
+          mapfile -t stale_review_ids < <(jq -r --arg head "$EXPECTED_HEAD" '
+            .[]
+              | select((.user.login | ascii_downcase | startswith("claude"))
+                  and .state == "CHANGES_REQUESTED"
+                  and (.commit_id // "") != $head)
+              | .id
+          ' "$reviews_file")
+          for review_id in "${stale_review_ids[@]}"; do
+            if gh api --method PUT "repos/$REPO/pulls/$PR/reviews/$review_id/dismissals" \
+              -f message="Superseded by review of current PR head $EXPECTED_HEAD." > /dev/null; then
+              echo "Dismissed stale Claude change-request review $review_id."
+            else
+              echo "::warning::Could not dismiss stale Claude review $review_id."
+            fi
+          done
+
+          fresh_verdicts=$(jq -n \
+            --slurpfile before "$BASELINE_REVIEWS" \
+            --slurpfile after "$reviews_file" \
+            --arg head "$EXPECTED_HEAD" \
+            --arg started "$REVIEW_STARTED_AT" '
+              ($before[0] | map(.id)) as $before_ids
+              | [$after[0][]
+                  | . as $review
+                  | select(
+                      ($before_ids | index($review.id) | not)
+                      and ($review.user.login | ascii_downcase | startswith("claude"))
+                      and (($review.commit_id // "") == $head)
+                      and (($review.submitted_at // "") >= $started)
+                      and ($review.state == "APPROVED" or $review.state == "CHANGES_REQUESTED")
+                    )]
+            ')
+          fresh_count=$(jq 'length' <<< "$fresh_verdicts")
+          if [ "$fresh_count" -ne 1 ]; then
+            echo "::error::Expected exactly one fresh Claude verdict on $EXPECTED_HEAD; found $fresh_count."
+            exit 1
+          fi
+
+          verdict_state=$(jq -r '.[0].state' <<< "$fresh_verdicts")
+          echo "Fresh Claude verdict on $EXPECTED_HEAD: $verdict_state"
+          if [ "$verdict_state" = "CHANGES_REQUESTED" ]; then
+            echo "::error::Claude requested changes on the current PR head."
+            exit 1
+          fi

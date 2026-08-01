@@ -1,0 +1,32 @@
+load("@rules_python//python:py_binary.bzl", "py_binary")
+load("@rules_python//python:py_library.bzl", "py_library")
+load("@rules_python//python:py_test.bzl", "py_test")
+
+package(default_visibility = ["//visibility:private"])
+
+py_library(
+    name = "lint_lib",
+    srcs = [
+        "__init__.py",
+        "lint.py",
+    ],
+    deps = ["//bazel:package"],
+)
+
+py_binary(
+    name = "lint",
+    srcs = ["main.py"],
+    legacy_create_init = 0,
+    main = "main.py",
+    python_version = "3.13",
+    deps = [":lint_lib"],
+)
+
+py_test(
+    name = "lint_test",
+    size = "small",
+    srcs = ["lint_test.py"],
+    legacy_create_init = 0,
+    python_version = "3.13",
+    deps = [":lint_lib"],
+)

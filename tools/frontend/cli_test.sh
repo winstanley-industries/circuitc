@@ -34,6 +34,8 @@ if [[ ${argument_status} -ne 2 ]]; then
   echo "expected unsupported-option exit 2; found ${argument_status}" >&2
   exit 1
 fi
+# The backticks are literal diagnostic punctuation, not command substitution.
+# shellcheck disable=SC2016
 grep -F 'unsupported option `--watch`' "${TEST_TMPDIR}/bad-args.stderr"
 
 invalid_dir="${TEST_TMPDIR}/invalid-case"
