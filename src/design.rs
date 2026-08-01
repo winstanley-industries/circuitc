@@ -241,6 +241,61 @@ impl fmt::Display for Diagnostic {
 }
 
 impl Design {
+    /// Canonicalize collections whose source declaration order has no semantic
+    /// meaning. Frontends call this before exposing an elaborated Design so
+    /// equality at the IR boundary is independent of source ordering.
+    pub fn canonicalize(&mut self) {
+        self.nets.sort_by(|left, right| {
+            (left.is_ground, &left.name).cmp(&(right.is_ground, &right.name))
+        });
+        self.components.sort_by(|left, right| {
+            (left.physical.is_none(), &left.reference, &left.path).cmp(&(
+                right.physical.is_none(),
+                &right.reference,
+                &right.path,
+            ))
+        });
+        for component in &mut self.components {
+            if let Some(simulation) = &mut component.simulation {
+                match simulation {
+                    SimulationModel::Resistor { resistance, .. } => {
+                        *resistance = resistance.canonicalized();
+                    }
+                    SimulationModel::DcVoltageSource { voltage, .. } => {
+                        *voltage = voltage.canonicalized();
+                    }
+                }
+            }
+            let terminal_rank =
+                |pin: &str| match component.simulation.as_ref().map(|model| model.pins()) {
+                    Some((positive, _)) if pin == positive => 0,
+                    Some((_, negative)) if pin == negative => 1,
+                    _ => 2,
+                };
+            component.connections.sort_by(|left, right| {
+                (terminal_rank(&left.pin), &left.pin, &left.net).cmp(&(
+                    terminal_rank(&right.pin),
+                    &right.pin,
+                    &right.net,
+                ))
+            });
+            if let Some(physical) = &mut component.physical {
+                physical.placement.rotation_degrees =
+                    physical.placement.rotation_degrees.rem_euclid(360);
+                physical
+                    .footprint
+                    .pads
+                    .sort_by(|left, right| left.number.cmp(&right.number));
+                physical
+                    .pin_pad_bindings
+                    .sort_by(|left, right| (&left.pad, &left.pin).cmp(&(&right.pad, &right.pin)));
+            }
+        }
+        self.board
+            .routes
+            .sort_by(|left, right| left.path.cmp(&right.path));
+    }
+
     pub fn validate(&self) -> Result<(), Vec<Diagnostic>> {
         let mut diagnostics = Vec::new();
 
@@ -804,6 +859,14 @@ fn validate_simulation(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let quantity = simulation.value();
+    if !quantity.is_canonical() {
+        push(
+            diagnostics,
+            "CC-SIM-009",
+            path,
+            "quantity must use its canonical exact decimal representation",
+        );
+    }
     if !quantity.exponent_is_valid() {
         push(
             diagnostics,
@@ -1100,5 +1163,18 @@ mod tests {
             .validate()
             .expect_err("duplicate route paths must be rejected");
         assert!(has_code(&diagnostics, "CC-ROUTE-007"));
+    }
+
+    #[test]
+    fn canonicalization_normalizes_full_turn_placements() {
+        let expected = voltage_divider();
+        let mut rotated = expected.clone();
+        for component in &mut rotated.components {
+            if let Some(physical) = &mut component.physical {
+                physical.placement.rotation_degrees = 360;
+            }
+        }
+        rotated.canonicalize();
+        assert_eq!(rotated, expected);
     }
 }

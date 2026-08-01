@@ -1,0 +1,20 @@
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+
+rust_binary(
+    name = "circuitc",
+    srcs = ["main.rs"],
+    crate_name = "circuitc_cli",
+    edition = "2024",
+    rustc_flags = ["-Dwarnings"],
+    visibility = ["//visibility:public"],
+    deps = ["//:circuitc"],
+)
+
+rust_test(
+    name = "circuitc_cli_test",
+    srcs = ["main.rs"],
+    crate_name = "circuitc_cli_test",
+    edition = "2024",
+    rustc_flags = ["-Dwarnings"],
+    deps = ["//:circuitc"],
+)

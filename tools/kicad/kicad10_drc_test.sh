@@ -3,6 +3,8 @@ set -euo pipefail
 
 generator="$1"
 normalizer="$2"
+frontend="$3"
+source_fixture="$4"
 
 if [[ -n "${CIRCUITC_KICAD_CLI:-}" ]]; then
   kicad_cli="${CIRCUITC_KICAD_CLI}"
@@ -23,10 +25,14 @@ fi
 
 first_dir="${TEST_TMPDIR}/first"
 second_dir="${TEST_TMPDIR}/second"
-"${generator}" "${first_dir}"
-"${generator}" "${second_dir}"
+rust_dir="${TEST_TMPDIR}/rust"
+"${frontend}" compile "${source_fixture}" --output-dir "${first_dir}"
+"${frontend}" compile "${source_fixture}" --output-dir "${second_dir}"
+"${generator}" "${rust_dir}"
 cmp "${first_dir}/voltage_divider.kicad_pcb" "${second_dir}/voltage_divider.kicad_pcb"
 cmp "${first_dir}/voltage_divider.spice" "${second_dir}/voltage_divider.spice"
+cmp "${first_dir}/voltage_divider.kicad_pcb" "${rust_dir}/voltage_divider.kicad_pcb"
+cmp "${first_dir}/voltage_divider.spice" "${rust_dir}/voltage_divider.spice"
 
 for directory in "${first_dir}" "${second_dir}"; do
   "${kicad_cli}" pcb drc \

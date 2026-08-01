@@ -1,14 +1,15 @@
 //! CircuitC compiler foundation.
 //!
-//! The bootstrap API is intentionally programmatic. It establishes the
-//! canonical semantic and backend boundaries before a user-facing language
-//! commits the project to grammar and syntax choices.
-//! Until the first released schema, this Rust construction API evolves in
-//! place without source-compatibility guarantees or migrations.
+//! The M1A frontend parses the deliberately small, unreleased CircuitC
+//! language and elaborates it into the same canonical Design IR used by the
+//! programmatic regression fixtures. Until the first release, the language,
+//! schema, and Rust construction API evolve in place without compatibility
+//! guarantees or migrations.
 
 mod compile;
 pub mod demo;
 pub mod design;
+pub mod frontend;
 mod kicad;
 pub mod quantity;
 mod spice;

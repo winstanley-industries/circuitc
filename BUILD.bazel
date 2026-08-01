@@ -37,11 +37,23 @@ rust_binary(
     deps = [":circuitc"],
 )
 
+rust_binary(
+    name = "frontend_equivalence",
+    testonly = True,
+    srcs = ["tools/frontend/equivalence.rs"],
+    crate_name = "frontend_equivalence",
+    edition = "2024",
+    rustc_flags = RUSTC_FLAGS,
+    deps = [":circuitc"],
+)
+
 rustfmt_test(
     name = "rustfmt_test",
     targets = [
         ":circuitc",
+        ":frontend_equivalence",
         ":voltage_divider",
+        "//cmd/circuitc",
     ],
 )
 
@@ -50,7 +62,30 @@ rust_clippy(
     testonly = True,
     deps = [
         ":circuitc",
+        ":frontend_equivalence",
         ":voltage_divider",
+        "//cmd/circuitc",
+    ],
+)
+
+sh_test(
+    name = "frontend_cli_test",
+    srcs = ["tools/frontend/cli_test.sh"],
+    args = [
+        "$(location //cmd/circuitc)",
+        "$(location examples/voltage_divider.circuitc)",
+        "$(location tools/frontend/fixtures/duplicate_net.circuitc)",
+        "$(location tools/frontend/fixtures/duplicate_net.json)",
+        "$(location :voltage_divider)",
+        "$(location :frontend_equivalence)",
+    ],
+    data = [
+        ":frontend_equivalence",
+        ":voltage_divider",
+        "//cmd/circuitc",
+        "examples/voltage_divider.circuitc",
+        "tools/frontend/fixtures/duplicate_net.circuitc",
+        "tools/frontend/fixtures/duplicate_net.json",
     ],
 )
 
@@ -77,9 +112,13 @@ sh_test(
     args = [
         "$(location :voltage_divider)",
         "$(location tools/kicad/normalize_drc.py)",
+        "$(location //cmd/circuitc)",
+        "$(location examples/voltage_divider.circuitc)",
     ],
     data = [
         ":voltage_divider",
+        "//cmd/circuitc",
+        "examples/voltage_divider.circuitc",
         "tools/kicad/normalize_drc.py",
     ],
     tags = [

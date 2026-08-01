@@ -1,0 +1,45 @@
+design voltage_divider {
+  net VIN;
+  net VOUT;
+  ground GND;
+
+  resistor divider.r_top R1 {
+    resistance 10 kohm;
+    terminals 1 2;
+    connect 1 VIN;
+    connect 2 VOUT;
+    footprint "CircuitC:R_0603_1608Metric" {
+      pad 1 at (-1 mm, 0 mm) size (0.9 mm, 0.95 mm) shape roundrect;
+      pad 2 at (1 mm, 0 mm) size (0.9 mm, 0.95 mm) shape roundrect;
+      bind 1 1;
+      bind 2 2;
+    }
+  }
+
+  resistor divider.r_bottom R2 {
+    resistance 10 kohm;
+    terminals 1 2;
+    connect 1 VOUT;
+    connect 2 GND;
+    footprint "CircuitC:R_0603_1608Metric" {
+      pad 1 at (-1 mm, 0 mm) size (0.9 mm, 0.95 mm) shape roundrect;
+      pad 2 at (1 mm, 0 mm) size (0.9 mm, 0.95 mm) shape roundrect;
+      bind 1 1;
+      bind 2 2;
+    }
+  }
+
+  dc_source analysis.input V1 {
+    voltage 10 V;
+    terminals p n;
+    connect p VIN;
+    connect n GND;
+  }
+
+  board {
+    rectangle at (0 mm, 0 mm) size (40 mm, 20 mm);
+    place R1 at (15 mm, 10 mm) rotation 0 deg layer front;
+    place R2 at (25 mm, 10 mm) rotation 0 deg layer front;
+    route board.routes.vout_bridge net VOUT from (16 mm, 10 mm) to (24 mm, 10 mm) width 0.25 mm layer front;
+  }
+}

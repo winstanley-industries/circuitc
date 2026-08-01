@@ -11,7 +11,7 @@ const MM: i64 = 1_000_000;
 
 /// A two-resistor divider with one code-authored route and an analysis-only DC source.
 pub fn voltage_divider() -> Design {
-    Design {
+    let mut design = Design {
         schema_version: DESIGN_SCHEMA_VERSION,
         name: "voltage_divider".to_owned(),
         nets: vec![
@@ -66,7 +66,9 @@ pub fn voltage_divider() -> Design {
                 layer: CopperLayer::Front,
             }],
         },
-    }
+    };
+    design.canonicalize();
+    design
 }
 
 fn resistor(path: &str, reference: &str, x_nm: i64, pin_1_net: &str, pin_2_net: &str) -> Component {

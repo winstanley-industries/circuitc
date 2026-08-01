@@ -1,0 +1,7 @@
+design invalid {
+  net VIN;
+  net VIN;
+  board {
+    rectangle at (0 mm, 0 mm) size (1 mm, 1 mm);
+  }
+}

@@ -1,0 +1,22 @@
+[
+  {
+    "code": "CC-LANG-NET-002",
+    "filename": "invalid.circuitc",
+    "start": 34,
+    "end": 37,
+    "line": 3,
+    "column": 7,
+    "semantic_path": "design.nets.VIN",
+    "message": "duplicate net name `VIN`",
+    "related": [
+      {
+        "filename": "invalid.circuitc",
+        "start": 23,
+        "end": 26,
+        "line": 2,
+        "column": 7,
+        "message": "first declaration is here"
+      }
+    ]
+  }
+]
