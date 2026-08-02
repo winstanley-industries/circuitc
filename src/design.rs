@@ -1879,4 +1879,21 @@ mod tests {
         rotated.canonicalize();
         assert_eq!(rotated, expected);
     }
+
+    #[test]
+    fn canonicalization_orders_modules_and_normalizes_schematic_rotation() {
+        let expected = voltage_divider();
+        let mut permuted = expected.clone();
+        permuted.modules.reverse();
+        for module in &mut permuted.modules {
+            module.ports.reverse();
+        }
+        for component in &mut permuted.components {
+            component.schematic_placement.rotation_degrees += 360;
+        }
+
+        permuted.canonicalize();
+
+        assert_eq!(permuted, expected);
+    }
 }
