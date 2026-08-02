@@ -254,7 +254,8 @@ fn validate_relative_output_path(filename: &str) -> io::Result<&Path> {
     ),
 ))]
 mod anchored_output {
-    use std::ffi::{CStr, CString, OsStr};
+    use std::ffi::{CStr, CString, OsStr, OsString};
+    use std::fmt;
     use std::fs::File;
     use std::io::{self, Write as _};
     use std::os::fd::{AsRawFd as _, FromRawFd as _, RawFd};
@@ -270,11 +271,15 @@ mod anchored_output {
     const O_CLOEXEC: c_int = 0x80000;
     #[cfg(target_os = "linux")]
     const O_CREAT: c_int = 0x40;
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    const O_DIRECTORY: c_int = 0x4000;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     const O_DIRECTORY: c_int = 0x10000;
     #[cfg(target_os = "linux")]
     const O_EXCL: c_int = 0x80;
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    const O_NOFOLLOW: c_int = 0x8000;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     const O_NOFOLLOW: c_int = 0x20000;
     #[cfg(target_os = "linux")]
     const O_NONBLOCK: c_int = 0x800;
@@ -307,6 +312,29 @@ mod anchored_output {
     const ENOSYS: c_int = 78;
     #[cfg(target_os = "macos")]
     type Mode = u16;
+
+    #[derive(Debug)]
+    struct OutputDirectoryComponentFailure {
+        segment: OsString,
+        source: io::Error,
+    }
+
+    impl fmt::Display for OutputDirectoryComponentFailure {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "output directory component {} must be a non-symlinked directory: {}",
+                Path::new(&self.segment).display(),
+                self.source
+            )
+        }
+    }
+
+    impl std::error::Error for OutputDirectoryComponentFailure {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.source)
+        }
+    }
 
     const O_RDONLY: c_int = 0;
     const O_WRONLY: c_int = 1;
@@ -824,11 +852,19 @@ mod anchored_output {
     fn output_directory_component_error(segment: &OsStr, error: io::Error) -> io::Error {
         io::Error::new(
             error.kind(),
-            format!(
-                "output directory component {} must be a non-symlinked directory: {error}",
-                Path::new(segment).display()
-            ),
+            OutputDirectoryComponentFailure {
+                segment: segment.to_owned(),
+                source: error,
+            },
         )
+    }
+
+    #[cfg(test)]
+    pub(super) fn output_directory_component_raw_os_error(error: &io::Error) -> Option<i32> {
+        error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<OutputDirectoryComponentFailure>())
+            .and_then(|failure| failure.source.raw_os_error())
     }
 
     fn open_existing_parent(root: &Directory, relative: &Path) -> io::Result<Option<Directory>> {
@@ -1386,6 +1422,17 @@ mod tests {
 
         let error = super::write_outputs(&link.join("out"), &outputs)
             .expect_err("symlinked output ancestor must fail closed");
+        let raw_os_error = super::anchored_output::output_directory_component_raw_os_error(&error);
+        #[cfg(target_os = "linux")]
+        assert!(
+            matches!(raw_os_error, Some(20 | 40)),
+            "Linux symlinked ancestor must fail with ENOTDIR or ELOOP, got: {error:?}"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            matches!(raw_os_error, Some(20 | 62)),
+            "macOS symlinked ancestor must fail with ENOTDIR or ELOOP, got: {error:?}"
+        );
         assert!(
             error
                 .to_string()
