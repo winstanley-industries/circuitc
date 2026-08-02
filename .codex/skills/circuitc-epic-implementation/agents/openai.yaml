@@ -1,0 +1,4 @@
+interface:
+  display_name: "CircuitC Epic Implementation"
+  short_description: "Ship CircuitC epics through reviewed PR stacks"
+  default_prompt: "Use $circuitc-epic-implementation to implement and ship the next CircuitC epic through validation, review feedback, merge, and retrospective."
