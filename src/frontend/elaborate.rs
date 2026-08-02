@@ -19,7 +19,6 @@ use super::syntax::{
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProvenanceMap {
-    pub source_name: String,
     semantic_spans: BTreeMap<SemanticProvenanceKey, Span>,
     rendered_semantic_spans: BTreeMap<String, Option<Span>>,
     identity_owner_spans: BTreeMap<String, Option<Span>>,
@@ -151,7 +150,6 @@ pub(crate) fn elaborate(tree: &SyntaxTree) -> Result<ElaboratedDesign, Vec<Sourc
     let source = &tree.source;
     let mut diagnostics = Vec::new();
     let mut provenance = ProvenanceMap {
-        source_name: source.name.clone(),
         semantic_spans: BTreeMap::new(),
         rendered_semantic_spans: BTreeMap::new(),
         identity_owner_spans: BTreeMap::new(),
@@ -1965,7 +1963,6 @@ mod tests {
     #[test]
     fn large_provenance_index_resolves_derived_identity_paths() {
         let mut provenance = ProvenanceMap {
-            source_name: "large.circuitc".to_owned(),
             semantic_spans: std::collections::BTreeMap::new(),
             rendered_semantic_spans: std::collections::BTreeMap::new(),
             identity_owner_spans: std::collections::BTreeMap::new(),

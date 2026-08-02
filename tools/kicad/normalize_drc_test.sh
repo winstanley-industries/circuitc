@@ -80,7 +80,35 @@ for category, filename in (
     variant["violations"] = []
     variant[category] = [finding]
     (target / filename).write_text(json.dumps(variant), encoding="utf-8")
+
+missing_uuid = copy.deepcopy(report)
+missing_uuid["violations"][0]["items"][0].pop("uuid")
+(target / "drc-missing-uuid.json").write_text(
+    json.dumps(missing_uuid), encoding="utf-8"
+)
+
+multiple = copy.deepcopy(report)
+second = copy.deepcopy(finding)
+second["description"] = "Second DRC failure"
+second["items"][0]["description"] = "Second mapped DRC item"
+second["type"] = "second_clearance"
+multiple["violations"] = [finding, second]
+(target / "drc-multiple.json").write_text(json.dumps(multiple), encoding="utf-8")
 PY
+
+expect_failure missing-finding-uuid \
+  'requires a UUID when an identity map is supplied' \
+  --raw "${TEST_TMPDIR}/drc-missing-uuid.json" \
+  --normalized "${TEST_TMPDIR}/drc-missing-uuid.normalized.json" \
+  --expected-major 10 \
+  --identity-map "${identity_map}"
+
+expect_failure unexpected-drc-multiple 'Track has insufficient clearance' \
+  --raw "${TEST_TMPDIR}/drc-multiple.json" \
+  --normalized "${TEST_TMPDIR}/drc-multiple.normalized.json" \
+  --expected-major 10 \
+  --identity-map "${identity_map}"
+grep -F 'Second DRC failure' "${TEST_TMPDIR}/unexpected-drc-multiple.stderr"
 
 expect_failure unexpected-unconnected board.routes.vout_bridge \
   --raw "${TEST_TMPDIR}/drc-unconnected.json" \

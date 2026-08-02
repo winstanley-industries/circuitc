@@ -200,6 +200,37 @@ mod tests {
         footprint_library_file, part, symbol, symbol_library_file,
     };
 
+    fn balanced_block<'a>(text: &'a str, needle: &str) -> &'a str {
+        let start = text.find(needle).expect("requested block exists");
+        let mut depth = 0_i32;
+        let mut in_string = false;
+        let mut escaped = false;
+        for (offset, character) in text[start..].char_indices() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if character == '\\' {
+                    escaped = true;
+                } else if character == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match character {
+                '"' => in_string = true,
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &text[start..start + offset + character.len_utf8()];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("requested block must be balanced")
+    }
+
     #[test]
     fn vendored_assets_match_the_catalog() {
         let resistor_identity = PartIdentity {
@@ -260,14 +291,38 @@ mod tests {
         assert_eq!(graphics.courtyard_end, PointNm::new(1_700_000, 750_000));
         assert!(RESISTOR_FOOTPRINT_LIBRARY.contains("(layer \"F.CrtYd\")"));
         assert!(RESISTOR_FOOTPRINT_LIBRARY.contains("(fp_line\n    (start -0.45 -0.5)"));
-        assert!(
-            SYMBOL_LIBRARY
-                .contains("(pin passive line\n        (at 0 3.81 270)\n        (length 1.27)")
-        );
-        assert!(
-            SYMBOL_LIBRARY
-                .contains("(pin passive line\n        (at 0 -3.81 90)\n        (length 1.27)")
-        );
+        for library_id in ["CircuitC:R", "CircuitC:VDC"] {
+            let definition = symbol(library_id).expect("catalog symbol exists");
+            let symbol_asset = balanced_block(
+                SYMBOL_LIBRARY,
+                &format!("  (symbol \"{}\"", definition.name),
+            );
+            for pin in definition.pins {
+                let number_marker = format!("(number \"{}\"", pin.number);
+                let number_offset = symbol_asset.find(&number_marker).unwrap_or_else(|| {
+                    panic!("vendored {library_id} is missing pin {}", pin.number)
+                });
+                let pin_start = symbol_asset[..number_offset]
+                    .rfind("(pin passive line")
+                    .expect("pin number belongs to a passive pin stanza");
+                let pin_asset = balanced_block(&symbol_asset[pin_start..], "(pin passive line");
+                let expected_at = match pin.offset {
+                    PointNm {
+                        x: 0,
+                        y: -3_810_000,
+                    } => "(at 0 3.81 270)",
+                    PointNm { x: 0, y: 3_810_000 } => "(at 0 -3.81 90)",
+                    offset => panic!("unexpected {library_id} catalog pin offset: {offset:?}"),
+                };
+                assert!(
+                    pin_asset.contains(expected_at),
+                    "vendored {library_id} pin {} does not match catalog offset {:?}: {pin_asset}",
+                    pin.number,
+                    pin.offset
+                );
+                assert!(pin_asset.contains(&number_marker));
+            }
+        }
     }
 
     #[test]

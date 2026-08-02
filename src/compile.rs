@@ -143,6 +143,29 @@ mod tests {
     }
 
     #[test]
+    fn reference_library_tables_pin_the_complete_kicad_structure() {
+        let artifacts = compile(&voltage_divider()).expect("reference design must compile");
+        assert_eq!(
+            artifacts.kicad_symbol_table,
+            concat!(
+                "(sym_lib_table\n",
+                "  (version 7)\n",
+                "  (lib (name \"CircuitC\")(type \"KiCad\")(uri \"${KIPRJMOD}/CircuitC.kicad_sym\")(options \"\")(descr \"CircuitC vendored symbols\"))\n",
+                ")\n",
+            )
+        );
+        assert_eq!(
+            artifacts.kicad_footprint_table,
+            concat!(
+                "(fp_lib_table\n",
+                "  (version 7)\n",
+                "  (lib (name \"CircuitC\")(type \"KiCad\")(uri \"${KIPRJMOD}/CircuitC.pretty\")(options \"\")(descr \"CircuitC vendored footprints\"))\n",
+                ")\n",
+            )
+        );
+    }
+
+    #[test]
     fn schematic_embeds_catalog_symbols_and_links_board_footprints_by_uuid() {
         let artifacts = compile(&voltage_divider()).expect("reference design must compile");
         let component_identity = artifacts

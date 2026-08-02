@@ -270,7 +270,7 @@ mod tests {
             .expect("source must compile");
         let second = compile_source("/absolute/elsewhere/input.circuitc", MINIMAL_VIRTUAL_SOURCE)
             .expect("source path must not affect compilation");
-        assert_eq!(first.elaborated.design, second.elaborated.design);
+        assert_eq!(first.elaborated, second.elaborated);
         assert_eq!(first.artifacts, second.artifacts);
         assert_eq!(first.kicad_identity_map, second.kicad_identity_map);
         assert!(
