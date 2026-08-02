@@ -23,6 +23,7 @@ pub struct ProvenanceMap {
     semantic_spans: BTreeMap<SemanticProvenanceKey, Span>,
     rendered_semantic_spans: BTreeMap<String, Option<Span>>,
     identity_owner_spans: BTreeMap<String, Option<Span>>,
+    route_spans: BTreeMap<String, Span>,
     structural_spans: BTreeMap<String, Span>,
 }
 
@@ -61,6 +62,9 @@ impl ProvenanceMap {
     }
 
     pub(crate) fn span_for_identity(&self, semantic_path: &str) -> Option<Span> {
+        if let Some(span) = self.route_spans.get(semantic_path) {
+            return Some(*span);
+        }
         let mut candidate = semantic_path;
         loop {
             if let Some(span) = self.identity_owner_spans.get(candidate) {
@@ -108,7 +112,9 @@ impl ProvenanceMap {
             .entry(rendered.clone())
             .and_modify(|existing| *existing = None)
             .or_insert(Some(span));
-        if !matches!(&key, SemanticProvenanceKey::Route(_)) {
+        if matches!(&key, SemanticProvenanceKey::Route(_)) {
+            self.route_spans.insert(rendered, span);
+        } else {
             self.identity_owner_spans
                 .entry(rendered)
                 .and_modify(|existing| *existing = None)
@@ -149,6 +155,7 @@ pub(crate) fn elaborate(tree: &SyntaxTree) -> Result<ElaboratedDesign, Vec<Sourc
         semantic_spans: BTreeMap::new(),
         rendered_semantic_spans: BTreeMap::new(),
         identity_owner_spans: BTreeMap::new(),
+        route_spans: BTreeMap::new(),
         structural_spans: BTreeMap::new(),
     };
     provenance.insert_structural("design", tree.design.span);
@@ -1962,6 +1969,7 @@ mod tests {
             semantic_spans: std::collections::BTreeMap::new(),
             rendered_semantic_spans: std::collections::BTreeMap::new(),
             identity_owner_spans: std::collections::BTreeMap::new(),
+            route_spans: std::collections::BTreeMap::new(),
             structural_spans: std::collections::BTreeMap::new(),
         };
         for index in 0..4096 {
@@ -2007,6 +2015,13 @@ mod tests {
         assert_eq!(span.start, component_start);
         assert_ne!(span.start, route_start);
 
+        let exact_route_span = compiled
+            .elaborated
+            .provenance
+            .span_for_identity("divider.r_top.symbol")
+            .expect("an exact route identity must resolve to its route declaration");
+        assert_eq!(exact_route_span.start, route_start);
+
         let marker = format!("\"semantic_path\": \"{semantic_path}\"");
         let identity = compiled
             .kicad_identity_map
@@ -2017,6 +2032,18 @@ mod tests {
         assert!(
             identity.contains(&format!("\"location\": {{\"start\": {component_start},")),
             "identity map attributed {semantic_path} to the wrong owner: {identity}"
+        );
+
+        let route_marker = "\"semantic_path\": \"divider.r_top.symbol\"";
+        let route_identity = compiled
+            .kicad_identity_map
+            .split(route_marker)
+            .nth(1)
+            .and_then(|tail| tail.split("\n    }").next())
+            .expect("route identity-map entry must exist");
+        assert!(
+            route_identity.contains(&format!("\"location\": {{\"start\": {route_start},")),
+            "identity map lost the exact route location: {route_identity}"
         );
     }
 

@@ -323,6 +323,46 @@ mod tests {
     }
 
     #[test]
+    fn coincident_no_connect_pins_fail_before_emission() {
+        let mut design = voltage_divider();
+        let r1_position = design.components[0].schematic_placement.position;
+        design.components[0].simulation = None;
+        design.components[0]
+            .connections
+            .iter_mut()
+            .find(|connection| connection.pin == "2")
+            .expect("R1 pin 2 connection exists")
+            .state = ConnectionState::NoConnect;
+        let r2 = design
+            .components
+            .iter_mut()
+            .find(|component| component.reference == "R2")
+            .expect("reference resistor exists");
+        r2.schematic_placement.position =
+            crate::design::PointNm::new(r1_position.x, r1_position.y + 7_620_000);
+        r2.simulation = None;
+        r2.connections
+            .iter_mut()
+            .find(|connection| connection.pin == "1")
+            .expect("R2 pin 1 connection exists")
+            .state = ConnectionState::NoConnect;
+
+        let diagnostics = compile(&design)
+            .expect_err("distinct no-connect pins may not share a schematic point")
+            .diagnostics;
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "CC-KICAD-SCHEMATIC-002")
+            .unwrap_or_else(|| panic!("missing schematic collision diagnostic: {diagnostics:#?}"));
+        assert!(
+            diagnostic
+                .message
+                .contains("no-connect pins may not share a connection point"),
+            "unexpected no-connect collision diagnostic: {diagnostic:#?}"
+        );
+    }
+
+    #[test]
     fn declaration_permutations_do_not_change_artifacts() {
         let design = voltage_divider();
         let expected = compile(&design).expect("reference design must compile");
@@ -567,6 +607,23 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.code == "CC-KICAD-FOOTPRINT-003"),
             "missing CC-KICAD-FOOTPRINT-003: {diagnostics:#?}"
+        );
+
+        let mut design = voltage_divider();
+        design.components[0]
+            .physical
+            .as_mut()
+            .expect("reference resistor is physical")
+            .footprint
+            .library_id = "CircuitC:R_0805_2012Metric".to_owned();
+        let diagnostics = compile(&design)
+            .expect_err("footprint identity drift from the part catalog must fail")
+            .diagnostics;
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CC-KICAD-FOOTPRINT-002"),
+            "missing CC-KICAD-FOOTPRINT-002: {diagnostics:#?}"
         );
 
         let mut design = voltage_divider();

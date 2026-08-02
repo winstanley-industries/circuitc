@@ -56,6 +56,9 @@ bazel run //cmd/circuitc -- compile \
 
 On macOS, use `/private/tmp/circuitc-voltage-divider`; CircuitC rejects
 symlinked output-directory ancestors, and `/tmp` is a symlink there.
+An existing output artifact must be a readable or writable regular file so
+CircuitC can verify its type through the anchored directory descriptor before
+replacement.
 
 This writes:
 

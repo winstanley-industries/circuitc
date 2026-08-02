@@ -140,13 +140,19 @@ fn validate_schematic_connection_points(design: &Design, diagnostics: &mut Vec<D
                 continue;
             };
             if let Some((first_component, first_pin, first_connection)) = occupied.get(&position)
-                && *first_connection != connection
+                && (*first_connection != connection
+                    || matches!(connection, ConnectionState::NoConnect))
             {
+                let conflict = if matches!(connection, ConnectionState::NoConnect) {
+                    "no-connect pins may not share a connection point"
+                } else {
+                    "the pins have different connection states"
+                };
                 diagnostics.push(Diagnostic {
                     code: "CC-KICAD-SCHEMATIC-002",
                     path: format!("{}.connection.{}", component.path, binding.pin),
                     message: format!(
-                        "schematic pin {} on {} shares connection point ({}, {}) nm with pin {} on {} but has a different connection state",
+                        "schematic pin {} on {} shares connection point ({}, {}) nm with pin {} on {}; {conflict}",
                         binding.pin,
                         component.path,
                         position.x,

@@ -310,7 +310,14 @@ mod anchored_output {
 
     const O_RDONLY: c_int = 0;
     const O_WRONLY: c_int = 1;
+    const EACCES: c_int = 13;
+    const EISDIR: c_int = 21;
     const EINVAL: c_int = 22;
+    const ENOTDIR: c_int = 20;
+    #[cfg(target_os = "linux")]
+    const ELOOP: c_int = 40;
+    #[cfg(target_os = "macos")]
+    const ELOOP: c_int = 62;
 
     unsafe extern "C" {
         fn open(path: *const c_char, flags: c_int, ...) -> c_int;
@@ -385,6 +392,20 @@ mod anchored_output {
                     self.0.as_raw_fd(),
                     name.as_ptr(),
                     O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC,
+                )
+            };
+            file_from_descriptor(descriptor)
+        }
+
+        fn open_entry_write_only(&self, name: &CStr) -> io::Result<File> {
+            // This fallback permits type inspection of write-only regular
+            // artifacts without granting publication through symlinks.
+            // SAFETY: `name` is NUL-terminated and remains live for this call.
+            let descriptor = unsafe {
+                openat(
+                    self.0.as_raw_fd(),
+                    name.as_ptr(),
+                    O_WRONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC,
                 )
             };
             file_from_descriptor(descriptor)
@@ -630,48 +651,26 @@ mod anchored_output {
                     ));
                 }
                 backed_up.push(index);
-                match entry.parent.open_entry(&entry.backup) {
-                    Ok(file) => match file.metadata() {
-                        Ok(metadata) if metadata.file_type().is_file() => {}
-                        Ok(_) => {
-                            return Err(with_cleanup_error(
-                                io::Error::other(format!(
-                                    "output target {} changed type during publication",
-                                    entry.display_path
-                                )),
-                                rollback(
-                                    &entries,
-                                    &temporary_files,
-                                    &backed_up,
-                                    &[],
-                                    &created_directories,
-                                ),
-                            ));
-                        }
-                        Err(error) => {
-                            return Err(with_cleanup_error(
-                                operation_error(
-                                    "read staged backup metadata for",
-                                    &entry.display_path,
-                                    error,
-                                ),
-                                rollback(
-                                    &entries,
-                                    &temporary_files,
-                                    &backed_up,
-                                    &[],
-                                    &created_directories,
-                                ),
-                            ));
-                        }
-                    },
+                match inspect_target(&entry.parent, &entry.backup, Path::new(&entry.display_path)) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Err(with_cleanup_error(
+                            io::Error::other(format!(
+                                "output target {} disappeared during publication",
+                                entry.display_path
+                            )),
+                            rollback(
+                                &entries,
+                                &temporary_files,
+                                &backed_up,
+                                &[],
+                                &created_directories,
+                            ),
+                        ));
+                    }
                     Err(error) => {
                         return Err(with_cleanup_error(
-                            operation_error(
-                                "inspect staged backup for",
-                                &entry.display_path,
-                                error,
-                            ),
+                            error,
                             rollback(
                                 &entries,
                                 &temporary_files,
@@ -870,13 +869,39 @@ mod anchored_output {
     }
 
     fn inspect_target(parent: &Directory, name: &CStr, path: &Path) -> io::Result<bool> {
-        match parent.open_entry(name) {
-            Ok(file) if file.metadata()?.file_type().is_file() => Ok(true),
-            Ok(_) => Err(io::Error::other(format!(
-                "output target {} exists and is not a regular file",
-                path.display()
-            ))),
+        let opened = match parent.open_entry(name) {
+            Err(error) if error.raw_os_error() == Some(EACCES) => {
+                parent.open_entry_write_only(name)
+            }
+            result => result,
+        };
+        match opened {
+            Ok(file) => match file.metadata() {
+                Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+                Ok(_) => Err(non_regular_target_error(path)),
+                Err(error) => Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to inspect output target {} metadata: {error}",
+                        path.display()
+                    ),
+                )),
+            },
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error)
+                if error
+                    .raw_os_error()
+                    .is_some_and(|code| code == ELOOP || code == ENOTDIR || code == EISDIR) =>
+            {
+                Err(non_regular_target_error(path))
+            }
+            Err(error) if error.raw_os_error() == Some(EACCES) => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "failed to inspect output target {}; existing targets must be readable or writable regular files: {error}",
+                    path.display()
+                ),
+            )),
             Err(error) => Err(io::Error::new(
                 error.kind(),
                 format!(
@@ -885,6 +910,13 @@ mod anchored_output {
                 ),
             )),
         }
+    }
+
+    fn non_regular_target_error(path: &Path) -> io::Error {
+        io::Error::other(format!(
+            "output target {} exists and is not a regular file",
+            path.display()
+        ))
     }
 
     fn ensure_absent(
@@ -1353,6 +1385,39 @@ mod tests {
         ),
     ))]
     #[test]
+    fn unsafe_relative_output_paths_fail_before_creating_the_output_root() {
+        use std::fs;
+
+        let scratch = scratch_directory("unsafe-relative-path");
+        let output = scratch.join("output");
+        for name in ["../escape.txt", "/absolute.txt", "", "a/../../escape.txt"] {
+            let outputs = [(name.to_owned(), b"generated".as_slice())];
+            let error = super::write_outputs(&output, &outputs)
+                .expect_err("unsafe generated output path must fail closed");
+            assert!(
+                error.to_string().contains("is not a safe relative path"),
+                "unexpected unsafe-path error for {name:?}: {error}"
+            );
+        }
+        assert!(!scratch.join("escape.txt").exists());
+        assert!(
+            !output.exists(),
+            "rejected publication must not create its output root"
+        );
+        fs::remove_dir_all(&scratch).expect("remove test scratch directory");
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+    ))]
+    #[test]
     fn failed_transaction_removes_descriptor_created_output_root() {
         use std::fs;
         use std::io;
@@ -1410,6 +1475,128 @@ mod tests {
             1,
             "successful publication must remove temporary and backup entries"
         );
+        fs::remove_dir_all(&scratch).expect("remove test scratch directory");
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+    ))]
+    #[test]
+    fn output_target_symlink_has_an_explicit_non_regular_diagnostic() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let scratch = scratch_directory("target-symlink");
+        let output = scratch.join("output");
+        let external = scratch.join("external.txt");
+        fs::create_dir(&output).expect("create output directory");
+        fs::write(&external, b"external sentinel").expect("write external sentinel");
+        symlink(&external, output.join("result.txt")).expect("create output target symlink");
+        let outputs = [("result.txt".to_owned(), b"generated".as_slice())];
+
+        let error = super::write_outputs(&output, &outputs)
+            .expect_err("publication must reject an output-target symlink");
+        assert!(
+            error
+                .to_string()
+                .contains("output target result.txt exists and is not a regular file"),
+            "unexpected target-symlink error: {error}"
+        );
+        assert_eq!(
+            fs::read(&external).expect("read external sentinel"),
+            b"external sentinel"
+        );
+        assert!(
+            fs::symlink_metadata(output.join("result.txt"))
+                .expect("output target symlink remains")
+                .file_type()
+                .is_symlink()
+        );
+        fs::remove_dir_all(&scratch).expect("remove test scratch directory");
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+    ))]
+    #[test]
+    fn descriptor_anchored_publication_replaces_an_unreadable_regular_file() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = scratch_directory("replace-unreadable-file");
+        let output = scratch.join("output");
+        let target = output.join("result.txt");
+        fs::create_dir(&output).expect("create output directory");
+        fs::write(&target, b"old").expect("write existing output");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o200))
+            .expect("make existing output unreadable");
+        let outputs = [("result.txt".to_owned(), b"new".as_slice())];
+
+        super::write_outputs(&output, &outputs)
+            .expect("directory authority must permit replacing an unreadable regular file");
+        assert_eq!(fs::read(&target).expect("read replaced output"), b"new");
+        assert_eq!(
+            fs::read_dir(&output)
+                .expect("list output directory")
+                .count(),
+            1,
+            "successful publication must remove temporary and backup entries"
+        );
+        fs::remove_dir_all(&scratch).expect("remove test scratch directory");
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+    ))]
+    #[test]
+    fn inaccessible_existing_target_fails_with_the_documented_permission_requirement() {
+        use std::fs;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let scratch = scratch_directory("inaccessible-existing-file");
+        let output = scratch.join("output");
+        let target = output.join("result.txt");
+        fs::create_dir(&output).expect("create output directory");
+        fs::write(&target, b"old").expect("write existing output");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o000))
+            .expect("make existing output inaccessible");
+        let outputs = [("result.txt".to_owned(), b"new".as_slice())];
+
+        let error = super::write_outputs(&output, &outputs)
+            .expect_err("a fully inaccessible target must fail with an explicit requirement");
+        assert!(
+            error
+                .to_string()
+                .contains("existing targets must be readable or writable regular files"),
+            "unexpected inaccessible-target error: {error}"
+        );
+        let metadata = fs::metadata(&target).expect("inaccessible target remains");
+        assert_eq!(metadata.mode() & 0o777, 0);
+        assert_eq!(metadata.len(), 3);
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600))
+            .expect("restore target permissions for cleanup");
+        assert_eq!(fs::read(&target).expect("read preserved target"), b"old");
         fs::remove_dir_all(&scratch).expect("remove test scratch directory");
     }
 

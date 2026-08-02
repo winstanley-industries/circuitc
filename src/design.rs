@@ -1556,6 +1556,13 @@ mod tests {
         let duplicate = design.components[0].symbol.pins[0].symbol_pin.clone();
         design.components[0].symbol.pins[1].symbol_pin = duplicate;
         assert_rejected(design, "CC-SYMBOL-005");
+
+        let mut design = voltage_divider();
+        design.components[0].connections.push(super::Connection {
+            pin: "3".to_owned(),
+            state: ConnectionState::Connected("VIN".to_owned()),
+        });
+        assert_rejected(design, "CC-PIN-003");
     }
 
     #[test]
