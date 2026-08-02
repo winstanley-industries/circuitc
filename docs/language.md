@@ -143,13 +143,15 @@ path rather than the `/tmp` symlink.
 - `2`: invalid invocation or unsupported option; and
 - `3`: input or output I/O failure.
 
-Once every artifact has been published, failure to remove backup staging does
-not misreport publication as failed: the CLI emits `CC-CLI-IO-003`, names the
-cleanup residue, and exits successfully. Failures before complete publication
-still roll back and exit `3` with `CC-CLI-IO-002`. A broken output pipe after
-publication is also treated as success. Other success-reporting stream failures
-emit `CC-CLI-IO-004`, explicitly state that outputs were already published, and
-exit `3`.
+Once every artifact has been published, CircuitC synchronizes each distinct
+artifact parent and each parent in which it created a directory, after removing
+backup staging. A post-publication directory-sync or backup-cleanup failure does
+not misreport publication as incomplete: the CLI emits `CC-CLI-IO-003`, names
+the durability or cleanup failure, and exits successfully. Failures before
+complete publication still roll back and exit `3` with `CC-CLI-IO-002`. A
+broken output pipe after publication is also treated as success. Other
+success-reporting stream failures emit `CC-CLI-IO-004`, explicitly state that
+outputs were already published, and exit `3`.
 
 Human diagnostics are the default. JSON diagnostics contain stable codes, the
 requested filename, UTF-8 byte spans, one-based line and column, semantic path

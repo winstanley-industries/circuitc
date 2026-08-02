@@ -326,10 +326,61 @@ mod tests {
         let graphics = footprint_graphics("CircuitC:R_0603_1608Metric")
             .expect("catalog footprint graphics must exist");
         assert_eq!(graphics.silkscreen_lines.len(), 2);
+        assert_eq!(graphics.silkscreen_lines[0].semantic_name, "top");
+        assert_eq!(
+            graphics.silkscreen_lines[0].start,
+            PointNm::new(-450_000, -500_000)
+        );
+        assert_eq!(
+            graphics.silkscreen_lines[0].end,
+            PointNm::new(450_000, -500_000)
+        );
+        assert_eq!(graphics.silkscreen_lines[0].width_nm, 120_000);
+        assert_eq!(graphics.silkscreen_lines[1].semantic_name, "bottom");
+        assert_eq!(
+            graphics.silkscreen_lines[1].start,
+            PointNm::new(-450_000, 500_000)
+        );
+        assert_eq!(
+            graphics.silkscreen_lines[1].end,
+            PointNm::new(450_000, 500_000)
+        );
+        assert_eq!(graphics.silkscreen_lines[1].width_nm, 120_000);
         assert_eq!(graphics.courtyard_start, PointNm::new(-1_700_000, -750_000));
         assert_eq!(graphics.courtyard_end, PointNm::new(1_700_000, 750_000));
-        assert!(RESISTOR_FOOTPRINT_LIBRARY.contains("(layer \"F.CrtYd\")"));
-        assert!(RESISTOR_FOOTPRINT_LIBRARY.contains("(fp_line\n    (start -0.45 -0.5)"));
+        assert_eq!(graphics.courtyard_width_nm, 50_000);
+        for expected in [
+            concat!(
+                "(fp_line\n",
+                "    (start -0.45 -0.5)\n",
+                "    (end 0.45 -0.5)\n",
+                "    (stroke (width 0.12) (type default))\n",
+                "    (layer \"F.SilkS\")\n",
+                "  )",
+            ),
+            concat!(
+                "(fp_line\n",
+                "    (start -0.45 0.5)\n",
+                "    (end 0.45 0.5)\n",
+                "    (stroke (width 0.12) (type default))\n",
+                "    (layer \"F.SilkS\")\n",
+                "  )",
+            ),
+            concat!(
+                "(fp_rect\n",
+                "    (start -1.7 -0.75)\n",
+                "    (end 1.7 0.75)\n",
+                "    (stroke (width 0.05) (type default))\n",
+                "    (fill none)\n",
+                "    (layer \"F.CrtYd\")\n",
+                "  )",
+            ),
+        ] {
+            assert!(
+                RESISTOR_FOOTPRINT_LIBRARY.contains(expected),
+                "vendored footprint geometry does not match catalog field set: {expected}"
+            );
+        }
         for library_id in ["CircuitC:R", "CircuitC:VDC"] {
             let definition = symbol(library_id).expect("catalog symbol exists");
             let symbol_asset = balanced_block(

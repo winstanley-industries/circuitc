@@ -114,7 +114,7 @@ fn report_successful_publication(
         if let Some(error) = &write_outcome.cleanup_warning {
             writeln!(
                 stderr,
-                "CC-CLI-IO-003: output publication to {} succeeded, but backup staging cleanup was incomplete: {error}",
+                "CC-CLI-IO-003: output publication to {} succeeded, but post-publication durability or cleanup was incomplete: {error}",
                 output_directory.display()
             )?;
         }
@@ -290,6 +290,7 @@ fn validate_relative_output_path(filename: &str) -> io::Result<&Path> {
     ),
 ))]
 mod anchored_output {
+    use std::collections::BTreeSet;
     use std::ffi::{CStr, CString, OsStr, OsString};
     use std::fmt;
     use std::fs::File;
@@ -297,6 +298,7 @@ mod anchored_output {
     use std::os::fd::{AsRawFd as _, FromRawFd as _, RawFd};
     use std::os::raw::{c_char, c_int, c_uint};
     use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
     use std::path::{Component, Path};
     use std::process;
 
@@ -440,6 +442,11 @@ mod anchored_output {
             self.0.try_clone().map(Self)
         }
 
+        fn identity(&self) -> io::Result<(u64, u64)> {
+            let metadata = self.0.metadata()?;
+            Ok((metadata.dev(), metadata.ino()))
+        }
+
         fn open_child(&self, name: &CStr) -> io::Result<Self> {
             // SAFETY: `name` is NUL-terminated and remains live for this call.
             let descriptor = unsafe {
@@ -559,22 +566,25 @@ mod anchored_output {
             |_, file| file.sync_all(),
             |_| Ok(()),
             || Ok(()),
+            |directory| directory.0.sync_all(),
         )
     }
 
-    fn write_outputs_with_hooks<F, S, G, H>(
+    fn write_outputs_with_hooks<F, S, G, H, D>(
         output_directory: &Path,
         outputs: &[(String, &[u8])],
         pre_anchor_hook: F,
         mut sync_staging: S,
         mut before_publish_hook: G,
         after_publication_hook: H,
+        mut sync_directory: D,
     ) -> io::Result<super::WriteOutcome>
     where
         F: FnOnce() -> io::Result<()>,
         S: FnMut(usize, &File) -> io::Result<()>,
         G: FnMut(usize) -> io::Result<()>,
         H: FnOnce() -> io::Result<()>,
+        D: FnMut(&Directory) -> io::Result<()>,
     {
         let relative_paths: Vec<_> = outputs
             .iter()
@@ -802,10 +812,12 @@ mod anchored_output {
         }
         let hook_result = after_publication_hook();
         let cleanup_result = cleanup_backups(&entries, &backed_up);
-        let cleanup_warning = match hook_result {
-            Ok(()) => cleanup_result.err(),
-            Err(error) => Some(with_cleanup_error(error, cleanup_result)),
-        };
+        let directory_sync_result =
+            sync_published_directories(&entries, &created_directories, &mut sync_directory);
+        let mut cleanup_warning = None;
+        merge_post_publication_result(&mut cleanup_warning, hook_result);
+        merge_post_publication_result(&mut cleanup_warning, cleanup_result);
+        merge_post_publication_result(&mut cleanup_warning, directory_sync_result);
         Ok(super::WriteOutcome { cleanup_warning })
     }
 
@@ -1090,6 +1102,68 @@ mod anchored_output {
         cleanup_result("published-output backup cleanup", errors)
     }
 
+    fn sync_published_directories<D>(
+        entries: &[OutputEntry<'_>],
+        created_directories: &[CreatedDirectory],
+        sync_directory: &mut D,
+    ) -> io::Result<()>
+    where
+        D: FnMut(&Directory) -> io::Result<()>,
+    {
+        let mut synced = BTreeSet::new();
+        let mut errors = Vec::new();
+        for entry in entries {
+            sync_directory_once(
+                &entry.parent,
+                &format!("sync published parent for {}", entry.display_path),
+                &mut synced,
+                &mut errors,
+                sync_directory,
+            );
+        }
+        for created in created_directories {
+            sync_directory_once(
+                &created.parent,
+                &format!(
+                    "sync parent of created directory {}",
+                    created.name.to_string_lossy()
+                ),
+                &mut synced,
+                &mut errors,
+                sync_directory,
+            );
+        }
+        cleanup_result("published-output directory synchronization", errors)
+    }
+
+    fn sync_directory_once<D>(
+        directory: &Directory,
+        action: &str,
+        synced: &mut BTreeSet<(u64, u64)>,
+        errors: &mut Vec<String>,
+        sync_directory: &mut D,
+    ) where
+        D: FnMut(&Directory) -> io::Result<()>,
+    {
+        match directory.identity() {
+            Ok(identity) if synced.insert(identity) => {
+                record_cleanup_error(errors, action, sync_directory(directory));
+            }
+            Ok(_) => {}
+            Err(error) => errors.push(format!("identify directory before {action}: {error}")),
+        }
+    }
+
+    fn merge_post_publication_result(warning: &mut Option<io::Error>, result: io::Result<()>) {
+        let Err(error) = result else {
+            return;
+        };
+        *warning = Some(match warning.take() {
+            Some(first) => with_cleanup_error(first, Err(error)),
+            None => error,
+        });
+    }
+
     fn remove_created_directories(created: &[CreatedDirectory]) -> io::Result<()> {
         let mut errors = Vec::new();
         for directory in created.iter().rev() {
@@ -1243,6 +1317,7 @@ mod anchored_output {
             |_, file| file.sync_all(),
             |_| Ok(()),
             || Ok(()),
+            |directory| directory.0.sync_all(),
         )
     }
 
@@ -1262,6 +1337,7 @@ mod anchored_output {
             |index, _| hook(index),
             |_| Ok(()),
             || Ok(()),
+            |directory| directory.0.sync_all(),
         )
     }
 
@@ -1281,6 +1357,7 @@ mod anchored_output {
             |_, file| file.sync_all(),
             hook,
             || Ok(()),
+            |directory| directory.0.sync_all(),
         )
     }
 
@@ -1300,6 +1377,32 @@ mod anchored_output {
             |_, file| file.sync_all(),
             |_| Ok(()),
             hook,
+            |directory| directory.0.sync_all(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn write_outputs_with_directory_sync_hook<F>(
+        output_directory: &Path,
+        outputs: &[(String, &[u8])],
+        mut hook: F,
+    ) -> io::Result<super::WriteOutcome>
+    where
+        F: FnMut(usize) -> io::Result<()>,
+    {
+        let mut index = 0;
+        write_outputs_with_hooks(
+            output_directory,
+            outputs,
+            || Ok(()),
+            |_, file| file.sync_all(),
+            |_| Ok(()),
+            || Ok(()),
+            |_| {
+                let result = hook(index);
+                index += 1;
+                result
+            },
         )
     }
 
@@ -1993,6 +2096,68 @@ mod tests {
             "injected staging residue must be observable"
         );
         fs::remove_dir(&backup).expect("remove injected backup directory");
+        fs::remove_dir_all(&scratch).expect("remove test scratch directory");
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+    ))]
+    #[test]
+    fn successful_publication_reports_directory_sync_failure_as_a_warning() {
+        use std::cell::Cell;
+        use std::fs;
+        use std::io;
+
+        let scratch = scratch_directory("directory-sync-warning");
+        let output = scratch.join("output");
+        fs::create_dir(&output).expect("create output directory");
+        let outputs = [("nested/result.txt".to_owned(), b"generated".as_slice())];
+        let sync_calls = Cell::new(0);
+
+        let outcome = super::anchored_output::write_outputs_with_directory_sync_hook(
+            &output,
+            &outputs,
+            |index| {
+                sync_calls.set(sync_calls.get() + 1);
+                if index == 0 {
+                    Err(io::Error::other("injected directory sync failure"))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect("publication must remain successful after a directory sync failure");
+
+        let warning = outcome
+            .cleanup_warning
+            .expect("directory sync failure must remain visible to the caller");
+        assert!(
+            warning
+                .to_string()
+                .contains("published-output directory synchronization was incomplete"),
+            "unexpected directory sync warning: {warning}"
+        );
+        assert!(
+            warning
+                .to_string()
+                .contains("injected directory sync failure")
+        );
+        assert_eq!(
+            fs::read(output.join("nested/result.txt")).expect("read published output"),
+            b"generated"
+        );
+        assert_eq!(
+            sync_calls.get(),
+            2,
+            "publication must sync the artifact parent and its created-directory parent exactly once each"
+        );
         fs::remove_dir_all(&scratch).expect("remove test scratch directory");
     }
 

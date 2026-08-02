@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
-use std::path::{Component, Path};
+use std::path::Path;
 
 use crate::design::{Design, Diagnostic};
 use crate::spice::SpiceNameMap;
@@ -24,12 +24,12 @@ pub struct RelativeArtifactPath(String);
 impl RelativeArtifactPath {
     pub fn try_new(path: impl Into<String>) -> Result<Self, InvalidRelativeArtifactPath> {
         let path = path.into();
-        let parsed = Path::new(&path);
         if path.is_empty()
-            || parsed.is_absolute()
-            || parsed
-                .components()
-                .any(|component| !matches!(component, Component::Normal(_)))
+            || path.starts_with('/')
+            || path.contains(['\\', '\0'])
+            || path
+                .split('/')
+                .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
         {
             return Err(InvalidRelativeArtifactPath { path });
         }
@@ -64,7 +64,7 @@ impl fmt::Display for InvalidRelativeArtifactPath {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "artifact path must be non-empty, relative, and contain only normal components: {:?}",
+            "artifact path must be a canonical portable relative path with non-empty '/'-separated normal components and no backslash or NUL: {:?}",
             self.path
         )
     }
@@ -284,6 +284,63 @@ mod tests {
     }
 
     #[test]
+    fn part_identity_values_round_trip_into_schematic_and_board_properties() {
+        let artifacts = compile(&voltage_divider()).expect("reference design must compile");
+        let physical_identity = artifacts
+            .kicad_identities
+            .iter()
+            .find(|identity| identity.semantic_path == "divider.r_top")
+            .expect("physical symbol identity must exist");
+        let physical_symbol = balanced_block_containing(
+            &artifacts.kicad_schematic,
+            "  (symbol\n",
+            &format!("    (uuid \"{}\")", physical_identity.uuid),
+        );
+        for expected in [
+            "(property \"Footprint\" \"CircuitC:R_0603_1608Metric\"",
+            "(property \"Description\" \"resistor\"",
+            "(property \"Manufacturer\" \"Yageo\"",
+            "(property \"MPN\" \"RC0603FR-0710KL\"",
+        ] {
+            assert!(
+                physical_symbol.contains(expected),
+                "physical schematic symbol is missing exact part identity property {expected}"
+            );
+        }
+
+        let footprint = balanced_block_containing(
+            &artifacts.kicad_pcb,
+            "  (footprint \"CircuitC:R_0603_1608Metric\"",
+            "(property \"Reference\" \"R1\"",
+        );
+        for expected in [
+            "(property \"Manufacturer\" \"Yageo\"",
+            "(property \"MPN\" \"RC0603FR-0710KL\"",
+            "(property \"Description\" \"resistor\"",
+        ] {
+            assert!(
+                footprint.contains(expected),
+                "board footprint is missing exact part identity property {expected}"
+            );
+        }
+
+        let virtual_identity = artifacts
+            .kicad_identities
+            .iter()
+            .find(|identity| identity.semantic_path == "divider.analysis.input")
+            .expect("virtual symbol identity must exist");
+        let virtual_symbol = balanced_block_containing(
+            &artifacts.kicad_schematic,
+            "  (symbol\n",
+            &format!("    (uuid \"{}\")", virtual_identity.uuid),
+        );
+        assert!(virtual_symbol.contains("(property \"Footprint\" \"\""));
+        assert!(virtual_symbol.contains("(property \"Description\" \"dc_voltage_source\""));
+        assert!(!virtual_symbol.contains("(property \"Manufacturer\""));
+        assert!(!virtual_symbol.contains("(property \"MPN\""));
+    }
+
+    #[test]
     fn every_emitted_kicad_uuid_has_exactly_one_identity() {
         let reference = compile(&voltage_divider()).expect("reference design must compile");
         assert_identity_map_is_total(&reference);
@@ -308,7 +365,17 @@ mod tests {
 
     #[test]
     fn relative_artifact_paths_reject_unsafe_components_at_construction() {
-        for path in ["", "/absolute", "../escape", "nested/../escape"] {
+        for path in [
+            "",
+            "/absolute",
+            "../escape",
+            "nested/../escape",
+            "CircuitC.pretty/./R.kicad_mod",
+            "CircuitC.pretty//R.kicad_mod",
+            "CircuitC.pretty/R.kicad_mod/",
+            "CircuitC.pretty\\R.kicad_mod",
+            "CircuitC.pretty/R\0.kicad_mod",
+        ] {
             assert!(
                 super::RelativeArtifactPath::try_new(path).is_err(),
                 "unsafe artifact path must be rejected: {path:?}"
