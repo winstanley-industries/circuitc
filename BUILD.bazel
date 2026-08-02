@@ -7,6 +7,7 @@ load(
     "rustfmt_test",
 )
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
+load("//bazel:ohmnivore_pin.bzl", "OHMNIVORE_SOURCE_REVISION")
 
 package(default_visibility = ["//visibility:private"])
 
@@ -21,13 +22,80 @@ rust_library(
     ],
     crate_name = "circuitc",
     crate_root = "src/lib.rs",
+    data = [
+        ":ohmnivore_executable",
+        ":ohmnivore_provenance",
+    ],
     edition = "2024",
+    rustc_env = {
+        "CIRCUITC_OHMNIVORE_SOURCE_REVISION": OHMNIVORE_SOURCE_REVISION,
+    },
     rustc_flags = RUSTC_FLAGS,
     visibility = ["//visibility:public"],
     deps = [
+        "@crates//libc",
         "@crates//serde",
         "@crates//serde_json",
         "@crates//sha2",
+    ],
+)
+
+rust_binary(
+    name = "ohmnivore_provenance_writer",
+    srcs = ["tools/simulation/provenance_writer.rs"],
+    crate_name = "ohmnivore_provenance_writer",
+    edition = "2024",
+    rustc_env = {
+        "CIRCUITC_OHMNIVORE_SOURCE_REVISION": OHMNIVORE_SOURCE_REVISION,
+    },
+    rustc_flags = RUSTC_FLAGS,
+    deps = ["@crates//sha2"],
+)
+
+genrule(
+    name = "ohmnivore_executable",
+    srcs = ["@crates//:ohmnivore__ohmnivore"],
+    outs = ["ohmnivore-cpu"],
+    cmd = "cp $(location @crates//:ohmnivore__ohmnivore) $@ && chmod 0555 $@",
+    executable = True,
+)
+
+genrule(
+    name = "ohmnivore_provenance",
+    srcs = [":ohmnivore_executable"],
+    outs = ["ohmnivore-provenance.txt"],
+    cmd = "$(location :ohmnivore_provenance_writer) $(location :ohmnivore_executable) $@",
+    tools = [":ohmnivore_provenance_writer"],
+)
+
+rust_binary(
+    name = "simulation_runner_gate",
+    testonly = True,
+    srcs = ["tools/simulation/runner_gate.rs"],
+    crate_name = "simulation_runner_gate",
+    edition = "2024",
+    rustc_flags = RUSTC_FLAGS,
+    deps = [":circuitc"],
+)
+
+sh_test(
+    name = "ohmnivore_cpu_test",
+    srcs = ["tools/simulation/ohmnivore_cpu_test.sh"],
+    args = ["$(location :simulation_runner_gate)"],
+    data = [":simulation_runner_gate"],
+)
+
+sh_test(
+    name = "ohmnivore_pin_test",
+    srcs = ["tools/simulation/ohmnivore_pin_test.sh"],
+    args = [
+        OHMNIVORE_SOURCE_REVISION,
+        "$(location MODULE.bazel)",
+        "$(location MODULE.bazel.lock)",
+    ],
+    data = [
+        "MODULE.bazel",
+        "MODULE.bazel.lock",
     ],
 )
 
@@ -61,6 +129,8 @@ rustfmt_test(
     targets = [
         ":circuitc",
         ":frontend_equivalence",
+        ":ohmnivore_provenance_writer",
+        ":simulation_runner_gate",
         ":voltage_divider",
         "//cmd/circuitc",
     ],
@@ -72,6 +142,8 @@ rust_clippy(
     deps = [
         ":circuitc",
         ":frontend_equivalence",
+        ":ohmnivore_provenance_writer",
+        ":simulation_runner_gate",
         ":voltage_divider",
         "//cmd/circuitc",
     ],
