@@ -1,5 +1,35 @@
 design physical_no_connect {
+  net TEST;
+  ground GND;
   module board_only {}
+
+  dc_source board_only.anchor V1 {
+    part "dc_voltage_source" virtual;
+    symbol "CircuitC:VDC" {
+      bind p 1 passive;
+      bind n 2 passive;
+    }
+    model "spice:Vdc";
+    schematic at (60.96 mm, 81.28 mm) rotation 0 deg;
+    voltage 1 V;
+    terminals p n;
+    connect p TEST;
+    connect n GND;
+  }
+
+  dc_source board_only.anchor_return V2 {
+    part "dc_voltage_source" virtual;
+    symbol "CircuitC:VDC" {
+      bind p 1 passive;
+      bind n 2 passive;
+    }
+    model "spice:Vdc";
+    schematic at (60.96 mm, 101.6 mm) rotation 0 deg;
+    voltage 1 V;
+    terminals p n;
+    connect p TEST;
+    connect n GND;
+  }
 
   resistor board_only.unused R1 {
     part "resistor" manufacturer "Yageo" number "RC0603FR-0710KL";
@@ -7,9 +37,9 @@ design physical_no_connect {
       bind 1 1 passive;
       bind 2 2 passive;
     }
-    schematic at (81.28 mm, 81.28 mm) rotation 0 deg;
+    schematic at (81.28 mm, 81.28 mm) rotation 90 deg;
     resistance 10 kohm;
-    no_connect 1;
+    connect 1 TEST;
     no_connect 2;
     footprint "CircuitC:R_0603_1608Metric" {
       bind 1 1;

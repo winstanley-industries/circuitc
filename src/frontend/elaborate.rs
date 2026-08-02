@@ -1987,17 +1987,25 @@ mod tests {
     }
 
     #[test]
-    fn source_can_author_a_physical_only_component_with_no_connect_pins() {
+    fn source_can_author_a_physical_only_component_with_connected_and_no_connect_pins() {
         let elaborated = elaborate_source(PHYSICAL_NO_CONNECT)
             .expect("physical-only no-connect source must elaborate");
-        let component = &elaborated.design.components[0];
+        let component = elaborated
+            .design
+            .components
+            .iter()
+            .find(|component| component.reference == "R1")
+            .expect("physical-only resistor must exist");
         assert!(component.physical.is_some());
         assert!(component.simulation.is_none());
         assert!(matches!(
             component.value,
             crate::design::ComponentValue::Resistance(_)
         ));
-        assert!(component.connections.iter().all(|connection| matches!(
+        assert!(component.connections.iter().any(|connection| {
+            matches!(&connection.state, crate::design::ConnectionState::Connected(net) if net == "TEST")
+        }));
+        assert!(component.connections.iter().any(|connection| matches!(
             connection.state,
             crate::design::ConnectionState::NoConnect
         )));

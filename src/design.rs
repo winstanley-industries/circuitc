@@ -172,9 +172,9 @@ impl Placement {
         let normalized = self.rotation_degrees.rem_euclid(360);
         let rotated = match normalized {
             0 => offset,
-            90 => PointNm::new(offset.y.checked_neg()?, offset.x),
+            90 => PointNm::new(offset.y, offset.x.checked_neg()?),
             180 => PointNm::new(offset.x.checked_neg()?, offset.y.checked_neg()?),
-            270 => PointNm::new(offset.y, offset.x.checked_neg()?),
+            270 => PointNm::new(offset.y.checked_neg()?, offset.x),
             _ => return None,
         };
         Some(PointNm::new(
@@ -1614,9 +1614,9 @@ mod tests {
             .expect("reference resistor is physical")
             .placement;
         for (rotation, offset) in [
-            (90, PointNm::new(0, i64::MIN)),
+            (90, PointNm::new(i64::MIN, 0)),
             (180, PointNm::new(i64::MIN, 0)),
-            (270, PointNm::new(i64::MIN, 0)),
+            (270, PointNm::new(0, i64::MIN)),
         ] {
             placement.rotation_degrees = rotation;
             assert_eq!(placement.transform(offset), None);

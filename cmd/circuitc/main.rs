@@ -283,6 +283,8 @@ mod anchored_output {
     #[cfg(target_os = "linux")]
     const RENAME_NOREPLACE: c_uint = 1;
     #[cfg(target_os = "linux")]
+    const ENOSYS: c_int = 38;
+    #[cfg(target_os = "linux")]
     type Mode = c_uint;
 
     #[cfg(target_os = "macos")]
@@ -302,10 +304,13 @@ mod anchored_output {
     #[cfg(target_os = "macos")]
     const RENAME_EXCL: c_uint = 0x00000004;
     #[cfg(target_os = "macos")]
+    const ENOSYS: c_int = 78;
+    #[cfg(target_os = "macos")]
     type Mode = u16;
 
     const O_RDONLY: c_int = 0;
     const O_WRONLY: c_int = 1;
+    const EINVAL: c_int = 22;
 
     unsafe extern "C" {
         fn open(path: *const c_char, flags: c_int, ...) -> c_int;
@@ -483,7 +488,14 @@ mod anchored_output {
         // cannot leave newly-created generated directories behind.
         let initial_preflight = relative_paths.iter().try_for_each(|relative| {
             if let Some(parent) =
-                open_existing_parent(&root, relative.parent().unwrap_or_else(|| Path::new("")))?
+                open_existing_parent(&root, relative.parent().unwrap_or_else(|| Path::new("")))
+                    .map_err(|error| {
+                        operation_error(
+                            "inspect output parent for",
+                            &relative.display().to_string(),
+                            error,
+                        )
+                    })?
             {
                 let target = c_name(
                     relative
@@ -516,7 +528,14 @@ mod anchored_output {
                     &root,
                     relative.parent().unwrap_or_else(|| Path::new("")),
                     &mut created_directories,
-                )?;
+                )
+                .map_err(|error| {
+                    operation_error(
+                        "create output parent for",
+                        &relative.display().to_string(),
+                        error,
+                    )
+                })?;
                 let basename = relative
                     .file_name()
                     .expect("validated generated paths always have a basename");
@@ -546,8 +565,18 @@ mod anchored_output {
         let pinned_preflight = entries.iter_mut().try_for_each(|entry| {
             entry.had_existing_target =
                 inspect_target(&entry.parent, &entry.target, Path::new(&entry.display_path))?;
-            ensure_absent(&entry.parent, &entry.temporary, "temporary staging")?;
-            ensure_absent(&entry.parent, &entry.backup, "backup staging")
+            ensure_absent(
+                &entry.parent,
+                &entry.temporary,
+                "temporary staging",
+                &entry.display_path,
+            )?;
+            ensure_absent(
+                &entry.parent,
+                &entry.backup,
+                "backup staging",
+                &entry.display_path,
+            )
         });
         if let Err(error) = pinned_preflight {
             return Err(with_cleanup_error(
@@ -561,9 +590,14 @@ mod anchored_output {
             let result = entry
                 .parent
                 .create_file(&entry.temporary)
+                .map_err(|error| {
+                    operation_error("create temporary output for", &entry.display_path, error)
+                })
                 .and_then(|mut file| {
                     temporary_files.push(index);
-                    file.write_all(entry.contents)
+                    file.write_all(entry.contents).map_err(|error| {
+                        operation_error("write temporary output for", &entry.display_path, error)
+                    })
                 });
             if let Err(error) = result {
                 return Err(with_cleanup_error(
@@ -576,9 +610,14 @@ mod anchored_output {
         let mut backed_up = Vec::new();
         for (index, entry) in entries.iter().enumerate() {
             if entry.had_existing_target {
-                if let Err(error) =
-                    rename_noreplace(&entry.parent, &entry.target, &entry.parent, &entry.backup)
-                {
+                if let Err(error) = rename_noreplace_with_context(
+                    &entry.parent,
+                    &entry.target,
+                    &entry.parent,
+                    &entry.backup,
+                    "stage backup for",
+                    &entry.display_path,
+                ) {
                     return Err(with_cleanup_error(
                         error,
                         rollback(
@@ -611,7 +650,11 @@ mod anchored_output {
                         }
                         Err(error) => {
                             return Err(with_cleanup_error(
-                                error,
+                                operation_error(
+                                    "read staged backup metadata for",
+                                    &entry.display_path,
+                                    error,
+                                ),
                                 rollback(
                                     &entries,
                                     &temporary_files,
@@ -624,7 +667,11 @@ mod anchored_output {
                     },
                     Err(error) => {
                         return Err(with_cleanup_error(
-                            error,
+                            operation_error(
+                                "inspect staged backup for",
+                                &entry.display_path,
+                                error,
+                            ),
                             rollback(
                                 &entries,
                                 &temporary_files,
@@ -652,11 +699,13 @@ mod anchored_output {
                     ),
                 ));
             }
-            if let Err(error) = rename_noreplace(
+            if let Err(error) = rename_noreplace_with_context(
                 &entry.parent,
                 &entry.temporary,
                 &entry.parent,
                 &entry.target,
+                "publish",
+                &entry.display_path,
             ) {
                 return Err(with_cleanup_error(
                     error,
@@ -728,7 +777,7 @@ mod anchored_output {
                         Ok(created) => created,
                         Err(error) => {
                             return Err(with_cleanup_error(
-                                error,
+                                output_directory_component_error(segment, error),
                                 remove_created_directories(&created),
                             ));
                         }
@@ -838,16 +887,21 @@ mod anchored_output {
         }
     }
 
-    fn ensure_absent(parent: &Directory, name: &CStr, label: &str) -> io::Result<()> {
+    fn ensure_absent(
+        parent: &Directory,
+        name: &CStr,
+        label: &str,
+        display_path: &str,
+    ) -> io::Result<()> {
         match parent.open_entry(name) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Ok(_) => Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                format!("{label} path already exists"),
+                format!("{label} path for {display_path} already exists"),
             )),
             Err(error) => Err(io::Error::new(
                 error.kind(),
-                format!("failed to inspect {label} path: {error}"),
+                format!("failed to inspect {label} path for {display_path}: {error}"),
             )),
         }
     }
@@ -873,7 +927,14 @@ mod anchored_output {
             record_cleanup_error(
                 &mut errors,
                 &format!("restore original output {}", entry.display_path),
-                rename_noreplace(&entry.parent, &entry.backup, &entry.parent, &entry.target),
+                rename_noreplace_with_context(
+                    &entry.parent,
+                    &entry.backup,
+                    &entry.parent,
+                    &entry.target,
+                    "restore backup for",
+                    &entry.display_path,
+                ),
             );
         }
         for index in temporary_files {
@@ -981,6 +1042,42 @@ mod anchored_output {
         status_result(status)
     }
 
+    fn rename_noreplace_with_context(
+        old_directory: &Directory,
+        old_name: &CStr,
+        new_directory: &Directory,
+        new_name: &CStr,
+        operation: &str,
+        display_path: &str,
+    ) -> io::Result<()> {
+        rename_noreplace(old_directory, old_name, new_directory, new_name)
+            .map_err(|error| no_replace_error(operation, display_path, error))
+    }
+
+    fn no_replace_error(operation: &str, display_path: &str, error: io::Error) -> io::Error {
+        if matches!(error.raw_os_error(), Some(EINVAL | ENOSYS)) {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "failed to {operation} {display_path}: output filesystem does not support no-replace rename: {error}"
+                ),
+            )
+        } else {
+            operation_error(
+                &format!("{operation} with no-replace rename"),
+                display_path,
+                error,
+            )
+        }
+    }
+
+    fn operation_error(operation: &str, display_path: &str, error: io::Error) -> io::Error {
+        io::Error::new(
+            error.kind(),
+            format!("failed to {operation} {display_path}: {error}"),
+        )
+    }
+
     fn c_name(name: &OsStr) -> io::Result<CString> {
         CString::new(name.as_bytes()).map_err(|_| {
             io::Error::new(
@@ -1041,6 +1138,15 @@ mod anchored_output {
         F: FnOnce() -> io::Result<()>,
     {
         write_outputs_with_hooks(output_directory, outputs, || Ok(()), |_| Ok(()), hook)
+    }
+
+    #[cfg(test)]
+    pub(super) fn unsupported_no_replace_error_for_test() -> io::Error {
+        no_replace_error(
+            "publish",
+            "nested/result.txt",
+            io::Error::from_raw_os_error(EINVAL),
+        )
     }
 }
 
@@ -1112,6 +1218,25 @@ mod tests {
             ),
             std::path::Path::new("/workspace/out")
         );
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+    ))]
+    #[test]
+    fn unsupported_no_replace_rename_reports_operation_and_filename() {
+        let error = super::anchored_output::unsupported_no_replace_error_for_test();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        let message = error.to_string();
+        assert!(message.contains("publish nested/result.txt"));
+        assert!(message.contains("output filesystem does not support no-replace rename"));
     }
 
     #[cfg(any(

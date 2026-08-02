@@ -60,12 +60,13 @@ pub fn compile(design: &Design) -> Result<CompiledArtifacts, CompileError> {
         });
     }
     let lowered_spice = spice::lower_netlist(design);
-    let project = kicad::emit_project(design);
+    let kicad_library_files = kicad_library_files(design);
+    let project = kicad::emit_project(design, &kicad_library_files);
     Ok(CompiledArtifacts {
         kicad_schematic: project.schematic,
         kicad_pcb: project.board,
         kicad_project: project.project,
-        kicad_library_files: kicad_library_files(design),
+        kicad_library_files,
         kicad_symbol_table: project.symbol_table,
         kicad_footprint_table: project.footprint_table,
         kicad_identities: project.identities,
@@ -130,6 +131,35 @@ mod tests {
     }
 
     #[test]
+    fn schematic_embeds_catalog_symbols_and_links_board_footprints_by_uuid() {
+        let artifacts = compile(&voltage_divider()).expect("reference design must compile");
+        let component_identity = artifacts
+            .kicad_identities
+            .iter()
+            .find(|identity| identity.semantic_path == "divider.r_top")
+            .expect("reference component identity must exist");
+        assert!(
+            artifacts
+                .kicad_schematic
+                .contains(&format!("    (uuid \"{}\")", component_identity.uuid)),
+            "schematic symbol must carry the component identity UUID"
+        );
+        assert!(
+            artifacts
+                .kicad_pcb
+                .contains(&format!("    (path \"/{}\")", component_identity.uuid)),
+            "board footprint must link back to the schematic symbol UUID"
+        );
+
+        let embedded = balanced_block(&artifacts.kicad_schematic, "  (lib_symbols\n");
+        assert!(embedded.contains("(symbol \"CircuitC:R\""));
+        assert!(
+            embedded.matches("(pin passive line").count() >= 2,
+            "embedded resistor definition must retain both catalog pins"
+        );
+    }
+
+    #[test]
     fn schematic_connectivity_labels_cover_every_connected_symbol_pin() {
         let design = voltage_divider();
         let connected_pin_count = design
@@ -164,9 +194,9 @@ mod tests {
     #[test]
     fn schematic_pin_coordinates_cover_every_orthogonal_rotation() {
         for (rotation, no_connect_at, connected_at) in [
-            (90, "85.09 81.28", "77.47 81.28"),
+            (90, "77.47 81.28", "85.09 81.28"),
             (180, "81.28 85.09", "81.28 77.47"),
-            (270, "77.47 81.28", "85.09 81.28"),
+            (270, "85.09 81.28", "77.47 81.28"),
         ] {
             let mut design = voltage_divider();
             let component = design
@@ -300,15 +330,38 @@ mod tests {
         let source = include_str!("../examples/physical_no_connect.circuitc");
         let compiled = crate::frontend::compile_source("physical_no_connect.circuitc", source)
             .expect("source-authored physical no-connect fixture must compile");
-        let component = &compiled.elaborated.design.components[0];
+        let component = compiled
+            .elaborated
+            .design
+            .components
+            .iter()
+            .find(|component| component.reference == "R1")
+            .expect("physical-only resistor must exist");
         assert!(component.simulation.is_none());
         assert!(
             component
                 .connections
                 .iter()
-                .all(|connection| connection.state == ConnectionState::NoConnect)
+                .any(|connection| matches!(&connection.state, ConnectionState::Connected(net) if net == "TEST"))
+        );
+        assert!(
+            component
+                .connections
+                .iter()
+                .any(|connection| connection.state == ConnectionState::NoConnect)
         );
         assert!(!compiled.artifacts.spice.contains("R1 "));
+        assert!(global_label_at(
+            &compiled.artifacts.kicad_schematic,
+            "TEST",
+            "77.47 81.28"
+        ));
+        assert!(
+            compiled
+                .artifacts
+                .kicad_schematic
+                .contains("  (no_connect (at 85.09 81.28)")
+        );
 
         let footprint_start = compiled
             .artifacts
@@ -316,7 +369,7 @@ mod tests {
             .find("(property \"Reference\" \"R1\"")
             .expect("R1 footprint must exist");
         let footprint = &compiled.artifacts.kicad_pcb[footprint_start..];
-        assert!(pad_stanza(footprint, "1").contains("(net \"unconnected-(R1-Pad1)\")"));
+        assert!(pad_stanza(footprint, "1").contains("(net \"TEST\")"));
         assert!(pad_stanza(footprint, "2").contains("(net \"unconnected-(R1-Pad2)\")"));
     }
 
@@ -328,7 +381,7 @@ mod tests {
             .as_mut()
             .expect("reference resistor is physical");
         physical.placement.rotation_degrees = 90;
-        physical.footprint.pads[0].offset.y = i64::MIN;
+        physical.footprint.pads[0].offset.x = i64::MIN;
         let result = catch_unwind(|| compile(&design));
         assert!(
             result.is_ok(),
@@ -562,5 +615,36 @@ mod tests {
         schematic.contains(&format!(
             "  (global_label \"{net}\"\n    (shape bidirectional)\n    (at {coordinates} 0)"
         ))
+    }
+
+    fn balanced_block<'a>(text: &'a str, needle: &str) -> &'a str {
+        let start = text.find(needle).expect("requested block must exist");
+        let mut depth = 0_i32;
+        let mut in_string = false;
+        let mut escaped = false;
+        for (offset, character) in text[start..].char_indices() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if character == '\\' {
+                    escaped = true;
+                } else if character == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match character {
+                '"' => in_string = true,
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &text[start..start + offset + character.len_utf8()];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("requested block must be balanced")
     }
 }

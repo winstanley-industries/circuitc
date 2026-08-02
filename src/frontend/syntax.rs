@@ -31,7 +31,6 @@ pub struct SourceFile {
     pub(crate) name: String,
     pub(crate) text: String,
     line_starts: Vec<usize>,
-    char_starts: Vec<usize>,
 }
 
 impl SourceFile {
@@ -43,12 +42,10 @@ impl SourceFile {
                 .enumerate()
                 .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
         );
-        let char_starts = text.char_indices().map(|(index, _)| index).collect();
         Self {
             name: name.into(),
             text,
             line_starts,
-            char_starts,
         }
     }
 
@@ -68,11 +65,7 @@ impl SourceFile {
         let line_index = self.line_starts.partition_point(|start| *start <= offset) - 1;
         let line = line_index + 1;
         let line_start = self.line_starts[line_index];
-        let chars_before_offset = self.char_starts.partition_point(|start| *start < offset);
-        let chars_before_line = self
-            .char_starts
-            .partition_point(|start| *start < line_start);
-        let column = chars_before_offset - chars_before_line + 1;
+        let column = self.text[line_start..offset].chars().count() + 1;
         (line, column)
     }
 }
@@ -116,7 +109,7 @@ mod tests {
     }
 
     #[test]
-    fn indexed_character_starts_scale_across_large_single_line_sources() {
+    fn unicode_columns_are_counted_across_large_single_line_sources() {
         let text = "é".repeat(4096);
         let source = SourceFile::new("large-single-line.circuitc", &text);
         for column in 1..=4097 {

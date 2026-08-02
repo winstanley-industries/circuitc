@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use crate::compile::KicadIdentity;
+use crate::compile::{KicadIdentity, KicadLibraryFile};
 use crate::design::{
     Component, ConnectionState, CopperLayer, Design, Diagnostic, PadShape, PointNm,
 };
@@ -20,15 +20,69 @@ pub(crate) struct ProjectArtifacts {
     pub identities: Vec<KicadIdentity>,
 }
 
-pub(crate) fn emit_project(design: &Design) -> ProjectArtifacts {
+pub(crate) fn emit_project(
+    design: &Design,
+    kicad_library_files: &[KicadLibraryFile],
+) -> ProjectArtifacts {
     ProjectArtifacts {
         schematic: emit_schematic(design),
         board: emit_board(design),
         project: emit_project_file(design),
-        symbol_table: "(sym_lib_table\n  (version 7)\n  (lib (name \"CircuitC\")(type \"KiCad\")(uri \"${KIPRJMOD}/CircuitC.kicad_sym\")(options \"\")(descr \"CircuitC vendored symbols\"))\n)\n".to_owned(),
-        footprint_table: "(fp_lib_table\n  (version 7)\n  (lib (name \"CircuitC\")(type \"KiCad\")(uri \"${KIPRJMOD}/CircuitC.pretty\")(options \"\")(descr \"CircuitC vendored footprints\"))\n)\n".to_owned(),
+        symbol_table: emit_symbol_table(kicad_library_files),
+        footprint_table: emit_footprint_table(kicad_library_files),
         identities: identities(design),
     }
+}
+
+fn emit_symbol_table(library_files: &[KicadLibraryFile]) -> String {
+    let mut output = String::from("(sym_lib_table\n  (version 7)\n");
+    for file in library_files {
+        let Some(name) = file.relative_path.strip_suffix(".kicad_sym") else {
+            continue;
+        };
+        writeln!(
+            output,
+            "  (lib (name {})(type \"KiCad\")(uri {})(options \"\")(descr {}))",
+            quoted(name.rsplit('/').next().unwrap_or(name)),
+            quoted(&format!("${{KIPRJMOD}}/{}", file.relative_path)),
+            quoted(&format!("{name} vendored symbols"))
+        )
+        .unwrap();
+    }
+    output.push_str(")\n");
+    output
+}
+
+fn emit_footprint_table(library_files: &[KicadLibraryFile]) -> String {
+    let mut output = String::from("(fp_lib_table\n  (version 7)\n");
+    let footprint_directories: BTreeSet<_> = library_files
+        .iter()
+        .filter_map(|file| {
+            file.relative_path
+                .rsplit_once('/')
+                .map(|(parent, _)| parent)
+        })
+        .filter(|parent| parent.ends_with(".pretty"))
+        .collect();
+    for directory in footprint_directories {
+        let Some(name) = directory
+            .rsplit('/')
+            .next()
+            .and_then(|basename| basename.strip_suffix(".pretty"))
+        else {
+            continue;
+        };
+        writeln!(
+            output,
+            "  (lib (name {})(type \"KiCad\")(uri {})(options \"\")(descr {}))",
+            quoted(name),
+            quoted(&format!("${{KIPRJMOD}}/{directory}")),
+            quoted(&format!("{name} vendored footprints"))
+        )
+        .unwrap();
+    }
+    output.push_str(")\n");
+    output
 }
 
 pub(crate) fn validate(design: &Design) -> Vec<Diagnostic> {
@@ -638,9 +692,9 @@ fn schematic_pin_position(component: &Component, symbol_pin: &str) -> Option<Poi
         .rem_euclid(360)
     {
         0 => offset,
-        90 => PointNm::new(offset.y.checked_neg()?, offset.x),
+        90 => PointNm::new(offset.y, offset.x.checked_neg()?),
         180 => PointNm::new(offset.x.checked_neg()?, offset.y.checked_neg()?),
-        270 => PointNm::new(offset.y, offset.x.checked_neg()?),
+        270 => PointNm::new(offset.y.checked_neg()?, offset.x),
         _ => return None,
     };
     Some(PointNm::new(

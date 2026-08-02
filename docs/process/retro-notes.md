@@ -3,9 +3,9 @@
 ## EPIC-0002 adversarial remediation (2026-08-01)
 
 - Exercise every accepted IR state through the public source language and the
-  supported host, not only through hand-built Rust fixtures. The physical-only
-  no-connect fixture exposed a schematic-to-PCB parity gap that unit-level
-  string checks did not.
+  supported host, not only through hand-built Rust fixtures. The fixture with
+  a physical-only/no-connect component exposed a schematic-to-PCB parity gap
+  that unit-level string checks did not.
 - Tests for nested formats must inspect the complete owning stanza or parse the
   structure. Matching only an opening line can miss absent child semantics.
 - Treat rendered semantic paths as a global namespace independently of UUID

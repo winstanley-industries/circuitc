@@ -54,6 +54,14 @@ python3 "${normalizer}" \
   --allow-ignored-check simulation_model_issue
 grep -F '"report_kind": "erc"' "${TEST_TMPDIR}/erc.normalized.json"
 
+expect_failure erc-library-allowlist \
+  'library-warning allowlists apply only to DRC reports' \
+  --raw "${erc_raw}" \
+  --normalized "${TEST_TMPDIR}/erc-allowlist.normalized.json" \
+  --expected-major 10 \
+  --identity-map "${identity_map}" \
+  --allow-library-warning R1
+
 python3 - "${unexpected_raw}" "${TEST_TMPDIR}" <<'PY'
 import copy
 import json

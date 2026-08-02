@@ -281,6 +281,37 @@ mod tests {
     }
 
     #[test]
+    fn virtual_only_bundle_tables_reference_only_published_libraries() {
+        let compiled = compile_source("virtual.circuitc", MINIMAL_VIRTUAL_SOURCE)
+            .expect("virtual-only source must compile");
+        assert_eq!(
+            compiled
+                .artifacts
+                .kicad_library_files
+                .iter()
+                .map(|file| file.relative_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["CircuitC.kicad_sym"]
+        );
+        assert!(
+            compiled
+                .artifacts
+                .kicad_symbol_table
+                .contains("${KIPRJMOD}/CircuitC.kicad_sym")
+        );
+        assert_eq!(
+            compiled.artifacts.kicad_footprint_table,
+            "(fp_lib_table\n  (version 7)\n)\n"
+        );
+        assert!(
+            !compiled
+                .artifacts
+                .kicad_footprint_table
+                .contains("CircuitC.pretty")
+        );
+    }
+
+    #[test]
     fn source_semantic_collision_reports_both_authored_entities() {
         let source = include_str!("../../examples/voltage_divider.circuitc")
             .replace("board.routes.vout_bridge", "divider.r_top");
