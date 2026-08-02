@@ -10,10 +10,10 @@ Capture the exact head before interpreting checks or reviews:
 gh pr view NUMBER --repo OWNER/REPO \
   --json number,url,state,isDraft,mergeable,reviewDecision,headRefName,headRefOid,baseRefName,statusCheckRollup
 gh pr checks NUMBER --repo OWNER/REPO
-python3 scripts/pr_thread_status.py --repo OWNER/REPO --pr NUMBER
+bazel run //tools/github:pr_thread_status -- --repo OWNER/REPO --pr NUMBER
 ```
 
-Resolve the script path relative to the skill directory. Repeat the snapshot after every push and before merge. Do not combine a current head with an earlier check or verdict.
+Repeat the snapshot after every push and before merge. Do not combine a current head with an earlier check or verdict.
 
 ## Watch checks
 

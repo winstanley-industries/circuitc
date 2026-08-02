@@ -90,7 +90,8 @@ Treat a missing row or a row without discriminating evidence as a blocker before
    - unsupported input fails with machine-readable diagnostics;
    - KiCad parser, structured ERC, and structured DRC remain final KiCad authorities;
    - APGAR and Ohmnivore cross only explicit versioned boundaries;
-   - CircuitC remains headless and Bazel remains the exclusive top-level interface.
+   - CircuitC remains headless and Bazel remains the exclusive top-level interface;
+   - the unreleased Design IR evolves in place at schema version 1, with no version bumps, migrations, or compatibility adapters; record semantic changes in `schemas/` and, when authority or wire boundaries move, in an ADR.
 5. Update architecture, ADR, epic, and schema documentation whenever implementation intentionally changes their authority, determinism, ownership, or wire semantics.
 6. Run focused tests while developing and update the ledger immediately when implementation reveals another behavior or failure path.
 
@@ -168,13 +169,13 @@ Use `github:gh-fix-ci` for failing Actions checks and `github:gh-address-comment
 
 Watch checks through completion, not merely until ordinary CI is green. Manual `workflow_dispatch` success is confidence evidence, not a substitute for required PR-event status. After every push, discard stale successes and approvals and restart the snapshot from the new head.
 
-Run the bundled read-only helper when `gh` is available:
+Run the repository-owned read-only helper when `gh` is available:
 
 ```sh
-python3 scripts/pr_thread_status.py --repo OWNER/REPO --pr NUMBER
+bazel run //tools/github:pr_thread_status -- --repo OWNER/REPO --pr NUMBER
 ```
 
-Resolve script paths relative to this skill directory. The helper reports exact head and unresolved current/outdated threads; it never writes to GitHub.
+The Bazel-owned helper reports exact head and unresolved current/outdated threads; it never writes to GitHub.
 
 ## 9. Integrate feedback in bounded rounds
 
@@ -200,7 +201,7 @@ Thread resolution is a distinct delivery operation. After a fix is pushed and th
 2. Resolve the thread only when the code now satisfies it, the changed code makes it inapplicable, or the reviewer accepted the evidence.
 3. For rejected feedback, explain why with a contract or test citation; resolve only when authorized and the disposition is unambiguous.
 4. Leave unresolved any partially addressed, disputed, or newly failing issue.
-5. Re-run `scripts/pr_thread_status.py` immediately and require zero unresolved threads before merge.
+5. Re-run `//tools/github:pr_thread_status` immediately and require zero unresolved threads before merge.
 
 Prefer `github:gh-address-comments`. If the connector cannot expose thread state or resolution, use authenticated `gh api graphql` as described in [references/github-closeout.md](references/github-closeout.md). Keep reply and resolution operations auditable, use small mutation batches, and verify every returned thread state. Do not defer thread cleanup until the merge command fails.
 

@@ -1,13 +1,18 @@
-#!/usr/bin/env python3
 """Report exact-head GitHub pull-request review-thread state without writes."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
-from typing import Any
+from collections.abc import Callable, Sequence
+from typing import Any, TextIO
+
+Runner = Callable[[list[str]], str]
+
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
 QUERY = r"""
 query ReviewThreads(
@@ -45,20 +50,23 @@ query ReviewThreads(
 
 
 def run_gh(arguments: list[str]) -> str:
-    process = subprocess.run(
-        ["gh", *arguments],
-        capture_output=True,
-        check=False,
-        text=True,
-    )
+    try:
+        process = subprocess.run(
+            ["gh", *arguments],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+    except OSError as error:
+        raise RuntimeError(f"gh CLI not available: {error}") from error
     if process.returncode != 0:
         detail = process.stderr.strip() or process.stdout.strip()
         raise RuntimeError(f"gh {' '.join(arguments[:2])} failed: {detail}")
     return process.stdout
 
 
-def current_repo() -> str:
-    return run_gh(["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"]).strip()
+def current_repo(runner: Runner = run_gh) -> str:
+    return runner(["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"]).strip()
 
 
 def parse_repo(value: str) -> tuple[str, str]:
@@ -68,38 +76,55 @@ def parse_repo(value: str) -> tuple[str, str]:
     return parts[0], parts[1]
 
 
-def graphql_page(owner: str, name: str, number: int, after: str | None) -> dict[str, Any]:
+def graphql_page(
+    owner: str,
+    name: str,
+    number: int,
+    after: str | None,
+    runner: Runner = run_gh,
+) -> dict[str, Any]:
     arguments = [
         "api",
         "graphql",
         "-f",
         f"query={QUERY}",
-        "-F",
+        "-f",
         f"owner={owner}",
-        "-F",
+        "-f",
         f"name={name}",
         "-F",
         f"number={number}",
     ]
     if after is not None:
-        arguments.extend(["-F", f"after={after}"])
-    return json.loads(run_gh(arguments))
+        arguments.extend(["-f", f"after={after}"])
+    return json.loads(runner(arguments))
 
 
-def collect(repo: str, number: int) -> dict[str, Any]:
+def collect(repo: str, number: int, runner: Runner = run_gh) -> dict[str, Any]:
     owner, name = parse_repo(repo)
     after: str | None = None
     threads: list[dict[str, Any]] = []
     head_oid: str | None = None
 
     while True:
-        payload = graphql_page(owner, name, number, after)
+        payload = graphql_page(owner, name, number, after, runner)
+        errors = payload.get("errors") or []
+        if errors:
+            raise RuntimeError(f"GitHub GraphQL errors: {json.dumps(errors, sort_keys=True)}")
         pull_request = payload.get("data", {}).get("repository", {}).get("pullRequest")
         if pull_request is None:
             raise RuntimeError(f"pull request {repo}#{number} was not found")
-        head_oid = pull_request["headRefOid"]
+
+        page_head = pull_request.get("headRefOid")
+        if not isinstance(page_head, str) or not page_head:
+            raise RuntimeError("GitHub response omitted the pull request head OID")
+        if head_oid is None:
+            head_oid = page_head
+        elif head_oid != page_head:
+            raise RuntimeError(f"head moved during pagination: {head_oid} -> {page_head}")
+
         connection = pull_request["reviewThreads"]
-        threads.extend(connection["nodes"])
+        threads.extend(connection.get("nodes") or [])
         page_info = connection["pageInfo"]
         if not page_info["hasNextPage"]:
             break
@@ -109,9 +134,10 @@ def collect(repo: str, number: int) -> dict[str, Any]:
 
     normalized = []
     for thread in threads:
-        latest_nodes = thread.pop("comments", {}).get("nodes", [])
+        latest_nodes = thread.get("comments", {}).get("nodes", [])
         latest = latest_nodes[-1] if latest_nodes else None
-        normalized.append({**thread, "latestComment": latest})
+        thread_fields = {key: value for key, value in thread.items() if key != "comments"}
+        normalized.append({**thread_fields, "latestComment": latest})
 
     unresolved = [thread for thread in normalized if not thread["isResolved"]]
     return {
@@ -132,18 +158,23 @@ def collect(repo: str, number: int) -> dict[str, Any]:
 def one_line(value: str | None, limit: int = 120) -> str:
     if not value:
         return ""
-    compact = " ".join(value.split())
+    compact = _CONTROL.sub("�", " ".join(value.split()))
     return compact if len(compact) <= limit else compact[: limit - 1] + "…"
 
 
-def print_summary(report: dict[str, Any]) -> None:
+def print_summary(report: dict[str, Any], stream: TextIO = sys.stdout) -> None:
     counts = report["counts"]
-    print(f"{report['repository']}#{report['pullRequest']} head {report['headRefOid']}")
+    print(
+        f"{one_line(report['repository'])}#{report['pullRequest']} "
+        f"head {one_line(report['headRefOid'])}",
+        file=stream,
+    )
     print(
         "threads "
         f"total={counts['total']} resolved={counts['resolved']} "
         f"unresolved={counts['unresolved']} current={counts['unresolvedCurrent']} "
-        f"outdated={counts['unresolvedOutdated']}"
+        f"outdated={counts['unresolvedOutdated']}",
+        file=stream,
     )
     for thread in report["unresolvedThreads"]:
         location = thread.get("line") or thread.get("originalLine") or "?"
@@ -151,34 +182,39 @@ def print_summary(report: dict[str, Any]) -> None:
         latest = thread.get("latestComment") or {}
         author = (latest.get("author") or {}).get("login") or "unknown"
         print(
-            f"- {thread['id']} [{state}] {thread.get('path') or '?'}:{location} "
-            f"@{author} {latest.get('url') or ''} {one_line(latest.get('body'))}"
+            f"- {one_line(thread['id'])} [{state}] "
+            f"{one_line(thread.get('path') or '?', 240)}:{location} "
+            f"@{one_line(author)} {one_line(latest.get('url') or '', 240)} "
+            f"{one_line(latest.get('body'))}",
+            file=stream,
         )
 
 
-def main() -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    runner: Runner = run_gh,
+    stdout: TextIO = sys.stdout,
+    stderr: TextIO = sys.stderr,
+) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--repo", help="GitHub repository as OWNER/REPO; defaults to current gh repo"
     )
     parser.add_argument("--pr", required=True, type=int, help="pull-request number")
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     try:
-        repo = args.repo or current_repo()
-        report = collect(repo, args.pr)
+        repo = args.repo or current_repo(runner)
+        report = collect(repo, args.pr, runner)
     except (RuntimeError, ValueError, json.JSONDecodeError) as error:
-        print(f"error: {error}", file=sys.stderr)
+        print(f"error: {error}", file=stderr)
         return 2
 
     if args.json:
-        json.dump(report, sys.stdout, indent=2, sort_keys=True)
-        sys.stdout.write("\n")
+        json.dump(report, stdout, indent=2, sort_keys=True)
+        stdout.write("\n")
     else:
-        print_summary(report)
+        print_summary(report, stdout)
     return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
