@@ -320,112 +320,46 @@ fn validate_kicad_semantic_paths(
         }
     };
 
-    register(
-        "design.schematic".to_owned(),
-        "schematic root",
-        provenance
-            .structural_spans
-            .get("design")
-            .copied()
-            .unwrap_or(Span::new(0, source.text.len())),
-    );
-    register(
-        "design.board.outline".to_owned(),
-        "board outline",
-        provenance
-            .structural_spans
-            .get("design.board.outline")
-            .copied()
-            .unwrap_or(Span::new(0, source.text.len())),
-    );
-
-    for component in components {
-        let component_span = provenance
-            .semantic_spans
-            .get(&SemanticProvenanceKey::Component(component.path.clone()))
-            .copied()
-            .unwrap_or(Span::new(0, source.text.len()));
-        register(component.path.clone(), "schematic symbol", component_span);
-        for pin in &component.symbol.pins {
-            register(
-                format!("{}.symbol.pin.{}", component.path, pin.pin),
-                "schematic pin",
-                component_span,
-            );
-            register(
-                format!("{}.connection.{}", component.path, pin.pin),
-                "schematic connection",
-                component_span,
-            );
-        }
-        if let Some(physical) = &component.physical {
-            let footprint_span = provenance
+    for descriptor in crate::kicad::generated_kicad_identity_descriptors(components, &board.routes)
+    {
+        let span = match descriptor.origin {
+            crate::kicad::GeneratedKicadIdentityOrigin::Design => {
+                provenance.structural_spans.get("design").copied()
+            }
+            crate::kicad::GeneratedKicadIdentityOrigin::BoardOutline => provenance
+                .structural_spans
+                .get("design.board.outline")
+                .copied(),
+            crate::kicad::GeneratedKicadIdentityOrigin::Component(component) => provenance
                 .semantic_spans
-                .get(&SemanticProvenanceKey::Footprint(component.path.clone()))
+                .get(&SemanticProvenanceKey::Component(component.to_owned()))
+                .copied(),
+            crate::kicad::GeneratedKicadIdentityOrigin::Footprint(component) => provenance
+                .semantic_spans
+                .get(&SemanticProvenanceKey::Footprint(component.to_owned()))
                 .copied()
-                .unwrap_or(component_span);
-            register(
-                format!("{}.footprint", component.path),
-                "PCB footprint",
-                footprint_span,
-            );
-            for property in [
-                "Reference",
-                "Value",
-                "Datasheet",
-                "Description",
-                "Manufacturer",
-                "MPN",
-            ] {
-                register(
-                    format!("{}.footprint.property.{property}", component.path),
-                    "PCB footprint property",
-                    footprint_span,
-                );
-            }
-            for pad in &physical.footprint.pads {
-                let pad_span = provenance
-                    .semantic_spans
-                    .get(&SemanticProvenanceKey::Pad {
-                        component: component.path.clone(),
-                        pad: pad.number.clone(),
-                    })
-                    .copied()
-                    .unwrap_or(footprint_span);
-                register(
-                    format!("{}.footprint.pad.{}", component.path, pad.number),
-                    "PCB pad",
-                    pad_span,
-                );
-            }
-            if let Some(graphics) =
-                crate::library::footprint_graphics(&physical.footprint.library_id)
-            {
-                for line in graphics.silkscreen_lines {
-                    register(
-                        format!(
-                            "{}.footprint.graphic.silkscreen.{}",
-                            component.path, line.semantic_name
-                        ),
-                        "PCB footprint silkscreen graphic",
-                        footprint_span,
-                    );
-                }
-                register(
-                    format!("{}.footprint.graphic.courtyard", component.path),
-                    "PCB footprint courtyard graphic",
-                    footprint_span,
-                );
-            }
+                .or_else(|| provenance.component_span(component)),
+            crate::kicad::GeneratedKicadIdentityOrigin::Pad { component, pad } => provenance
+                .semantic_spans
+                .get(&SemanticProvenanceKey::Pad {
+                    component: component.to_owned(),
+                    pad: pad.to_owned(),
+                })
+                .copied()
+                .or_else(|| {
+                    provenance
+                        .semantic_spans
+                        .get(&SemanticProvenanceKey::Footprint(component.to_owned()))
+                        .copied()
+                })
+                .or_else(|| provenance.component_span(component)),
+            crate::kicad::GeneratedKicadIdentityOrigin::Route(route) => provenance
+                .semantic_spans
+                .get(&SemanticProvenanceKey::Route(route.to_owned()))
+                .copied(),
         }
-    }
-    for route in &board.routes {
-        let span = provenance
-            .semantic_spans
-            .get(&SemanticProvenanceKey::Route(route.path.clone()))
-            .copied()
-            .unwrap_or(Span::new(0, source.text.len()));
-        register(route.path.clone(), "PCB route", span);
+        .unwrap_or(Span::new(0, source.text.len()));
+        register(descriptor.semantic_path, descriptor.diagnostic_kind, span);
     }
 }
 

@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 
 use crate::compile::{KicadIdentity, KicadLibraryFile, KicadLibraryFileKind};
 use crate::design::{
-    Component, ConnectionState, CopperLayer, Design, Diagnostic, PadShape, PointNm,
+    Component, ConnectionState, CopperLayer, Design, Diagnostic, PadShape, PointNm, RouteSegment,
 };
 
 const KICAD_BOARD_FORMAT_VERSION: u32 = 20_260_206;
@@ -291,42 +291,15 @@ fn validate_catalog_bindings(design: &Design, diagnostics: &mut Vec<Diagnostic>)
 
         match (&component.physical, part.footprint_library_id) {
             (Some(physical), Some(expected)) if physical.footprint.library_id == expected => {
-                let Some(geometry_matches) =
-                    crate::library::footprint_geometry_matches_catalog(&physical.footprint)
-                else {
-                    diagnostics.push(Diagnostic {
-                        code: "CC-KICAD-FOOTPRINT-005",
-                        path: path.to_owned(),
-                        message: format!("part catalog footprint {expected} is unavailable"),
-                    });
+                if !validate_catalog_footprint(
+                    path,
+                    expected,
+                    crate::library::footprint_geometry_matches_catalog(&physical.footprint),
+                    crate::library::footprint_library_file(expected),
+                    crate::library::footprint_graphics(expected),
+                    diagnostics,
+                ) {
                     continue;
-                };
-                if crate::library::footprint_library_file(expected).is_none() {
-                    diagnostics.push(Diagnostic {
-                        code: "CC-KICAD-FOOTPRINT-006",
-                        path: path.to_owned(),
-                        message: format!(
-                            "part catalog footprint {expected} has no publishable vendored library file"
-                        ),
-                    });
-                }
-                if crate::library::footprint_graphics(expected).is_none() {
-                    diagnostics.push(Diagnostic {
-                        code: "CC-KICAD-FOOTPRINT-007",
-                        path: path.to_owned(),
-                        message: format!(
-                            "part catalog footprint {expected} has no vendored drawing geometry"
-                        ),
-                    });
-                }
-                if !geometry_matches {
-                    diagnostics.push(Diagnostic {
-                        code: "CC-KICAD-FOOTPRINT-001",
-                        path: path.to_owned(),
-                        message: format!(
-                            "footprint {expected} geometry differs from the vendored catalog"
-                        ),
-                    });
                 }
                 for binding in &physical.pin_pad_bindings {
                     if let Some(symbol_binding) = component
@@ -376,6 +349,48 @@ fn validate_catalog_bindings(design: &Design, diagnostics: &mut Vec<Diagnostic>)
     }
 }
 
+fn validate_catalog_footprint(
+    path: &str,
+    expected: &str,
+    geometry_matches: Option<bool>,
+    library_file: Option<crate::library::LibraryFileDefinition>,
+    graphics: Option<crate::library::FootprintGraphicsDefinition>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> bool {
+    let Some(geometry_matches) = geometry_matches else {
+        diagnostics.push(Diagnostic {
+            code: "CC-KICAD-FOOTPRINT-005",
+            path: path.to_owned(),
+            message: format!("part catalog footprint {expected} is unavailable"),
+        });
+        return false;
+    };
+    if library_file.is_none() {
+        diagnostics.push(Diagnostic {
+            code: "CC-KICAD-FOOTPRINT-006",
+            path: path.to_owned(),
+            message: format!(
+                "part catalog footprint {expected} has no publishable vendored library file"
+            ),
+        });
+    }
+    if graphics.is_none() {
+        diagnostics.push(Diagnostic {
+            code: "CC-KICAD-FOOTPRINT-007",
+            path: path.to_owned(),
+            message: format!("part catalog footprint {expected} has no vendored drawing geometry"),
+        });
+    }
+    if !geometry_matches {
+        diagnostics.push(Diagnostic {
+            code: "CC-KICAD-FOOTPRINT-001",
+            path: path.to_owned(),
+            message: format!("footprint {expected} geometry differs from the vendored catalog"),
+        });
+    }
+    true
+}
+
 fn validate_publishable_symbol(
     path: &str,
     symbol: crate::library::SymbolDefinition,
@@ -402,44 +417,92 @@ fn validate_publishable_symbol(
     }
 }
 
-fn identities(design: &Design) -> Vec<KicadIdentity> {
+pub(crate) struct GeneratedKicadIdentityDescriptor<'a> {
+    pub semantic_path: String,
+    pub uuid_kind: &'static str,
+    pub uuid_fields: Vec<&'a str>,
+    pub diagnostic_kind: &'static str,
+    pub origin: GeneratedKicadIdentityOrigin<'a>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum GeneratedKicadIdentityOrigin<'a> {
+    Design,
+    BoardOutline,
+    Component(&'a str),
+    Footprint(&'a str),
+    Pad { component: &'a str, pad: &'a str },
+    Route(&'a str),
+}
+
+pub(crate) fn generated_kicad_identity_descriptors<'a>(
+    components: &'a [Component],
+    routes: &'a [RouteSegment],
+) -> Vec<GeneratedKicadIdentityDescriptor<'a>> {
     let mut result = Vec::new();
-    let mut register = |semantic_path: String, kind: &str, fields: &[&str]| {
-        result.push(KicadIdentity {
-            uuid: stable_uuid(&design.name, kind, fields),
+    let mut register = |semantic_path: String,
+                        uuid_kind: &'static str,
+                        uuid_fields: Vec<&'a str>,
+                        diagnostic_kind: &'static str,
+                        origin: GeneratedKicadIdentityOrigin<'a>| {
+        result.push(GeneratedKicadIdentityDescriptor {
             semantic_path,
+            uuid_kind,
+            uuid_fields,
+            diagnostic_kind,
+            origin,
         });
     };
-    register("design.schematic".to_owned(), "schematic-root", &[]);
-    register("design.board.outline".to_owned(), "board-outline", &[]);
-    for component in &design.components {
+    register(
+        "design.schematic".to_owned(),
+        "schematic-root",
+        Vec::new(),
+        "schematic root",
+        GeneratedKicadIdentityOrigin::Design,
+    );
+    register(
+        "design.board.outline".to_owned(),
+        "board-outline",
+        Vec::new(),
+        "board outline",
+        GeneratedKicadIdentityOrigin::BoardOutline,
+    );
+    for component in components {
         register(
             component.path.clone(),
             "schematic-symbol",
-            &[&component.path],
+            vec![&component.path],
+            "schematic symbol",
+            GeneratedKicadIdentityOrigin::Component(&component.path),
         );
         for pin in &component.symbol.pins {
             register(
                 format!("{}.symbol.pin.{}", component.path, pin.pin),
                 "schematic-pin",
-                &[&component.path, &pin.pin],
+                vec![&component.path, &pin.pin],
+                "schematic pin",
+                GeneratedKicadIdentityOrigin::Component(&component.path),
             );
-            let kind = match component.connection_for_pin(&pin.pin) {
+            let uuid_kind = match component.connection_for_pin(&pin.pin) {
                 Some(ConnectionState::Connected(_)) => "schematic-global-label",
                 Some(ConnectionState::NoConnect) => "schematic-no-connect",
                 None => "schematic-missing-connection",
             };
             register(
                 format!("{}.connection.{}", component.path, pin.pin),
-                kind,
-                &[&component.path, &pin.pin],
+                uuid_kind,
+                vec![&component.path, &pin.pin],
+                "schematic connection",
+                GeneratedKicadIdentityOrigin::Component(&component.path),
             );
         }
         if let Some(physical) = &component.physical {
             register(
                 format!("{}.footprint", component.path),
                 "footprint",
-                &[&component.path],
+                vec![&component.path],
+                "PCB footprint",
+                GeneratedKicadIdentityOrigin::Footprint(&component.path),
             );
             for property in [
                 "Reference",
@@ -452,38 +515,69 @@ fn identities(design: &Design) -> Vec<KicadIdentity> {
                 register(
                     format!("{}.footprint.property.{property}", component.path),
                     "footprint-property",
-                    &[&component.path, property],
+                    vec![&component.path, property],
+                    "PCB footprint property",
+                    GeneratedKicadIdentityOrigin::Footprint(&component.path),
                 );
             }
             for pad in &physical.footprint.pads {
                 register(
                     format!("{}.footprint.pad.{}", component.path, pad.number),
                     "footprint-pad",
-                    &[&component.path, &pad.number],
+                    vec![&component.path, &pad.number],
+                    "PCB pad",
+                    GeneratedKicadIdentityOrigin::Pad {
+                        component: &component.path,
+                        pad: &pad.number,
+                    },
                 );
             }
-            let graphics = crate::library::footprint_graphics(&physical.footprint.library_id)
-                .expect("validated catalog footprint must have drawing geometry");
-            for line in graphics.silkscreen_lines {
+            if let Some(graphics) =
+                crate::library::footprint_graphics(&physical.footprint.library_id)
+            {
+                for line in graphics.silkscreen_lines {
+                    register(
+                        format!(
+                            "{}.footprint.graphic.silkscreen.{}",
+                            component.path, line.semantic_name
+                        ),
+                        "footprint-silkscreen-line",
+                        vec![&component.path, line.semantic_name],
+                        "PCB footprint silkscreen graphic",
+                        GeneratedKicadIdentityOrigin::Footprint(&component.path),
+                    );
+                }
                 register(
-                    format!(
-                        "{}.footprint.graphic.silkscreen.{}",
-                        component.path, line.semantic_name
-                    ),
-                    "footprint-silkscreen-line",
-                    &[&component.path, line.semantic_name],
+                    format!("{}.footprint.graphic.courtyard", component.path),
+                    "footprint-courtyard",
+                    vec![&component.path],
+                    "PCB footprint courtyard graphic",
+                    GeneratedKicadIdentityOrigin::Footprint(&component.path),
                 );
             }
-            register(
-                format!("{}.footprint.graphic.courtyard", component.path),
-                "footprint-courtyard",
-                &[&component.path],
-            );
         }
     }
-    for route in &design.board.routes {
-        register(route.path.clone(), "route-segment", &[&route.path]);
+    for route in routes {
+        register(
+            route.path.clone(),
+            "route-segment",
+            vec![&route.path],
+            "PCB route",
+            GeneratedKicadIdentityOrigin::Route(&route.path),
+        );
     }
+    result
+}
+
+fn identities(design: &Design) -> Vec<KicadIdentity> {
+    let mut result: Vec<_> =
+        generated_kicad_identity_descriptors(&design.components, &design.board.routes)
+            .into_iter()
+            .map(|descriptor| KicadIdentity {
+                uuid: stable_uuid(&design.name, descriptor.uuid_kind, &descriptor.uuid_fields),
+                semantic_path: descriptor.semantic_path,
+            })
+            .collect();
     result.sort_by(|left, right| {
         (&left.semantic_path, &left.uuid).cmp(&(&right.semantic_path, &right.uuid))
     });
@@ -1302,9 +1396,14 @@ fn fnv1a64(seed: u64, bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use crate::library::{LibraryFileDefinition, symbol, symbol_library_file};
+    use crate::library::{
+        LibraryFileDefinition, footprint_graphics, footprint_library_file, symbol,
+        symbol_library_file,
+    };
 
-    use super::{millimeters, stable_uuid, validate_publishable_symbol};
+    use super::{
+        millimeters, stable_uuid, validate_catalog_footprint, validate_publishable_symbol,
+    };
 
     #[test]
     fn converts_nanometers_without_floating_point() {
@@ -1349,6 +1448,44 @@ mod tests {
             validate_publishable_symbol("divider.r_top", symbol, file, &mut diagnostics);
             assert_eq!(diagnostics.len(), 1);
             assert_eq!(diagnostics[0].code, "CC-KICAD-SYMBOL-007");
+            assert_eq!(diagnostics[0].path, "divider.r_top");
+        }
+    }
+
+    #[test]
+    fn incomplete_catalog_footprint_is_a_machine_readable_diagnostic() {
+        let footprint_id = "CircuitC:R_0603_1608Metric";
+        let library_file =
+            footprint_library_file(footprint_id).expect("footprint library file must exist");
+        let graphics = footprint_graphics(footprint_id).expect("footprint graphics must exist");
+        let cases = [
+            (
+                None,
+                Some(library_file),
+                Some(graphics),
+                "CC-KICAD-FOOTPRINT-005",
+            ),
+            (Some(true), None, Some(graphics), "CC-KICAD-FOOTPRINT-006"),
+            (
+                Some(true),
+                Some(library_file),
+                None,
+                "CC-KICAD-FOOTPRINT-007",
+            ),
+        ];
+
+        for (geometry_matches, library_file, graphics, expected_code) in cases {
+            let mut diagnostics = Vec::new();
+            validate_catalog_footprint(
+                "divider.r_top",
+                footprint_id,
+                geometry_matches,
+                library_file,
+                graphics,
+                &mut diagnostics,
+            );
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].code, expected_code);
             assert_eq!(diagnostics[0].path, "divider.r_top");
         }
     }

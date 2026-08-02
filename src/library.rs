@@ -38,6 +38,23 @@ pub(crate) struct PartDefinition {
     pub footprint_library_id: Option<&'static str>,
 }
 
+const PART_DEFINITIONS: &[PartDefinition] = &[
+    PartDefinition {
+        logical_device: "resistor",
+        manufacturer: Some("Yageo"),
+        manufacturer_part_number: Some("RC0603FR-0710KL"),
+        symbol_library_id: "CircuitC:R",
+        footprint_library_id: Some("CircuitC:R_0603_1608Metric"),
+    },
+    PartDefinition {
+        logical_device: "dc_voltage_source",
+        manufacturer: None,
+        manufacturer_part_number: None,
+        symbol_library_id: "CircuitC:VDC",
+        footprint_library_id: None,
+    },
+];
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct GraphicLineDefinition {
     pub semantic_name: &'static str,
@@ -63,27 +80,16 @@ struct FootprintPadDefinition {
 }
 
 pub(crate) fn part(identity: &PartIdentity) -> Option<PartDefinition> {
-    match (
-        identity.logical_device.as_str(),
-        identity.manufacturer.as_deref(),
-        identity.manufacturer_part_number.as_deref(),
-    ) {
-        ("resistor", Some("Yageo"), Some("RC0603FR-0710KL")) => Some(PartDefinition {
-            logical_device: "resistor",
-            manufacturer: Some("Yageo"),
-            manufacturer_part_number: Some("RC0603FR-0710KL"),
-            symbol_library_id: "CircuitC:R",
-            footprint_library_id: Some("CircuitC:R_0603_1608Metric"),
-        }),
-        ("dc_voltage_source", None, None) => Some(PartDefinition {
-            logical_device: "dc_voltage_source",
-            manufacturer: None,
-            manufacturer_part_number: None,
-            symbol_library_id: "CircuitC:VDC",
-            footprint_library_id: None,
-        }),
-        _ => None,
-    }
+    PART_DEFINITIONS.iter().copied().find(|definition| {
+        definition.logical_device == identity.logical_device
+            && definition.manufacturer == identity.manufacturer.as_deref()
+            && definition.manufacturer_part_number == identity.manufacturer_part_number.as_deref()
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn part_definitions() -> &'static [PartDefinition] {
+    PART_DEFINITIONS
 }
 
 const TWO_PASSIVE_PINS: &[SymbolPinDefinition] = &[
@@ -230,7 +236,7 @@ mod tests {
 
     use super::{
         RESISTOR_FOOTPRINT_LIBRARY, SYMBOL_LIBRARY, footprint, footprint_graphics,
-        footprint_library_file, part, symbol, symbol_library_file,
+        footprint_library_file, part, part_definitions, symbol, symbol_library_file,
     };
 
     fn balanced_block<'a>(text: &'a str, needle: &str) -> &'a str {
@@ -361,7 +367,11 @@ mod tests {
     #[test]
     fn every_catalog_entry_has_a_publishable_library_file_and_footprint_graphics() {
         let mut library_bindings = std::collections::BTreeMap::new();
-        for library_id in ["CircuitC:R", "CircuitC:VDC"] {
+        let symbol_ids: std::collections::BTreeSet<_> = part_definitions()
+            .iter()
+            .map(|definition| definition.symbol_library_id)
+            .collect();
+        for library_id in symbol_ids {
             assert!(symbol(library_id).is_some());
             let file = symbol_library_file(library_id)
                 .expect("every catalog symbol must have a publishable library file");
@@ -379,7 +389,11 @@ mod tests {
                 );
             }
         }
-        for library_id in ["CircuitC:R_0603_1608Metric"] {
+        let footprint_ids: std::collections::BTreeSet<_> = part_definitions()
+            .iter()
+            .filter_map(|definition| definition.footprint_library_id)
+            .collect();
+        for library_id in footprint_ids {
             assert!(footprint(library_id).is_some());
             assert!(footprint_graphics(library_id).is_some());
             let file = footprint_library_file(library_id)
