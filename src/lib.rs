@@ -13,6 +13,7 @@ pub mod frontend;
 mod kicad;
 mod library;
 pub mod quantity;
+pub mod simulation;
 mod spice;
 
 pub use compile::{

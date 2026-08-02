@@ -27,4 +27,21 @@ rust.toolchain(
 )
 use_repo(rust, "rust_toolchains")
 
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate.spec(
+    features = ["derive"],
+    package = "serde",
+    version = "=1.0.228",
+)
+crate.spec(
+    package = "serde_json",
+    version = "=1.0.145",
+)
+crate.spec(
+    package = "sha2",
+    version = "=0.10.9",
+)
+crate.from_specs()
+use_repo(crate, "crates")
+
 register_toolchains("@rust_toolchains//:all")
