@@ -70,6 +70,11 @@ jobs:
       contents: read
       pull-requests: write
       id-token: write
+    # R2_BUCKET doubles as the on/off switch for private transcript upload. It
+    # must be exposed through job env because secrets cannot be read directly in
+    # a step-level `if:` expression.
+    env:
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
     steps:
       - name: Gate review on CI result
         id: gate
@@ -132,6 +137,7 @@ jobs:
 
       - name: Run Claude Code review
         if: steps.gate.outputs.run == 'true'
+        id: review
         uses: anthropics/claude-code-action@e90deca47693f9457b72f2b53c17d7c445a87342 # v1.0.171
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -221,3 +227,30 @@ jobs:
             echo "::error::Claude requested changes on the current PR head."
             exit 1
           fi
+
+      - name: Upload review transcript to R2 (private)
+        # Persist the full Claude execution transcript for debugging without
+        # exposing it in the public Actions log. The step remains dormant until
+        # the R2_BUCKET secret is available to this repository.
+        if: ${{ always() && steps.gate.outputs.run == 'true' && env.R2_BUCKET != '' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          # R2 rejects the AWS CLI v2 default integrity checksums.
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          REPO: ${{ github.event.repository.name }}
+          EXEC_FILE: ${{ steps.review.outputs.execution_file }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          if [ -z "$EXEC_FILE" ] || [ ! -f "$EXEC_FILE" ]; then
+            echo "No execution file; nothing to upload."
+            exit 0
+          fi
+          key="${REPO}/pr-${PR}/run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}.json"
+          aws s3 cp "$EXEC_FILE" "s3://${R2_BUCKET}/${key}" \
+            --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" \
+            --content-type application/json
+          echo "Uploaded transcript -> r2://${R2_BUCKET}/${key}"
