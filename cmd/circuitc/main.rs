@@ -484,18 +484,27 @@ mod anchored_output {
         output_directory: &Path,
         outputs: &[(String, &[u8])],
     ) -> io::Result<super::WriteOutcome> {
-        write_outputs_with_hooks(output_directory, outputs, || Ok(()), |_| Ok(()), || Ok(()))
+        write_outputs_with_hooks(
+            output_directory,
+            outputs,
+            || Ok(()),
+            |_, file| file.sync_all(),
+            |_| Ok(()),
+            || Ok(()),
+        )
     }
 
-    fn write_outputs_with_hooks<F, G, H>(
+    fn write_outputs_with_hooks<F, S, G, H>(
         output_directory: &Path,
         outputs: &[(String, &[u8])],
         pre_anchor_hook: F,
+        mut sync_staging: S,
         mut before_publish_hook: G,
         after_publication_hook: H,
     ) -> io::Result<super::WriteOutcome>
     where
         F: FnOnce() -> io::Result<()>,
+        S: FnMut(usize, &File) -> io::Result<()>,
         G: FnMut(usize) -> io::Result<()>,
         H: FnOnce() -> io::Result<()>,
     {
@@ -608,21 +617,25 @@ mod anchored_output {
 
         let mut temporary_files = Vec::new();
         for (index, entry) in entries.iter().enumerate() {
-            let result = entry
-                .parent
-                .create_file(&entry.temporary)
-                .map_err(|error| {
-                    operation_error("create temporary output for", &entry.display_path, error)
-                })
-                .and_then(|mut file| {
-                    temporary_files.push(index);
-                    file.write_all(entry.contents).map_err(|error| {
-                        operation_error("write temporary output for", &entry.display_path, error)
-                    })
-                });
-            if let Err(error) = result {
+            let mut file = match entry.parent.create_file(&entry.temporary) {
+                Ok(file) => file,
+                Err(error) => {
+                    return Err(with_cleanup_error(
+                        operation_error("create temporary output for", &entry.display_path, error),
+                        rollback(&entries, &temporary_files, &[], &[], &created_directories),
+                    ));
+                }
+            };
+            temporary_files.push(index);
+            if let Err(error) = file.write_all(entry.contents) {
                 return Err(with_cleanup_error(
-                    error,
+                    operation_error("write temporary output for", &entry.display_path, error),
+                    rollback(&entries, &temporary_files, &[], &[], &created_directories),
+                ));
+            }
+            if let Err(error) = sync_staging(index, &file) {
+                return Err(with_cleanup_error(
+                    operation_error("sync temporary output for", &entry.display_path, error),
                     rollback(&entries, &temporary_files, &[], &[], &created_directories),
                 ));
             }
@@ -1144,7 +1157,33 @@ mod anchored_output {
     where
         F: FnOnce() -> io::Result<()>,
     {
-        write_outputs_with_hooks(output_directory, outputs, hook, |_| Ok(()), || Ok(()))
+        write_outputs_with_hooks(
+            output_directory,
+            outputs,
+            hook,
+            |_, file| file.sync_all(),
+            |_| Ok(()),
+            || Ok(()),
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn write_outputs_with_staging_sync_hook<F>(
+        output_directory: &Path,
+        outputs: &[(String, &[u8])],
+        mut hook: F,
+    ) -> io::Result<super::WriteOutcome>
+    where
+        F: FnMut(usize) -> io::Result<()>,
+    {
+        write_outputs_with_hooks(
+            output_directory,
+            outputs,
+            || Ok(()),
+            |index, _| hook(index),
+            |_| Ok(()),
+            || Ok(()),
+        )
     }
 
     #[cfg(test)]
@@ -1156,7 +1195,14 @@ mod anchored_output {
     where
         F: FnMut(usize) -> io::Result<()>,
     {
-        write_outputs_with_hooks(output_directory, outputs, || Ok(()), hook, || Ok(()))
+        write_outputs_with_hooks(
+            output_directory,
+            outputs,
+            || Ok(()),
+            |_, file| file.sync_all(),
+            hook,
+            || Ok(()),
+        )
     }
 
     #[cfg(test)]
@@ -1168,7 +1214,14 @@ mod anchored_output {
     where
         F: FnOnce() -> io::Result<()>,
     {
-        write_outputs_with_hooks(output_directory, outputs, || Ok(()), |_| Ok(()), hook)
+        write_outputs_with_hooks(
+            output_directory,
+            outputs,
+            || Ok(()),
+            |_, file| file.sync_all(),
+            |_| Ok(()),
+            hook,
+        )
     }
 
     #[cfg(test)]
@@ -1597,6 +1650,68 @@ mod tests {
         fs::set_permissions(&target, fs::Permissions::from_mode(0o600))
             .expect("restore target permissions for cleanup");
         assert_eq!(fs::read(&target).expect("read preserved target"), b"old");
+        fs::remove_dir_all(&scratch).expect("remove test scratch directory");
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+    ))]
+    #[test]
+    fn staging_sync_failure_preserves_originals_without_residue() {
+        use std::fs;
+        use std::io;
+
+        let scratch = scratch_directory("staging-sync-failure");
+        let output = scratch.join("output");
+        fs::create_dir(&output).expect("create output directory");
+        fs::write(output.join("first.txt"), b"old first").expect("write first original");
+        fs::write(output.join("second.txt"), b"old second").expect("write second original");
+        let outputs = [
+            ("first.txt".to_owned(), b"new first".as_slice()),
+            ("second.txt".to_owned(), b"new second".as_slice()),
+        ];
+
+        let error = super::anchored_output::write_outputs_with_staging_sync_hook(
+            &output,
+            &outputs,
+            |index| {
+                if index == 1 {
+                    Err(io::Error::other("injected staging sync failure"))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect_err("staging sync failure must abort publication");
+
+        assert!(
+            error
+                .to_string()
+                .contains("sync temporary output for second.txt"),
+            "unexpected staging sync error: {error}"
+        );
+        assert_eq!(
+            fs::read(output.join("first.txt")).expect("read first original"),
+            b"old first"
+        );
+        assert_eq!(
+            fs::read(output.join("second.txt")).expect("read second original"),
+            b"old second"
+        );
+        assert_eq!(
+            fs::read_dir(&output)
+                .expect("list output directory")
+                .count(),
+            2,
+            "failed staging sync must remove every temporary file"
+        );
         fs::remove_dir_all(&scratch).expect("remove test scratch directory");
     }
 

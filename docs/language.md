@@ -84,6 +84,8 @@ coordinate envelope, dimensional mismatch, and electrical exponents outside
 `[-18, 18]`. Electrical values fold insignificant decimal zeros into a unique
 canonical coefficient and exponent, so forms such as `10 kohm` and
 `10000 ohm` elaborate identically.
+Orthogonal rotation is counterclockwise as rendered; in KiCad's Y-down frame,
+an offset `(x, y)` at 90 degrees maps to `(y, -x)`.
 
 Each component has exactly one part, symbol, schematic position, and
 kind-appropriate value, plus at most one footprint. `model` and `terminals` are

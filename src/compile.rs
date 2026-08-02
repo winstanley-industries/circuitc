@@ -114,7 +114,8 @@ mod tests {
     use std::panic::catch_unwind;
 
     use crate::demo::voltage_divider;
-    use crate::design::{ConnectionState, ModuleInstance};
+    use crate::design::{ComponentValue, ConnectionState, CopperLayer, ModuleInstance};
+    use crate::quantity::{Quantity, Unit};
 
     use super::{CompiledArtifacts, compile};
 
@@ -258,6 +259,43 @@ mod tests {
             assert!(
                 graphic.contains(&format!("(uuid \"{}\")", identity.uuid)),
                 "{semantic_path} graphic and identity UUID diverged: {graphic}"
+            );
+        }
+    }
+
+    #[test]
+    fn back_layer_footprint_graphics_and_pads_use_back_layers() {
+        let mut design = voltage_divider();
+        design.components[0]
+            .physical
+            .as_mut()
+            .expect("reference resistor must be physical")
+            .placement
+            .layer = CopperLayer::Back;
+        let artifacts = compile(&design).expect("back-layer design must compile");
+        let footprint = balanced_block_containing(
+            &artifacts.kicad_pcb,
+            "  (footprint ",
+            "(property \"Reference\" \"R1\"",
+        );
+        for marker in [
+            "    (fp_line\n      (start -0.45 -0.5)",
+            "    (fp_line\n      (start -0.45 0.5)",
+        ] {
+            assert!(
+                balanced_block(footprint, marker).contains("(layer \"B.SilkS\")"),
+                "back-layer silkscreen graphic has the wrong layer"
+            );
+        }
+        assert!(
+            balanced_block(footprint, "    (fp_rect\n      (start -1.7 -0.75)")
+                .contains("(layer \"B.CrtYd\")"),
+            "back-layer courtyard graphic has the wrong layer"
+        );
+        for pad in ["1", "2"] {
+            assert!(
+                pad_stanza(footprint, pad).contains("(layers \"B.Cu\" \"B.Paste\" \"B.Mask\")"),
+                "back-layer pad {pad} has the wrong copper/paste/mask layers"
             );
         }
     }
@@ -437,6 +475,7 @@ mod tests {
         design.canonicalize();
 
         let artifacts = compile(&design).expect("physical-only no-connect must compile");
+        assert_component_value(&artifacts, "divider.r_top", "R1", "10kΩ");
         assert!(artifacts.kicad_schematic.contains("  (no_connect (at "));
         assert!(artifacts.kicad_identities.iter().any(|identity| {
             identity.semantic_path == "divider.r_top.connection.1"
@@ -466,6 +505,15 @@ mod tests {
 
         let connected_pad = pad_stanza(footprint, "2");
         assert!(connected_pad.contains("(net \"VOUT\")"));
+
+        design
+            .components
+            .iter_mut()
+            .find(|component| component.reference == "R1")
+            .expect("reference resistor exists")
+            .value = ComponentValue::Resistance(Quantity::new(22, 3, Unit::Ohm));
+        let changed = compile(&design).expect("changed exact value must compile");
+        assert_component_value(&changed, "divider.r_top", "R1", "22kΩ");
     }
 
     #[test]
@@ -494,6 +542,7 @@ mod tests {
                 .any(|connection| connection.state == ConnectionState::NoConnect)
         );
         assert!(!compiled.artifacts.spice.contains("R1 "));
+        assert_component_value(&compiled.artifacts, "board_only.unused", "R1", "10kΩ");
         assert!(global_label_at(
             &compiled.artifacts.kicad_schematic,
             "TEST",
@@ -832,6 +881,33 @@ mod tests {
         uuids
     }
 
+    fn assert_component_value(
+        artifacts: &CompiledArtifacts,
+        semantic_path: &str,
+        reference: &str,
+        value: &str,
+    ) {
+        let identity = artifacts
+            .kicad_identities
+            .iter()
+            .find(|identity| identity.semantic_path == semantic_path)
+            .unwrap_or_else(|| panic!("missing component identity {semantic_path}"));
+        let schematic = balanced_block_containing(
+            &artifacts.kicad_schematic,
+            "  (symbol\n",
+            &format!("    (uuid \"{}\")", identity.uuid),
+        );
+        assert!(schematic.contains(&format!("(property \"Reference\" \"{reference}\"")));
+        assert!(schematic.contains(&format!("(property \"Value\" \"{value}\"")));
+
+        let footprint = balanced_block_containing(
+            &artifacts.kicad_pcb,
+            "  (footprint ",
+            &format!("(property \"Reference\" \"{reference}\""),
+        );
+        assert!(footprint.contains(&format!("(property \"Value\" \"{value}\"")));
+    }
+
     fn pad_stanza<'a>(footprint: &'a str, pad: &str) -> &'a str {
         let marker = format!("    (pad \"{pad}\"");
         let start = footprint.find(&marker).expect("pad stanza must exist");
@@ -885,5 +961,15 @@ mod tests {
             }
         }
         panic!("requested block must be balanced")
+    }
+
+    fn balanced_block_containing<'a>(text: &'a str, block_marker: &str, needle: &str) -> &'a str {
+        let needle_start = text.find(needle).expect("contained marker must exist");
+        let block_start = text[..needle_start]
+            .rfind(block_marker)
+            .expect("enclosing block must exist");
+        let block = balanced_block(&text[block_start..], block_marker);
+        assert!(block.contains(needle), "marker escaped its enclosing block");
+        block
     }
 }

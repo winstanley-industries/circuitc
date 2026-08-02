@@ -137,8 +137,9 @@ parts instead of misrepresenting their connectivity.
 
 Canonical schematic anchors are unique. The KiCad backend additionally derives
 every rotated symbol-pin connection point before emission and rejects a shared
-point whose canonical connection states differ, preventing distinct nets from
-being collapsed by coincident label anchors.
+point unless its canonical connection states are identical and connected.
+Coincident no-connect pins are rejected rather than merged, preventing distinct
+intent from being collapsed by shared anchors.
 
 Every backend integration test has three levels:
 

@@ -2105,6 +2105,34 @@ mod tests {
     }
 
     #[test]
+    fn module_ports_accept_inout_with_an_explicit_no_connect_state() {
+        let source = REFERENCE.replacen(
+            "port input GND passive connect GND;",
+            "port inout GND passive no_connect;",
+            1,
+        );
+        let elaborated = elaborate_source(&source)
+            .expect("inout no-connect module port must elaborate successfully");
+        let port = elaborated
+            .design
+            .modules
+            .iter()
+            .flat_map(|module| &module.ports)
+            .find(|port| {
+                port.name == "GND"
+                    && port.direction == crate::design::PortDirection::InOut
+                    && port.state == crate::design::ConnectionState::NoConnect
+            })
+            .expect("lowered inout no-connect port must exist");
+        assert_eq!(port.direction, crate::design::PortDirection::InOut);
+        assert_eq!(port.state, crate::design::ConnectionState::NoConnect);
+        elaborated
+            .design
+            .validate()
+            .expect("inout no-connect module port must satisfy the Design IR contract");
+    }
+
+    #[test]
     fn source_can_author_a_physical_only_component_with_connected_and_no_connect_pins() {
         let elaborated = elaborate_source(PHYSICAL_NO_CONNECT)
             .expect("physical-only no-connect source must elaborate");
