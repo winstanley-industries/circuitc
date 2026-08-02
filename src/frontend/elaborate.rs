@@ -2352,6 +2352,26 @@ mod tests {
             1,
         );
 
+        const MODEL: &str = "model \"spice:R\";";
+        let duplicate_model = REFERENCE.replacen(
+            &format!("    {MODEL}\n"),
+            &format!("    {MODEL}\n    {MODEL}\n"),
+            1,
+        );
+        let start = duplicate_model
+            .match_indices(MODEL)
+            .nth(1)
+            .map(|(start, _)| start)
+            .expect("duplicate model declaration exists");
+        assert_source_diagnostic(
+            &duplicate_model,
+            "CC-LANG-MODEL-002",
+            "component model is declared more than once",
+            start,
+            MODEL,
+            1,
+        );
+
         let duplicate_library_pin = REFERENCE.replacen("bind 2 2 passive;", "bind 2 1 passive;", 1);
         let start = duplicate_library_pin
             .find("bind 2 1 passive;")

@@ -53,15 +53,15 @@ pub fn compile(design: &Design) -> Result<CompiledArtifacts, CompileError> {
     design
         .validate()
         .map_err(|diagnostics| CompileError { diagnostics })?;
-    let backend_diagnostics = kicad::validate(design);
-    if !backend_diagnostics.is_empty() {
+    let validated_kicad = kicad::validate(design);
+    if !validated_kicad.diagnostics.is_empty() {
         return Err(CompileError {
-            diagnostics: backend_diagnostics,
+            diagnostics: validated_kicad.diagnostics,
         });
     }
     let lowered_spice = spice::lower_netlist(design);
     let kicad_library_files = kicad_library_files(design);
-    let project = kicad::emit_project(design, &kicad_library_files);
+    let project = kicad::emit_project(design, &kicad_library_files, validated_kicad.identities);
     Ok(CompiledArtifacts {
         kicad_schematic: project.schematic,
         kicad_pcb: project.board,
@@ -425,6 +425,17 @@ mod tests {
         );
 
         let mut design = voltage_divider();
+        design.components[0].symbol.library_id = "CircuitC:VDC".to_owned();
+        let diagnostics = compile(&design)
+            .expect_err("part and symbol catalog drift must fail")
+            .diagnostics;
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CC-KICAD-SYMBOL-001")
+        );
+
+        let mut design = voltage_divider();
         design.components[0].symbol.library_id = "CircuitC:UNKNOWN".to_owned();
         let result = catch_unwind(|| compile(&design));
         let diagnostics = result
@@ -458,6 +469,37 @@ mod tests {
             diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.code == "CC-KICAD-SYMBOL-003")
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CC-KICAD-SYMBOL-004")
+        );
+
+        let mut design = voltage_divider();
+        design.components[0].physical = None;
+        let diagnostics = compile(&design)
+            .expect_err("physical catalog parts require physical implementations")
+            .diagnostics;
+        for code in ["CC-KICAD-SYMBOL-005", "CC-KICAD-FOOTPRINT-004"] {
+            assert!(
+                diagnostics.iter().any(|diagnostic| diagnostic.code == code),
+                "missing {code}: {diagnostics:#?}"
+            );
+        }
+
+        let mut design = voltage_divider();
+        let physical = design.components[0]
+            .physical
+            .clone()
+            .expect("reference resistor is physical");
+        design.components[2].physical = Some(physical);
+        let diagnostics = crate::kicad::validate(&design).diagnostics;
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CC-KICAD-FOOTPRINT-003"),
+            "missing CC-KICAD-FOOTPRINT-003: {diagnostics:#?}"
         );
 
         let mut design = voltage_divider();

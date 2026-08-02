@@ -9,6 +9,8 @@ golden_diagnostic="$4"
 rust_generator="$5"
 equivalence="$6"
 project_validator="$7"
+normalizer="$8"
+clean_erc_fixture="$9"
 
 first_dir="${TEST_TMPDIR}/first"
 second_dir="${TEST_TMPDIR}/second"
@@ -37,6 +39,13 @@ done
 cmp \
   "${first_dir}/voltage_divider.kicad-map.json" \
   "${second_dir}/voltage_divider.kicad-map.json"
+python3 "${normalizer}" \
+  --raw "${clean_erc_fixture}" \
+  --normalized "${TEST_TMPDIR}/identity-map.normalized.json" \
+  --expected-major 10 \
+  --allow-ignored-check simulation_model_issue \
+  --identity-map "${first_dir}/voltage_divider.kicad-map.json"
+grep -F '"report_kind": "erc"' "${TEST_TMPDIR}/identity-map.normalized.json"
 "${project_validator}" \
   --project "${first_dir}/voltage_divider.kicad_pro" \
   --expected-filename voltage_divider.kicad_pro \

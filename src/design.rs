@@ -1383,7 +1383,10 @@ mod tests {
 
     use crate::demo::voltage_divider;
 
-    use super::{ComponentValue, ConnectionState, MAX_ABS_COORDINATE_NM, PinPadBinding, PointNm};
+    use super::{
+        ComponentValue, ConnectionState, CopperLayer, MAX_ABS_COORDINATE_NM, PinPadBinding,
+        Placement, PointNm,
+    };
 
     fn has_code(diagnostics: &[super::Diagnostic], code: &str) -> bool {
         diagnostics.iter().any(|diagnostic| diagnostic.code == code)
@@ -1520,6 +1523,10 @@ mod tests {
         assert_rejected(design, "CC-COMP-007");
 
         let mut design = voltage_divider();
+        design.components[0].part.logical_device.clear();
+        assert_rejected(design, "CC-PART-001");
+
+        let mut design = voltage_divider();
         design.components[0].part.manufacturer = None;
         design.components[0].part.manufacturer_part_number = None;
         assert_rejected(design, "CC-PART-002");
@@ -1620,6 +1627,24 @@ mod tests {
         ] {
             placement.rotation_degrees = rotation;
             assert_eq!(placement.transform(offset), None);
+        }
+    }
+
+    #[test]
+    fn transform_applies_each_supported_orthogonal_rotation() {
+        let offset = PointNm::new(1_000_000, 2_000_000);
+        for (rotation_degrees, expected) in [
+            (0, PointNm::new(11_000_000, 22_000_000)),
+            (90, PointNm::new(12_000_000, 19_000_000)),
+            (180, PointNm::new(9_000_000, 18_000_000)),
+            (270, PointNm::new(8_000_000, 21_000_000)),
+        ] {
+            let placement = Placement {
+                position: PointNm::new(10_000_000, 20_000_000),
+                rotation_degrees,
+                layer: CopperLayer::Front,
+            };
+            assert_eq!(placement.transform(offset), Some(expected));
         }
     }
 

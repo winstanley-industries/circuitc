@@ -20,9 +20,15 @@ pub(crate) struct ProjectArtifacts {
     pub identities: Vec<KicadIdentity>,
 }
 
+pub(crate) struct Validation {
+    pub diagnostics: Vec<Diagnostic>,
+    pub identities: Vec<KicadIdentity>,
+}
+
 pub(crate) fn emit_project(
     design: &Design,
     kicad_library_files: &[KicadLibraryFile],
+    identities: Vec<KicadIdentity>,
 ) -> ProjectArtifacts {
     ProjectArtifacts {
         schematic: emit_schematic(design),
@@ -30,7 +36,7 @@ pub(crate) fn emit_project(
         project: emit_project_file(design),
         symbol_table: emit_symbol_table(kicad_library_files),
         footprint_table: emit_footprint_table(kicad_library_files),
-        identities: identities(design),
+        identities,
     }
 }
 
@@ -85,32 +91,32 @@ fn emit_footprint_table(library_files: &[KicadLibraryFile]) -> String {
     output
 }
 
-pub(crate) fn validate(design: &Design) -> Vec<Diagnostic> {
+pub(crate) fn validate(design: &Design) -> Validation {
     let mut diagnostics = Vec::new();
     validate_catalog_bindings(design, &mut diagnostics);
     validate_schematic_connection_points(design, &mut diagnostics);
-    let mut uuids = BTreeMap::new();
-    let mut semantic_paths = BTreeMap::new();
-    if diagnostics.is_empty() {
-        for identity in identities(design) {
-            if let Some(first_uuid) =
-                semantic_paths.insert(identity.semantic_path.clone(), identity.uuid.clone())
-            {
+    let identities = if diagnostics.is_empty() {
+        let identities = identities(design);
+        for pair in identities.windows(2) {
+            let first = &pair[0];
+            let duplicate = &pair[1];
+            if first.semantic_path == duplicate.semantic_path {
                 diagnostics.push(Diagnostic {
                     code: "CC-KICAD-ID-002",
-                    path: identity.semantic_path.clone(),
+                    path: duplicate.semantic_path.clone(),
                     message: format!(
-                        "generated KiCad semantic path is shared by UUIDs {first_uuid} and {}",
-                        identity.uuid
+                        "generated KiCad semantic path is shared by UUIDs {} and {}",
+                        first.uuid, duplicate.uuid
                     ),
                 });
             }
-            if let Some(first_path) =
-                uuids.insert(identity.uuid.clone(), identity.semantic_path.clone())
-            {
+        }
+        let mut uuids: BTreeMap<&str, &str> = BTreeMap::new();
+        for identity in &identities {
+            if let Some(first_path) = uuids.insert(&identity.uuid, &identity.semantic_path) {
                 diagnostics.push(Diagnostic {
                     code: "CC-KICAD-ID-001",
-                    path: identity.semantic_path,
+                    path: identity.semantic_path.clone(),
                     message: format!(
                         "generated KiCad UUID {} collides with entity {first_path}",
                         identity.uuid
@@ -118,8 +124,14 @@ pub(crate) fn validate(design: &Design) -> Vec<Diagnostic> {
                 });
             }
         }
+        identities
+    } else {
+        Vec::new()
+    };
+    Validation {
+        diagnostics,
+        identities,
     }
-    diagnostics
 }
 
 fn validate_schematic_connection_points(design: &Design, diagnostics: &mut Vec<Diagnostic>) {
