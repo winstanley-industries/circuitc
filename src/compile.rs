@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::{Component, Path};
 
 use crate::design::{Design, Diagnostic};
 use crate::spice::SpiceNameMap;
@@ -17,12 +18,66 @@ pub enum KicadLibraryFileKind {
     Footprint,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct RelativeArtifactPath(String);
+
+impl RelativeArtifactPath {
+    pub fn try_new(path: impl Into<String>) -> Result<Self, InvalidRelativeArtifactPath> {
+        let path = path.into();
+        let parsed = Path::new(&path);
+        if path.is_empty()
+            || parsed.is_absolute()
+            || parsed
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(InvalidRelativeArtifactPath { path });
+        }
+        Ok(Self(path))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn as_path(&self) -> &Path {
+        Path::new(&self.0)
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl fmt::Display for RelativeArtifactPath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InvalidRelativeArtifactPath {
+    path: String,
+}
+
+impl fmt::Display for InvalidRelativeArtifactPath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "artifact path must be non-empty, relative, and contain only normal components: {:?}",
+            self.path
+        )
+    }
+}
+
+impl std::error::Error for InvalidRelativeArtifactPath {}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KicadLibraryFile {
     pub kind: KicadLibraryFileKind,
     pub nickname: String,
-    pub relative_path: String,
-    pub table_relative_path: String,
+    pub relative_path: RelativeArtifactPath,
+    pub table_relative_path: RelativeArtifactPath,
     pub contents: String,
 }
 
@@ -101,8 +156,10 @@ fn kicad_library_files(design: &Design) -> Vec<KicadLibraryFile> {
         .map(|(relative_path, definition)| KicadLibraryFile {
             kind: definition.kind,
             nickname: definition.nickname.to_owned(),
-            relative_path: relative_path.to_owned(),
-            table_relative_path: definition.table_relative_path.to_owned(),
+            relative_path: RelativeArtifactPath::try_new(relative_path)
+                .expect("catalog library file path must be a safe relative artifact path"),
+            table_relative_path: RelativeArtifactPath::try_new(definition.table_relative_path)
+                .expect("catalog table path must be a safe relative artifact path"),
             contents: definition.contents.to_owned(),
         })
         .collect()
@@ -235,7 +292,33 @@ mod tests {
         let physical_no_connect =
             crate::frontend::compile_source("physical_no_connect.circuitc", source)
                 .expect("physical no-connect fixture must compile");
+        let physical_no_connect_repeat =
+            crate::frontend::compile_source("physical_no_connect.circuitc", source)
+                .expect("physical no-connect fixture must compile repeatedly");
+        assert_eq!(
+            physical_no_connect.artifacts, physical_no_connect_repeat.artifacts,
+            "physical-only/no-connect artifacts must be byte-stable across repeat builds"
+        );
+        assert_eq!(
+            physical_no_connect.kicad_identity_map, physical_no_connect_repeat.kicad_identity_map,
+            "physical-only/no-connect identity maps must be byte-stable across repeat builds"
+        );
         assert_identity_map_is_total(&physical_no_connect.artifacts);
+    }
+
+    #[test]
+    fn relative_artifact_paths_reject_unsafe_components_at_construction() {
+        for path in ["", "/absolute", "../escape", "nested/../escape"] {
+            assert!(
+                super::RelativeArtifactPath::try_new(path).is_err(),
+                "unsafe artifact path must be rejected: {path:?}"
+            );
+        }
+        let path =
+            super::RelativeArtifactPath::try_new("CircuitC.pretty/R_0603_1608Metric.kicad_mod")
+                .expect("catalog path must be valid");
+        assert_eq!(path.as_str(), "CircuitC.pretty/R_0603_1608Metric.kicad_mod");
+        assert_eq!(path.as_path(), std::path::Path::new(path.as_str()));
     }
 
     #[test]

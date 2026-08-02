@@ -46,7 +46,7 @@ fn main() -> ExitCode {
         artifacts
             .kicad_library_files
             .into_iter()
-            .map(|file| (file.relative_path, file.contents)),
+            .map(|file| (file.relative_path.into_string(), file.contents)),
     );
     outputs.extend([
         ("sym-lib-table".to_owned(), artifacts.kicad_symbol_table),

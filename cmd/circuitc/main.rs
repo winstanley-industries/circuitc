@@ -64,13 +64,12 @@ fn run(arguments: Vec<OsString>) -> Result<(), u8> {
             compiled.artifacts.kicad_project.as_bytes(),
         ),
     ];
-    outputs.extend(
-        compiled
-            .artifacts
-            .kicad_library_files
-            .iter()
-            .map(|file| (file.relative_path.clone(), file.contents.as_bytes())),
-    );
+    outputs.extend(compiled.artifacts.kicad_library_files.iter().map(|file| {
+        (
+            file.relative_path.as_str().to_owned(),
+            file.contents.as_bytes(),
+        )
+    }));
     outputs.extend([
         (
             "sym-lib-table".to_owned(),
@@ -315,6 +314,8 @@ mod anchored_output {
     #[cfg(target_os = "linux")]
     const ENOSYS: c_int = 38;
     #[cfg(target_os = "linux")]
+    const ENOTSUP_OR_EOPNOTSUPP: c_int = 95;
+    #[cfg(target_os = "linux")]
     type Mode = c_uint;
 
     #[cfg(target_os = "macos")]
@@ -335,6 +336,8 @@ mod anchored_output {
     const RENAME_EXCL: c_uint = 0x00000004;
     #[cfg(target_os = "macos")]
     const ENOSYS: c_int = 78;
+    #[cfg(target_os = "macos")]
+    const ENOTSUP_OR_EOPNOTSUPP: c_int = 45;
     #[cfg(target_os = "macos")]
     type Mode = u16;
 
@@ -1161,7 +1164,10 @@ mod anchored_output {
     }
 
     fn no_replace_error(operation: &str, display_path: &str, error: io::Error) -> io::Error {
-        if matches!(error.raw_os_error(), Some(EINVAL | ENOSYS)) {
+        if matches!(
+            error.raw_os_error(),
+            Some(EINVAL | ENOSYS | ENOTSUP_OR_EOPNOTSUPP)
+        ) {
             io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!(
@@ -1293,6 +1299,15 @@ mod anchored_output {
             io::Error::from_raw_os_error(EINVAL),
         )
     }
+
+    #[cfg(test)]
+    pub(super) fn unsupported_no_replace_filesystem_error_for_test() -> io::Error {
+        no_replace_error(
+            "publish",
+            "nested/result.txt",
+            io::Error::from_raw_os_error(ENOTSUP_OR_EOPNOTSUPP),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -1405,11 +1420,15 @@ mod tests {
     ))]
     #[test]
     fn unsupported_no_replace_rename_reports_operation_and_filename() {
-        let error = super::anchored_output::unsupported_no_replace_error_for_test();
-        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
-        let message = error.to_string();
-        assert!(message.contains("publish nested/result.txt"));
-        assert!(message.contains("output filesystem does not support no-replace rename"));
+        for error in [
+            super::anchored_output::unsupported_no_replace_error_for_test(),
+            super::anchored_output::unsupported_no_replace_filesystem_error_for_test(),
+        ] {
+            assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+            let message = error.to_string();
+            assert!(message.contains("publish nested/result.txt"));
+            assert!(message.contains("output filesystem does not support no-replace rename"));
+        }
     }
 
     #[cfg(any(

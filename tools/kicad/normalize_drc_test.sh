@@ -40,6 +40,7 @@ python3 "${normalizer}" \
   --allow-ignored-check missing_courtyard \
   --allow-ignored-check track_not_centered_on_via
 cmp "${first_normalized}" "${second_normalized}"
+grep -F '"report_kind": "drc"' "${first_normalized}"
 
 expect_failure unexpected-drc board.routes.vout_bridge \
   --raw "${unexpected_raw}" \
@@ -100,7 +101,48 @@ second["items"][0]["description"] = "Second mapped DRC item"
 second["type"] = "second_clearance"
 multiple["violations"] = [finding, second]
 (target / "drc-multiple.json").write_text(json.dumps(multiple), encoding="utf-8")
+
+finding_not_object = copy.deepcopy(report)
+finding_not_object["violations"] = []
+finding_not_object["unconnected_items"] = ["not-an-object"]
+(target / "drc-finding-not-object.json").write_text(
+    json.dumps(finding_not_object), encoding="utf-8"
+)
+
+finding_missing_items = copy.deepcopy(report)
+finding_missing_items["violations"] = []
+finding_missing_items["unconnected_items"] = [copy.deepcopy(finding)]
+finding_missing_items["unconnected_items"][0].pop("items")
+(target / "drc-finding-missing-items.json").write_text(
+    json.dumps(finding_missing_items), encoding="utf-8"
+)
+
+ignored_missing_description = copy.deepcopy(report)
+ignored_missing_description["violations"] = []
+ignored_missing_description["ignored_checks"] = [{"key": "missing_courtyard"}]
+(target / "drc-ignored-missing-description.json").write_text(
+    json.dumps(ignored_missing_description), encoding="utf-8"
+)
 PY
+
+expect_failure finding-not-object \
+  'every KiCad unconnected finding must be an object' \
+  --raw "${TEST_TMPDIR}/drc-finding-not-object.json" \
+  --normalized "${TEST_TMPDIR}/drc-finding-not-object.normalized.json" \
+  --expected-major 10
+
+expect_failure finding-missing-items \
+  'every KiCad unconnected finding must contain an items list' \
+  --raw "${TEST_TMPDIR}/drc-finding-missing-items.json" \
+  --normalized "${TEST_TMPDIR}/drc-finding-missing-items.normalized.json" \
+  --expected-major 10
+
+expect_failure ignored-missing-description \
+  'every ignored KiCad check must have a stable key and description' \
+  --raw "${TEST_TMPDIR}/drc-ignored-missing-description.json" \
+  --normalized "${TEST_TMPDIR}/drc-ignored-missing-description.normalized.json" \
+  --expected-major 10 \
+  --allow-ignored-check missing_courtyard
 
 expect_failure missing-finding-uuid \
   'requires a UUID when an identity map is supplied' \
@@ -173,6 +215,18 @@ violations_not_list["sheets"][0]["violations"] = {}
 (target / "erc-violations-not-list.json").write_text(
     json.dumps(violations_not_list), encoding="utf-8"
 )
+
+missing_sheets = copy.deepcopy(report)
+missing_sheets.pop("sheets")
+(target / "erc-missing-sheets.json").write_text(
+    json.dumps(missing_sheets), encoding="utf-8"
+)
+
+missing_coordinate_units = copy.deepcopy(report)
+missing_coordinate_units.pop("coordinate_units")
+(target / "erc-missing-coordinate-units.json").write_text(
+    json.dumps(missing_coordinate_units), encoding="utf-8"
+)
 PY
 
 expect_failure erc-sheet-not-object 'every KiCad ERC sheet must be an object' \
@@ -190,6 +244,18 @@ expect_failure erc-missing-uuid-path 'requires path and uuid_path' \
 expect_failure erc-violations-not-list 'requires a violations list' \
   --raw "${TEST_TMPDIR}/erc-violations-not-list.json" \
   --normalized "${TEST_TMPDIR}/erc-violations-not-list.normalized.json" \
+  --expected-major 10 \
+  --allow-ignored-check simulation_model_issue
+
+expect_failure erc-missing-sheets "KiCad report field 'sheets' must be a list" \
+  --raw "${TEST_TMPDIR}/erc-missing-sheets.json" \
+  --normalized "${TEST_TMPDIR}/erc-missing-sheets.normalized.json" \
+  --expected-major 10 \
+  --allow-ignored-check simulation_model_issue
+
+expect_failure erc-missing-coordinate-units 'KiCad report is missing coordinate_units' \
+  --raw "${TEST_TMPDIR}/erc-missing-coordinate-units.json" \
+  --normalized "${TEST_TMPDIR}/erc-missing-coordinate-units.normalized.json" \
   --expected-major 10 \
   --allow-ignored-check simulation_model_issue
 
