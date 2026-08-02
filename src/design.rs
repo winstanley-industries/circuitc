@@ -573,10 +573,11 @@ impl Design {
                 component.schematic_placement.position,
                 component.path.as_str(),
             ) {
-                push(
+                push_related(
                     &mut diagnostics,
                     "CC-SCHEMATIC-003",
                     component.path.as_str(),
+                    first_path,
                     format!("schematic placement shares its anchor with component {first_path}"),
                 );
             }
@@ -1374,6 +1375,21 @@ fn push(
     });
 }
 
+fn push_related(
+    diagnostics: &mut Vec<Diagnostic>,
+    code: &'static str,
+    path: impl Into<String>,
+    related_path: impl Into<String>,
+    message: impl Into<String>,
+) {
+    diagnostics.push(Diagnostic {
+        code,
+        path: path.into(),
+        related_path: Some(related_path.into()),
+        message: message.into(),
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use std::panic::catch_unwind;
@@ -1602,7 +1618,15 @@ mod tests {
         let mut design = voltage_divider();
         design.components[1].schematic_placement.position =
             design.components[0].schematic_placement.position;
-        assert_rejected(design, "CC-SCHEMATIC-003");
+        let diagnostics = design
+            .validate()
+            .expect_err("duplicate schematic anchors must be rejected");
+        let collision = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "CC-SCHEMATIC-003")
+            .expect("schematic anchor collision diagnostic must exist");
+        assert_eq!(collision.path, "divider.r_top");
+        assert_eq!(collision.related_path.as_deref(), Some("divider.r_bottom"));
 
         let mut design = voltage_divider();
         design.components[0].connections.pop();

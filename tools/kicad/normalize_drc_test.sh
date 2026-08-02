@@ -7,6 +7,7 @@ second_raw="$3"
 unexpected_raw="$4"
 erc_raw="$5"
 identity_map="$6"
+null_location_identity_map="$7"
 first_normalized="${TEST_TMPDIR}/first.normalized.json"
 second_normalized="${TEST_TMPDIR}/second.normalized.json"
 
@@ -41,6 +42,35 @@ python3 "${normalizer}" \
   --allow-ignored-check track_not_centered_on_via
 cmp "${first_normalized}" "${second_normalized}"
 grep -F '"report_kind": "drc"' "${first_normalized}"
+
+null_location_normalized="${TEST_TMPDIR}/null-location.normalized.json"
+python3 "${normalizer}" \
+  --raw "${first_raw}" \
+  --normalized "${null_location_normalized}" \
+  --expected-major 10 \
+  --identity-map "${null_location_identity_map}" \
+  --allow-library-warning R1 \
+  --allow-library-warning R2 \
+  --allow-ignored-check missing_courtyard \
+  --allow-ignored-check track_not_centered_on_via
+python3 - "${null_location_normalized}" <<'PY'
+import json
+import pathlib
+import sys
+
+report = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+items = [
+    item
+    for violation in report["violations"]
+    for item in violation["items"]
+]
+mapped = next(item for item in items if item["uuid"].startswith("11111111"))
+assert mapped["circuitc"] == {
+    "location": None,
+    "semantic_path": "divider.r_top",
+    "source": "voltage_divider.circuitc",
+}
+PY
 
 expect_failure unexpected-drc board.routes.vout_bridge \
   --raw "${unexpected_raw}" \

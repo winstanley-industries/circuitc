@@ -312,6 +312,50 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_generated_identity_provenance_emits_a_null_location() {
+        let source = include_str!("../../examples/voltage_divider.circuitc")
+            .replace("module divider.analysis", "module divider.r_top")
+            .replace(
+                "dc_source divider.analysis.input",
+                "dc_source divider.r_top.placement",
+            );
+        let compiled = compile_source("ambiguous-provenance.circuitc", &source)
+            .expect("a provenance-only rendered-path collision must compile");
+
+        assert_eq!(
+            compiled
+                .elaborated
+                .provenance
+                .span_for_identity("divider.r_top.placement"),
+            None,
+            "the generated placement owner and authored component must collapse to ambiguity",
+        );
+        assert!(
+            compiled.kicad_identity_map.contains(
+                "\"semantic_path\": \"divider.r_top.placement\",\n      \"location\": null"
+            )
+        );
+    }
+
+    #[test]
+    fn schematic_anchor_collision_maps_both_authored_components() {
+        let source = include_str!("../../examples/voltage_divider.circuitc").replacen(
+            "schematic at (101.6 mm, 81.28 mm)",
+            "schematic at (81.28 mm, 81.28 mm)",
+            1,
+        );
+        let diagnostics = compile_source("schematic-anchor-collision.circuitc", &source)
+            .expect_err("duplicate schematic anchors must fail source compilation");
+        let collision = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "CC-SCHEMATIC-003")
+            .expect("mapped schematic anchor collision must exist");
+        assert!(source[collision.start..].starts_with("resistor divider.r_top R1"));
+        assert_eq!(collision.related.len(), 1);
+        assert!(source[collision.related[0].start..].starts_with("resistor divider.r_bottom R2"));
+    }
+
+    #[test]
     fn json_diagnostics_are_stable_and_escape_content() {
         let source =
             "design d { net VIN; net VIN; board { rectangle at (0 mm, 0 mm) size (1 mm, 1 mm); } }";

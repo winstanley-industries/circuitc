@@ -109,6 +109,7 @@ sh_test(
         "$(location tools/kicad/fixtures/drc-unexpected.json)",
         "$(location tools/kicad/fixtures/erc-clean.json)",
         "$(location tools/kicad/fixtures/identity-map.json)",
+        "$(location tools/kicad/fixtures/identity-map-null-location.json)",
     ],
     data = [
         "tools/kicad/fixtures/drc-first.json",
@@ -116,6 +117,7 @@ sh_test(
         "tools/kicad/fixtures/drc-unexpected.json",
         "tools/kicad/fixtures/erc-clean.json",
         "tools/kicad/fixtures/identity-map.json",
+        "tools/kicad/fixtures/identity-map-null-location.json",
         "tools/kicad/normalize_drc.py",
     ],
 )
