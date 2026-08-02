@@ -1,0 +1,24 @@
+design physical_no_connect {
+  module board_only {}
+
+  resistor board_only.unused R1 {
+    part "resistor" manufacturer "Yageo" number "RC0603FR-0710KL";
+    symbol "CircuitC:R" {
+      bind 1 1 passive;
+      bind 2 2 passive;
+    }
+    schematic at (81.28 mm, 81.28 mm) rotation 0 deg;
+    resistance 10 kohm;
+    no_connect 1;
+    no_connect 2;
+    footprint "CircuitC:R_0603_1608Metric" {
+      bind 1 1;
+      bind 2 2;
+    }
+  }
+
+  board {
+    rectangle at (0 mm, 0 mm) size (10 mm, 10 mm);
+    place R1 at (5 mm, 5 mm) rotation 0 deg layer front;
+  }
+}

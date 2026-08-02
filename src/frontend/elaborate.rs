@@ -1,25 +1,27 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::design::{
-    Board, Component, Connection, CopperLayer, DESIGN_SCHEMA_VERSION, Design, Diagnostic,
-    Footprint, Net, Pad, PadShape, PhysicalImplementation, PinPadBinding, Placement, PointNm,
-    RectNm, RouteSegment, SimulationModel, SizeNm,
+    Board, Component, ComponentValue, Connection, ConnectionState, CopperLayer,
+    DESIGN_SCHEMA_VERSION, Design, Diagnostic, ElectricalPinType, ModuleInstance, ModulePort, Net,
+    PartIdentity, PhysicalImplementation, PinPadBinding, Placement, PointNm, PortDirection, RectNm,
+    RouteSegment, SchematicPlacement, SimulationModel, SizeNm, SymbolBinding, SymbolPinBinding,
 };
 use crate::quantity::Unit;
 
 use super::diagnostic::{SourceDiagnostic, sort_diagnostics};
 use super::quantity::{lower_electrical, lower_length, lower_rotation};
 use super::syntax::{
-    BindingSyntax, BoardItemSyntax, BoardSyntax, ComponentItemSyntax, ComponentKindSyntax,
-    ComponentSyntax, DeclarationSyntax, FootprintItemSyntax, FootprintSyntax, NetSyntax, PadSyntax,
-    PlacementSyntax, PointSyntax, QuantitySyntax, RectangleSyntax, RouteSyntax, SourceFile, Span,
-    SyntaxTree,
+    BoardItemSyntax, BoardSyntax, ComponentItemSyntax, ComponentKindSyntax, ComponentSyntax,
+    ConnectionStateSyntax, DeclarationSyntax, FootprintItemSyntax, FootprintSyntax, ModuleSyntax,
+    NetSyntax, PartSyntax, PlacementSyntax, PointSyntax, QuantitySyntax, RectangleSyntax,
+    RouteSyntax, SchematicPlacementSyntax, SourceFile, Span, SymbolSyntax, SyntaxTree,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProvenanceMap {
     pub source_name: String,
     semantic_spans: BTreeMap<SemanticProvenanceKey, Span>,
+    rendered_semantic_spans: BTreeMap<String, Option<Span>>,
     structural_spans: BTreeMap<String, Span>,
 }
 
@@ -45,15 +47,9 @@ impl SemanticProvenanceKey {
 
 impl ProvenanceMap {
     pub fn span_for(&self, semantic_path: &str) -> Option<Span> {
-        let mut matching = self
-            .semantic_spans
-            .iter()
-            .filter(|(key, _)| key.rendered_path() == semantic_path)
-            .map(|(_, span)| *span);
-        match (matching.next(), matching.next()) {
-            (Some(span), None) => Some(span),
-            (None, _) => self.structural_spans.get(semantic_path).copied(),
-            (Some(_), Some(_)) => None,
+        match self.rendered_semantic_spans.get(semantic_path) {
+            Some(span) => *span,
+            None => self.structural_spans.get(semantic_path).copied(),
         }
     }
 
@@ -61,6 +57,19 @@ impl ProvenanceMap {
         self.semantic_spans
             .iter()
             .map(|(key, span)| (key.rendered_path(), *span))
+    }
+
+    pub(crate) fn span_for_identity(&self, semantic_path: &str) -> Option<Span> {
+        let mut candidate = semantic_path;
+        loop {
+            if let Some(span) = self.rendered_semantic_spans.get(candidate) {
+                return *span;
+            }
+            let Some((parent, _)) = candidate.rsplit_once('.') else {
+                return self.structural_spans.get(semantic_path).copied();
+            };
+            candidate = parent;
+        }
     }
 
     fn component_span(&self, path: &str) -> Option<Span> {
@@ -93,6 +102,11 @@ impl ProvenanceMap {
     }
 
     fn insert_semantic(&mut self, key: SemanticProvenanceKey, span: Span) {
+        let rendered = key.rendered_path();
+        self.rendered_semantic_spans
+            .entry(rendered)
+            .and_modify(|existing| *existing = None)
+            .or_insert(Some(span));
         self.semantic_spans.insert(key, span);
     }
 
@@ -126,6 +140,7 @@ pub(crate) fn elaborate(tree: &SyntaxTree) -> Result<ElaboratedDesign, Vec<Sourc
     let mut provenance = ProvenanceMap {
         source_name: source.name.clone(),
         semantic_spans: BTreeMap::new(),
+        rendered_semantic_spans: BTreeMap::new(),
         structural_spans: BTreeMap::new(),
     };
     provenance.insert_structural("design", tree.design.span);
@@ -142,17 +157,26 @@ pub(crate) fn elaborate(tree: &SyntaxTree) -> Result<ElaboratedDesign, Vec<Sourc
     }
 
     let mut net_syntax = Vec::new();
+    let mut module_syntax = Vec::new();
     let mut component_syntax = Vec::new();
     let mut board_syntax = Vec::new();
     for declaration in &tree.design.declarations {
         match declaration {
             DeclarationSyntax::Net(net) => net_syntax.push(net),
+            DeclarationSyntax::Module(module) => module_syntax.push(module),
             DeclarationSyntax::Component(component) => component_syntax.push(component),
             DeclarationSyntax::Board(board) => board_syntax.push(board),
         }
     }
 
     let nets = elaborate_nets(source, &net_syntax, &mut provenance, &mut diagnostics);
+    let modules = elaborate_modules(
+        source,
+        &module_syntax,
+        &nets,
+        &mut provenance,
+        &mut diagnostics,
+    );
     let component_index = index_components(source, &component_syntax, &mut diagnostics);
     let board = select_board(source, &board_syntax, &mut diagnostics);
     let board_parts = board.map(|board| {
@@ -175,6 +199,7 @@ pub(crate) fn elaborate(tree: &SyntaxTree) -> Result<ElaboratedDesign, Vec<Sourc
             source,
             component,
             &nets,
+            &modules,
             &placements,
             &mut provenance,
             &mut diagnostics,
@@ -201,7 +226,11 @@ pub(crate) fn elaborate(tree: &SyntaxTree) -> Result<ElaboratedDesign, Vec<Sourc
     }
 
     let ground_count = nets.values().filter(|net| net.is_ground).count();
-    if !components.is_empty() && ground_count != 1 {
+    if components
+        .iter()
+        .any(|component| component.simulation.is_some())
+        && ground_count != 1
+    {
         diagnostics.push(SourceDiagnostic::new(
             "CC-LANG-GROUND-001",
             source,
@@ -209,6 +238,18 @@ pub(crate) fn elaborate(tree: &SyntaxTree) -> Result<ElaboratedDesign, Vec<Sourc
             Some("design.nets".to_owned()),
             format!("a simulated design requires exactly one ground; found {ground_count}"),
         ));
+    }
+
+    if diagnostics.is_empty()
+        && let Some(board_parts) = &board_parts
+    {
+        validate_kicad_semantic_paths(
+            source,
+            &components,
+            board_parts,
+            &provenance,
+            &mut diagnostics,
+        );
     }
 
     if !diagnostics.is_empty() {
@@ -221,6 +262,7 @@ pub(crate) fn elaborate(tree: &SyntaxTree) -> Result<ElaboratedDesign, Vec<Sourc
         schema_version: DESIGN_SCHEMA_VERSION,
         name: tree.design.name.value.clone(),
         nets: nets.into_values().collect(),
+        modules: modules.into_values().collect(),
         components,
         board: Board {
             outline: board_parts
@@ -234,6 +276,127 @@ pub(crate) fn elaborate(tree: &SyntaxTree) -> Result<ElaboratedDesign, Vec<Sourc
     Ok(ElaboratedDesign { design, provenance })
 }
 
+fn validate_kicad_semantic_paths(
+    source: &SourceFile,
+    components: &[Component],
+    board: &BoardParts,
+    provenance: &ProvenanceMap,
+    diagnostics: &mut Vec<SourceDiagnostic>,
+) {
+    let mut origins: BTreeMap<String, (&'static str, Span)> = BTreeMap::new();
+    let mut register = |path: String, kind: &'static str, span: Span| {
+        if let Some((first_kind, first_span)) = origins.get(&path).copied() {
+            diagnostics.push(
+                SourceDiagnostic::new(
+                    "CC-KICAD-ID-002",
+                    source,
+                    span,
+                    Some(path.clone()),
+                    format!(
+                        "generated KiCad semantic path `{path}` is shared by {first_kind} and {kind}"
+                    ),
+                )
+                .with_related(
+                    source,
+                    first_span,
+                    format!("first generated {first_kind} identity is here"),
+                ),
+            );
+        } else {
+            origins.insert(path, (kind, span));
+        }
+    };
+
+    register(
+        "design.schematic".to_owned(),
+        "schematic root",
+        provenance
+            .structural_spans
+            .get("design")
+            .copied()
+            .unwrap_or(Span::new(0, source.text.len())),
+    );
+    register(
+        "design.board.outline".to_owned(),
+        "board outline",
+        provenance
+            .structural_spans
+            .get("design.board.outline")
+            .copied()
+            .unwrap_or(Span::new(0, source.text.len())),
+    );
+
+    for component in components {
+        let component_span = provenance
+            .semantic_spans
+            .get(&SemanticProvenanceKey::Component(component.path.clone()))
+            .copied()
+            .unwrap_or(Span::new(0, source.text.len()));
+        register(component.path.clone(), "schematic symbol", component_span);
+        for pin in &component.symbol.pins {
+            register(
+                format!("{}.symbol.pin.{}", component.path, pin.pin),
+                "schematic pin",
+                component_span,
+            );
+            register(
+                format!("{}.connection.{}", component.path, pin.pin),
+                "schematic connection",
+                component_span,
+            );
+        }
+        if let Some(physical) = &component.physical {
+            let footprint_span = provenance
+                .semantic_spans
+                .get(&SemanticProvenanceKey::Footprint(component.path.clone()))
+                .copied()
+                .unwrap_or(component_span);
+            register(
+                format!("{}.footprint", component.path),
+                "PCB footprint",
+                footprint_span,
+            );
+            for property in [
+                "Reference",
+                "Value",
+                "Datasheet",
+                "Description",
+                "Manufacturer",
+                "MPN",
+            ] {
+                register(
+                    format!("{}.footprint.property.{property}", component.path),
+                    "PCB footprint property",
+                    footprint_span,
+                );
+            }
+            for pad in &physical.footprint.pads {
+                let pad_span = provenance
+                    .semantic_spans
+                    .get(&SemanticProvenanceKey::Pad {
+                        component: component.path.clone(),
+                        pad: pad.number.clone(),
+                    })
+                    .copied()
+                    .unwrap_or(footprint_span);
+                register(
+                    format!("{}.footprint.pad.{}", component.path, pad.number),
+                    "PCB pad",
+                    pad_span,
+                );
+            }
+        }
+    }
+    for route in &board.routes {
+        let span = provenance
+            .semantic_spans
+            .get(&SemanticProvenanceKey::Route(route.path.clone()))
+            .copied()
+            .unwrap_or(Span::new(0, source.text.len()));
+        register(route.path.clone(), "PCB route", span);
+    }
+}
+
 pub(crate) fn map_ir_diagnostics(
     source: &SourceFile,
     provenance: &ProvenanceMap,
@@ -244,6 +407,8 @@ pub(crate) fn map_ir_diagnostics(
         .map(|diagnostic| {
             let structural = diagnostic.code.starts_with("CC-IR-")
                 || diagnostic.code.starts_with("CC-NET-")
+                || diagnostic.code.starts_with("CC-MODULE-")
+                || diagnostic.code.starts_with("CC-PORT-")
                 || diagnostic.code.starts_with("CC-BOARD-")
                 || diagnostic.code.starts_with("CC-ROUTE-")
                 || diagnostic.code == "CC-SIM-001";
@@ -324,6 +489,175 @@ fn elaborate_nets(
         provenance.insert_structural(format!("design.nets.{name}"), net.span);
     }
     nets
+}
+
+fn elaborate_modules(
+    source: &SourceFile,
+    syntax: &[&ModuleSyntax],
+    nets: &BTreeMap<String, Net>,
+    provenance: &mut ProvenanceMap,
+    diagnostics: &mut Vec<SourceDiagnostic>,
+) -> BTreeMap<String, ModuleInstance> {
+    let mut modules = BTreeMap::new();
+    let mut first_spans = BTreeMap::new();
+    for module in syntax {
+        let path = module.path.value.as_str();
+        if !semantic_path_is_valid(path) {
+            diagnostics.push(SourceDiagnostic::new(
+                "CC-LANG-MODULE-001",
+                source,
+                module.path.span,
+                Some(path.to_owned()),
+                "module instance path is invalid",
+            ));
+        }
+        if let Some(first) = first_spans.get(path).copied() {
+            diagnostics.push(
+                SourceDiagnostic::new(
+                    "CC-LANG-MODULE-002",
+                    source,
+                    module.path.span,
+                    Some(path.to_owned()),
+                    format!("duplicate module instance path `{path}`"),
+                )
+                .with_related(source, first, "first declaration is here"),
+            );
+            continue;
+        }
+        first_spans.insert(path, module.path.span);
+
+        let mut ports = Vec::new();
+        let mut port_spans = BTreeMap::new();
+        for port in &module.ports {
+            if !canonical_token_is_valid(&port.name.value) {
+                diagnostics.push(SourceDiagnostic::new(
+                    "CC-LANG-PORT-001",
+                    source,
+                    port.name.span,
+                    Some(path.to_owned()),
+                    "module port name must be a non-empty canonical ASCII token",
+                ));
+            }
+            if let Some(first) = port_spans.get(port.name.value.as_str()).copied() {
+                diagnostics.push(
+                    SourceDiagnostic::new(
+                        "CC-LANG-PORT-002",
+                        source,
+                        port.name.span,
+                        Some(path.to_owned()),
+                        format!("duplicate module port `{}`", port.name.value),
+                    )
+                    .with_related(source, first, "first declaration is here"),
+                );
+                continue;
+            }
+            port_spans.insert(port.name.value.as_str(), port.name.span);
+            let direction = lower_port_direction(source, &port.direction, path, diagnostics);
+            let electrical_type =
+                lower_electrical_type(source, &port.electrical_type, path, diagnostics);
+            let state = match &port.state {
+                ConnectionStateSyntax::Connected(net) => {
+                    if !nets.contains_key(net.value.as_str()) {
+                        diagnostics.push(SourceDiagnostic::new(
+                            "CC-LANG-RESOLVE-001",
+                            source,
+                            net.span,
+                            Some(path.to_owned()),
+                            format!("module port references unknown net `{}`", net.value),
+                        ));
+                    }
+                    ConnectionState::Connected(net.value.clone())
+                }
+                ConnectionStateSyntax::NoConnect(_) => ConnectionState::NoConnect,
+            };
+            if let (Some(direction), Some(electrical_type)) = (direction, electrical_type) {
+                ports.push(ModulePort {
+                    name: port.name.value.clone(),
+                    direction,
+                    electrical_type,
+                    state,
+                });
+            }
+        }
+        provenance.insert_structural(format!("design.modules.{path}"), module.span);
+        modules.insert(
+            path.to_owned(),
+            ModuleInstance {
+                path: path.to_owned(),
+                ports,
+            },
+        );
+    }
+
+    for module in syntax {
+        let path = module.path.value.as_str();
+        if let Some((parent, _)) = path.rsplit_once('.')
+            && !modules.contains_key(parent)
+        {
+            diagnostics.push(SourceDiagnostic::new(
+                "CC-LANG-MODULE-003",
+                source,
+                module.path.span,
+                Some(path.to_owned()),
+                format!("module `{path}` requires parent module `{parent}`"),
+            ));
+        }
+    }
+    modules
+}
+
+fn lower_port_direction(
+    source: &SourceFile,
+    syntax: &super::syntax::Spanned<String>,
+    path: &str,
+    diagnostics: &mut Vec<SourceDiagnostic>,
+) -> Option<PortDirection> {
+    match syntax.value.as_str() {
+        "input" => Some(PortDirection::Input),
+        "output" => Some(PortDirection::Output),
+        "inout" => Some(PortDirection::InOut),
+        other => {
+            diagnostics.push(SourceDiagnostic::new(
+                "CC-LANG-PORT-003",
+                source,
+                syntax.span,
+                Some(path.to_owned()),
+                format!(
+                    "unsupported port direction `{other}`; expected `input`, `output`, or `inout`"
+                ),
+            ));
+            None
+        }
+    }
+}
+
+fn lower_electrical_type(
+    source: &SourceFile,
+    syntax: &super::syntax::Spanned<String>,
+    path: &str,
+    diagnostics: &mut Vec<SourceDiagnostic>,
+) -> Option<ElectricalPinType> {
+    let lowered = match syntax.value.as_str() {
+        "input" => ElectricalPinType::Input,
+        "output" => ElectricalPinType::Output,
+        "bidirectional" => ElectricalPinType::Bidirectional,
+        "passive" => ElectricalPinType::Passive,
+        "power_input" => ElectricalPinType::PowerInput,
+        "power_output" => ElectricalPinType::PowerOutput,
+        "open_collector" => ElectricalPinType::OpenCollector,
+        "open_emitter" => ElectricalPinType::OpenEmitter,
+        other => {
+            diagnostics.push(SourceDiagnostic::new(
+                "CC-LANG-PIN-TYPE-001",
+                source,
+                syntax.span,
+                Some(path.to_owned()),
+                format!("unsupported electrical pin type `{other}`"),
+            ));
+            return None;
+        }
+    };
+    Some(lowered)
 }
 
 struct ComponentIndex<'a> {
@@ -579,6 +913,7 @@ fn elaborate_component(
     source: &SourceFile,
     syntax: &ComponentSyntax,
     nets: &BTreeMap<String, Net>,
+    modules: &BTreeMap<String, ModuleInstance>,
     placements: &BTreeMap<String, LoweredPlacement>,
     provenance: &mut ProvenanceMap,
     diagnostics: &mut Vec<SourceDiagnostic>,
@@ -589,16 +924,55 @@ fn elaborate_component(
         syntax.span,
     );
 
+    let module_path = match path.rsplit_once('.') {
+        Some((module, _)) if modules.contains_key(module) => Some(module.to_owned()),
+        Some((module, _)) => {
+            diagnostics.push(SourceDiagnostic::new(
+                "CC-LANG-COMP-010",
+                source,
+                syntax.path.span,
+                Some(path.to_owned()),
+                format!("component requires declared parent module `{module}`"),
+            ));
+            None
+        }
+        None => {
+            diagnostics.push(SourceDiagnostic::new(
+                "CC-LANG-COMP-010",
+                source,
+                syntax.path.span,
+                Some(path.to_owned()),
+                "component path must include its parent module",
+            ));
+            None
+        }
+    };
+
+    let mut parts = Vec::new();
+    let mut symbols = Vec::new();
+    let mut models: Vec<(&super::syntax::Spanned<String>, Span)> = Vec::new();
+    let mut schematic_placements = Vec::new();
     let mut values: Vec<(&str, &QuantitySyntax, Span)> = Vec::new();
     let mut terminals: Vec<(
         &super::syntax::Spanned<String>,
         &super::syntax::Spanned<String>,
         Span,
     )> = Vec::new();
-    let mut connections = Vec::new();
+    type ConnectionSyntax<'a> = (
+        &'a super::syntax::Spanned<String>,
+        Option<&'a super::syntax::Spanned<String>>,
+        Span,
+    );
+    let mut connections: Vec<ConnectionSyntax<'_>> = Vec::new();
     let mut footprints = Vec::new();
     for item in &syntax.items {
         match item {
+            ComponentItemSyntax::Part(part) => parts.push(part),
+            ComponentItemSyntax::Symbol(symbol) => symbols.push(symbol),
+            ComponentItemSyntax::Model { library_id, span } => models.push((library_id, *span)),
+            ComponentItemSyntax::SchematicPlacement(placement) => {
+                schematic_placements.push(placement)
+            }
             ComponentItemSyntax::Value { keyword, quantity } => {
                 values.push((&keyword.value, quantity, keyword.span))
             }
@@ -608,11 +982,66 @@ fn elaborate_component(
                 span,
             } => terminals.push((positive, negative, *span)),
             ComponentItemSyntax::Connection { pin, net, span } => {
-                connections.push((pin, net, *span))
+                connections.push((pin, Some(net), *span))
             }
+            ComponentItemSyntax::NoConnect { pin, span } => connections.push((pin, None, *span)),
             ComponentItemSyntax::Footprint(footprint) => footprints.push(footprint),
         }
     }
+
+    let part = select_single(
+        source,
+        &parts,
+        syntax.span,
+        path,
+        "CC-LANG-PART-001",
+        "CC-LANG-PART-002",
+        "component requires one `part` declaration",
+        "component part is declared more than once",
+        diagnostics,
+    )
+    .copied();
+    let symbol = select_single(
+        source,
+        &symbols,
+        syntax.span,
+        path,
+        "CC-LANG-SYMBOL-001",
+        "CC-LANG-SYMBOL-002",
+        "component requires one `symbol` declaration",
+        "component symbol is declared more than once",
+        diagnostics,
+    )
+    .copied();
+    let model = select_single(
+        source,
+        &models,
+        syntax.span,
+        path,
+        "CC-LANG-MODEL-001",
+        "CC-LANG-MODEL-002",
+        "",
+        "component model is declared more than once",
+        diagnostics,
+    );
+    let schematic_placement = select_single(
+        source,
+        &schematic_placements,
+        syntax.span,
+        path,
+        "CC-LANG-SCHEMATIC-001",
+        "CC-LANG-SCHEMATIC-002",
+        "component requires one `schematic` placement",
+        "component schematic placement is declared more than once",
+        diagnostics,
+    )
+    .copied();
+
+    let lowered_part = part.map(lower_part);
+    let lowered_symbol =
+        symbol.and_then(|symbol| lower_symbol_binding(source, symbol, path, diagnostics));
+    let lowered_schematic_placement = schematic_placement
+        .and_then(|placement| lower_schematic_placement(source, placement, path, diagnostics));
 
     let expected_keyword = match syntax.kind {
         ComponentKindSyntax::Resistor => "resistance",
@@ -650,7 +1079,7 @@ fn elaborate_component(
         path,
         "CC-LANG-COMP-008",
         "CC-LANG-COMP-009",
-        "component requires one `terminals` declaration",
+        "",
         "component terminals are declared more than once",
         diagnostics,
     );
@@ -681,19 +1110,61 @@ fn elaborate_component(
             continue;
         }
         connection_map.insert(pin.value.as_str(), span);
-        if !nets.contains_key(net.value.as_str()) {
-            diagnostics.push(SourceDiagnostic::new(
-                "CC-LANG-RESOLVE-001",
-                source,
-                net.span,
-                Some(path.to_owned()),
-                format!("connection references unknown net `{}`", net.value),
-            ));
-        }
+        let state = match net {
+            Some(net) => {
+                if !nets.contains_key(net.value.as_str()) {
+                    diagnostics.push(SourceDiagnostic::new(
+                        "CC-LANG-RESOLVE-001",
+                        source,
+                        net.span,
+                        Some(path.to_owned()),
+                        format!("connection references unknown net `{}`", net.value),
+                    ));
+                }
+                ConnectionState::Connected(net.value.clone())
+            }
+            None => ConnectionState::NoConnect,
+        };
         lowered_connections.push(Connection {
             pin: pin.value.clone(),
-            net: net.value.clone(),
+            state,
         });
+    }
+
+    if let Some(symbol) = &lowered_symbol {
+        let symbol_pins: BTreeSet<_> = symbol.pins.iter().map(|pin| pin.pin.as_str()).collect();
+        for connection in &lowered_connections {
+            if !symbol_pins.contains(connection.pin.as_str()) {
+                diagnostics.push(SourceDiagnostic::new(
+                    "CC-LANG-SYMBOL-007",
+                    source,
+                    connection_map[connection.pin.as_str()],
+                    Some(path.to_owned()),
+                    format!(
+                        "connection references logical pin `{}` absent from the symbol binding",
+                        connection.pin
+                    ),
+                ));
+            }
+        }
+        for pin in &symbol.pins {
+            if !connection_map.contains_key(pin.pin.as_str()) {
+                diagnostics.push(SourceDiagnostic::new(
+                    "CC-LANG-CONNECT-002",
+                    source,
+                    symbol
+                        .pins
+                        .iter()
+                        .find(|candidate| candidate.pin == pin.pin)
+                        .map_or(syntax.span, |_| syntax.span),
+                    Some(path.to_owned()),
+                    format!(
+                        "symbol logical pin `{}` requires `connect` or `no_connect`",
+                        pin.pin
+                    ),
+                ));
+            }
+        }
     }
 
     if let Some((positive, negative, _)) = terminal {
@@ -707,7 +1178,10 @@ fn elaborate_component(
             ));
         }
         for pin in [positive, negative] {
-            if !connection_map.contains_key(pin.value.as_str()) {
+            if !lowered_connections.iter().any(|connection| {
+                connection.pin == pin.value
+                    && matches!(connection.state, ConnectionState::Connected(_))
+            }) {
                 diagnostics.push(SourceDiagnostic::new(
                     "CC-LANG-RESOLVE-002",
                     source,
@@ -748,47 +1222,228 @@ fn elaborate_component(
             source,
             footprint,
             path,
-            &connection_map,
+            &lowered_connections,
             placement.map(|placement| placement.placement),
             provenance,
             diagnostics,
         )
     });
 
-    let simulation = match (value, terminal) {
-        (Some((_, quantity, _)), Some((positive, negative, _))) => {
-            let expected_unit = match syntax.kind {
-                ComponentKindSyntax::Resistor => Unit::Ohm,
-                ComponentKindSyntax::DcSource => Unit::Volt,
-            };
-            lower_electrical(source, quantity, expected_unit, Some(path), diagnostics).map(
-                |lowered| match syntax.kind {
-                    ComponentKindSyntax::Resistor => SimulationModel::Resistor {
-                        resistance: lowered,
-                        positive_pin: positive.value.clone(),
-                        negative_pin: negative.value.clone(),
-                    },
-                    ComponentKindSyntax::DcSource => SimulationModel::DcVoltageSource {
-                        voltage: lowered,
-                        positive_pin: positive.value.clone(),
-                        negative_pin: negative.value.clone(),
-                    },
-                },
-            )
-        }
+    let expected_unit = match syntax.kind {
+        ComponentKindSyntax::Resistor => Unit::Ohm,
+        ComponentKindSyntax::DcSource => Unit::Volt,
+    };
+    let lowered_value = value.and_then(|(_, quantity, _)| {
+        lower_electrical(source, quantity, expected_unit, Some(path), diagnostics).map(|quantity| {
+            match syntax.kind {
+                ComponentKindSyntax::Resistor => ComponentValue::Resistance(quantity),
+                ComponentKindSyntax::DcSource => ComponentValue::DcVoltage(quantity),
+            }
+        })
+    });
+
+    let simulation_configuration_valid = terminal.is_some() == model.is_some();
+    if !simulation_configuration_valid {
+        let span = terminal
+            .map(|(_, _, span)| *span)
+            .or_else(|| model.map(|(_, span)| *span))
+            .unwrap_or(syntax.span);
+        diagnostics.push(SourceDiagnostic::new(
+            "CC-LANG-SIM-001",
+            source,
+            span,
+            Some(path.to_owned()),
+            "`model` and `terminals` must be declared together",
+        ));
+    }
+    let simulation = match (terminal, model) {
+        (Some((positive, negative, _)), Some((model, _))) => Some(match syntax.kind {
+            ComponentKindSyntax::Resistor => SimulationModel::Resistor {
+                model_id: model.value.clone(),
+                positive_pin: positive.value.clone(),
+                negative_pin: negative.value.clone(),
+            },
+            ComponentKindSyntax::DcSource => SimulationModel::DcVoltageSource {
+                model_id: model.value.clone(),
+                positive_pin: positive.value.clone(),
+                negative_pin: negative.value.clone(),
+            },
+        }),
         _ => None,
     };
 
-    if value.is_none() || terminal.is_none() || simulation.is_none() {
+    if lowered_value.is_none()
+        || !simulation_configuration_valid
+        || module_path.is_none()
+        || lowered_part.is_none()
+        || lowered_symbol.is_none()
+        || lowered_schematic_placement.is_none()
+    {
         return None;
     }
     Some(Component {
         path: path.to_owned(),
+        module_path: module_path.expect("checked above"),
         reference: syntax.reference.value.clone(),
+        part: lowered_part.expect("checked above"),
+        value: lowered_value.expect("checked above"),
+        symbol: lowered_symbol.expect("checked above"),
+        schematic_placement: lowered_schematic_placement.expect("checked above"),
         connections: lowered_connections,
         physical,
         simulation,
     })
+}
+
+fn lower_part(syntax: &PartSyntax) -> PartIdentity {
+    PartIdentity {
+        logical_device: syntax.logical_device.value.clone(),
+        manufacturer: syntax
+            .manufacturer
+            .as_ref()
+            .map(|manufacturer| manufacturer.value.clone()),
+        manufacturer_part_number: syntax
+            .manufacturer_part_number
+            .as_ref()
+            .map(|number| number.value.clone()),
+    }
+}
+
+fn lower_symbol_binding(
+    source: &SourceFile,
+    syntax: &SymbolSyntax,
+    component_path: &str,
+    diagnostics: &mut Vec<SourceDiagnostic>,
+) -> Option<SymbolBinding> {
+    let Some(definition) = crate::library::symbol(&syntax.library_id.value) else {
+        diagnostics.push(SourceDiagnostic::new(
+            "CC-LANG-SYMBOL-003",
+            source,
+            syntax.library_id.span,
+            Some(component_path.to_owned()),
+            format!(
+                "symbol `{}` is not present in the vendored CircuitC catalog",
+                syntax.library_id.value
+            ),
+        ));
+        return None;
+    };
+    let mut logical_pins = BTreeMap::new();
+    let mut library_pins = BTreeMap::new();
+    let mut lowered = Vec::new();
+    for pin in &syntax.pins {
+        if let Some(first) = logical_pins.get(pin.pin.value.as_str()).copied() {
+            diagnostics.push(
+                SourceDiagnostic::new(
+                    "CC-LANG-SYMBOL-004",
+                    source,
+                    pin.pin.span,
+                    Some(component_path.to_owned()),
+                    format!("logical pin `{}` is bound more than once", pin.pin.value),
+                )
+                .with_related(source, first, "first binding is here"),
+            );
+            continue;
+        }
+        logical_pins.insert(pin.pin.value.as_str(), pin.pin.span);
+        if let Some(first) = library_pins.get(pin.symbol_pin.value.as_str()).copied() {
+            diagnostics.push(
+                SourceDiagnostic::new(
+                    "CC-LANG-SYMBOL-005",
+                    source,
+                    pin.symbol_pin.span,
+                    Some(component_path.to_owned()),
+                    format!(
+                        "library symbol pin `{}` is bound more than once",
+                        pin.symbol_pin.value
+                    ),
+                )
+                .with_related(source, first, "first binding is here"),
+            );
+            continue;
+        }
+        library_pins.insert(pin.symbol_pin.value.as_str(), pin.symbol_pin.span);
+        let Some(catalog_pin) = definition
+            .pins
+            .iter()
+            .find(|candidate| candidate.number == pin.symbol_pin.value)
+        else {
+            diagnostics.push(SourceDiagnostic::new(
+                "CC-LANG-SYMBOL-006",
+                source,
+                pin.symbol_pin.span,
+                Some(component_path.to_owned()),
+                format!(
+                    "symbol `{}` has no pin `{}`",
+                    syntax.library_id.value, pin.symbol_pin.value
+                ),
+            ));
+            continue;
+        };
+        let Some(electrical_type) =
+            lower_electrical_type(source, &pin.electrical_type, component_path, diagnostics)
+        else {
+            continue;
+        };
+        if electrical_type != catalog_pin.electrical_type {
+            diagnostics.push(SourceDiagnostic::new(
+                "CC-LANG-SYMBOL-008",
+                source,
+                pin.electrical_type.span,
+                Some(component_path.to_owned()),
+                format!(
+                    "electrical type for symbol pin `{}` does not match the vendored library",
+                    pin.symbol_pin.value
+                ),
+            ));
+        }
+        lowered.push(SymbolPinBinding {
+            pin: pin.pin.value.clone(),
+            symbol_pin: pin.symbol_pin.value.clone(),
+            electrical_type,
+        });
+    }
+    for catalog_pin in definition.pins {
+        if !library_pins.contains_key(catalog_pin.number) {
+            diagnostics.push(SourceDiagnostic::new(
+                "CC-LANG-SYMBOL-009",
+                source,
+                syntax.span,
+                Some(component_path.to_owned()),
+                format!(
+                    "symbol pin `{}` has no explicit logical binding",
+                    catalog_pin.number
+                ),
+            ));
+        }
+    }
+    Some(SymbolBinding {
+        library_id: definition.library_id.to_owned(),
+        pins: lowered,
+    })
+}
+
+fn lower_schematic_placement(
+    source: &SourceFile,
+    syntax: &SchematicPlacementSyntax,
+    component_path: &str,
+    diagnostics: &mut Vec<SourceDiagnostic>,
+) -> Option<SchematicPlacement> {
+    let position = lower_point(source, &syntax.position, Some(component_path), diagnostics);
+    let rotation = lower_rotation(
+        source,
+        &syntax.rotation.value,
+        syntax.rotation.span,
+        Some(component_path),
+        diagnostics,
+    );
+    match (position, rotation) {
+        (Some(position), Some(rotation_degrees)) => Some(SchematicPlacement {
+            position,
+            rotation_degrees,
+        }),
+        _ => None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -796,7 +1451,7 @@ fn elaborate_footprint(
     source: &SourceFile,
     footprint: &FootprintSyntax,
     component_path: &str,
-    connections: &BTreeMap<&str, Span>,
+    connections: &[Connection],
     placement: Option<Placement>,
     provenance: &mut ProvenanceMap,
     diagnostics: &mut Vec<SourceDiagnostic>,
@@ -805,190 +1460,120 @@ fn elaborate_footprint(
         SemanticProvenanceKey::Footprint(component_path.to_owned()),
         footprint.span,
     );
-    let mut pads = Vec::new();
-    let mut pad_spans = BTreeMap::new();
-    let mut bindings = Vec::new();
-    for item in &footprint.items {
-        match item {
-            FootprintItemSyntax::Pad(pad) => {
-                let number = pad.number.value.as_str();
-                if let Some(first) = pad_spans.get(number).copied() {
-                    diagnostics.push(
-                        SourceDiagnostic::new(
-                            "CC-LANG-PAD-001",
-                            source,
-                            pad.number.span,
-                            Some(component_path.to_owned()),
-                            format!("duplicate physical pad `{number}`"),
-                        )
-                        .with_related(source, first, "first pad is here"),
-                    );
-                    continue;
-                }
-                pad_spans.insert(number, pad.span);
-                if let Some(lowered) = lower_pad(source, pad, component_path, diagnostics) {
-                    provenance.insert_semantic(
-                        SemanticProvenanceKey::Pad {
-                            component: component_path.to_owned(),
-                            pad: number.to_owned(),
-                        },
-                        pad.span,
-                    );
-                    pads.push(lowered);
-                }
-            }
-            FootprintItemSyntax::Binding(binding) => bindings.push(binding),
-        }
-    }
-    if pad_spans.is_empty() {
+    let Some(catalog_footprint) = crate::library::footprint(&footprint.library_id.value) else {
         diagnostics.push(SourceDiagnostic::new(
-            "CC-LANG-PAD-002",
+            "CC-LANG-FOOTPRINT-003",
             source,
-            footprint.span,
+            footprint.library_id.span,
             Some(component_path.to_owned()),
-            "footprint must declare at least one pad",
+            format!(
+                "footprint `{}` is not present in the vendored CircuitC catalog",
+                footprint.library_id.value
+            ),
         ));
-    }
+        return None;
+    };
+    let pad_numbers: BTreeSet<_> = catalog_footprint
+        .pads
+        .iter()
+        .map(|pad| pad.number.as_str())
+        .collect();
+    let logical_pins: BTreeSet<_> = connections
+        .iter()
+        .map(|connection| connection.pin.as_str())
+        .collect();
 
     let mut bound_pads = BTreeMap::new();
     let mut bound_pins = BTreeSet::new();
     let mut lowered_bindings = Vec::new();
-    for binding in bindings {
-        validate_binding(
-            source,
-            binding,
-            component_path,
-            connections,
-            &pad_spans,
-            &mut bound_pads,
-            &mut bound_pins,
-            &mut lowered_bindings,
-            diagnostics,
-        );
-    }
-    for (pad, span) in &pad_spans {
-        if !bound_pads.contains_key(pad) {
+    for item in &footprint.items {
+        let FootprintItemSyntax::Binding(binding) = item;
+        if !logical_pins.contains(binding.pin.value.as_str()) {
             diagnostics.push(SourceDiagnostic::new(
-                "CC-LANG-BIND-003",
+                "CC-LANG-RESOLVE-002",
                 source,
-                *span,
+                binding.pin.span,
                 Some(component_path.to_owned()),
-                format!("physical pad `{pad}` has no logical-pin binding"),
+                format!(
+                    "pin-to-pad binding references unknown logical pin `{}`",
+                    binding.pin.value
+                ),
             ));
         }
-    }
-    for (pin, span) in connections {
-        if !bound_pins.contains(pin) {
+        if !pad_numbers.contains(binding.pad.value.as_str()) {
             diagnostics.push(SourceDiagnostic::new(
-                "CC-LANG-BIND-004",
-                source,
-                *span,
-                Some(component_path.to_owned()),
-                format!("connected logical pin `{pin}` has no physical pad binding"),
-            ));
-        }
-    }
-    placement.map(|placement| PhysicalImplementation {
-        footprint: Footprint {
-            library_id: footprint.library_id.value.clone(),
-            pads,
-        },
-        placement,
-        pin_pad_bindings: lowered_bindings,
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn validate_binding<'a>(
-    source: &SourceFile,
-    binding: &'a BindingSyntax,
-    component_path: &str,
-    connections: &BTreeMap<&str, Span>,
-    pad_spans: &BTreeMap<&str, Span>,
-    bound_pads: &mut BTreeMap<&'a str, Span>,
-    bound_pins: &mut BTreeSet<&'a str>,
-    lowered: &mut Vec<PinPadBinding>,
-    diagnostics: &mut Vec<SourceDiagnostic>,
-) {
-    if !connections.contains_key(binding.pin.value.as_str()) {
-        diagnostics.push(SourceDiagnostic::new(
-            "CC-LANG-RESOLVE-002",
-            source,
-            binding.pin.span,
-            Some(component_path.to_owned()),
-            format!(
-                "pin-to-pad binding references unknown logical pin `{}`",
-                binding.pin.value
-            ),
-        ));
-    }
-    if !pad_spans.contains_key(binding.pad.value.as_str()) {
-        diagnostics.push(SourceDiagnostic::new(
-            "CC-LANG-RESOLVE-003",
-            source,
-            binding.pad.span,
-            Some(component_path.to_owned()),
-            format!(
-                "pin-to-pad binding references unknown physical pad `{}`",
-                binding.pad.value
-            ),
-        ));
-    }
-    if let Some(first) = bound_pads.get(binding.pad.value.as_str()).copied() {
-        diagnostics.push(
-            SourceDiagnostic::new(
-                "CC-LANG-BIND-002",
+                "CC-LANG-RESOLVE-003",
                 source,
                 binding.pad.span,
                 Some(component_path.to_owned()),
                 format!(
-                    "physical pad `{}` is bound more than once",
+                    "pin-to-pad binding references unknown catalog pad `{}`",
                     binding.pad.value
                 ),
-            )
-            .with_related(source, first, "first binding is here"),
-        );
-    } else {
-        bound_pads.insert(binding.pad.value.as_str(), binding.span);
-    }
-    bound_pins.insert(binding.pin.value.as_str());
-    lowered.push(PinPadBinding {
-        pin: binding.pin.value.clone(),
-        pad: binding.pad.value.clone(),
-    });
-}
-
-fn lower_pad(
-    source: &SourceFile,
-    syntax: &PadSyntax,
-    component_path: &str,
-    diagnostics: &mut Vec<SourceDiagnostic>,
-) -> Option<Pad> {
-    let offset = lower_point(source, &syntax.offset, Some(component_path), diagnostics);
-    let size = lower_size(source, &syntax.size, Some(component_path), diagnostics);
-    let shape = match syntax.shape.value.as_str() {
-        "rect" => Some(PadShape::Rect),
-        "roundrect" => Some(PadShape::RoundRect),
-        other => {
-            diagnostics.push(SourceDiagnostic::new(
-                "CC-LANG-PAD-003",
-                source,
-                syntax.shape.span,
-                Some(component_path.to_owned()),
-                format!("unsupported pad shape `{other}`; expected `rect` or `roundrect`"),
             ));
-            None
         }
-    };
-    match (offset, size, shape) {
-        (Some(offset), Some(size), Some(shape)) => Some(Pad {
-            number: syntax.number.value.clone(),
-            offset,
-            size,
-            shape,
-        }),
-        _ => None,
+        if let Some(first) = bound_pads.get(binding.pad.value.as_str()).copied() {
+            diagnostics.push(
+                SourceDiagnostic::new(
+                    "CC-LANG-BIND-002",
+                    source,
+                    binding.pad.span,
+                    Some(component_path.to_owned()),
+                    format!(
+                        "physical pad `{}` is bound more than once",
+                        binding.pad.value
+                    ),
+                )
+                .with_related(source, first, "first binding is here"),
+            );
+        } else {
+            bound_pads.insert(binding.pad.value.as_str(), binding.span);
+        }
+        bound_pins.insert(binding.pin.value.as_str());
+        provenance.insert_semantic(
+            SemanticProvenanceKey::Pad {
+                component: component_path.to_owned(),
+                pad: binding.pad.value.clone(),
+            },
+            binding.span,
+        );
+        lowered_bindings.push(PinPadBinding {
+            pin: binding.pin.value.clone(),
+            pad: binding.pad.value.clone(),
+        });
     }
+    for pad in &catalog_footprint.pads {
+        if !bound_pads.contains_key(pad.number.as_str()) {
+            diagnostics.push(SourceDiagnostic::new(
+                "CC-LANG-BIND-003",
+                source,
+                footprint.span,
+                Some(component_path.to_owned()),
+                format!("catalog pad `{}` has no logical-pin binding", pad.number),
+            ));
+        }
+    }
+    for connection in connections {
+        if matches!(&connection.state, ConnectionState::Connected(_))
+            && !bound_pins.contains(connection.pin.as_str())
+        {
+            diagnostics.push(SourceDiagnostic::new(
+                "CC-LANG-BIND-004",
+                source,
+                footprint.span,
+                Some(component_path.to_owned()),
+                format!(
+                    "connected logical pin `{}` has no physical pad binding",
+                    connection.pin
+                ),
+            ));
+        }
+    }
+    placement.map(|placement| PhysicalImplementation {
+        footprint: catalog_footprint,
+        placement,
+        pin_pad_bindings: lowered_bindings,
+    })
 }
 
 fn lower_rectangle(
@@ -1228,6 +1813,30 @@ impl HasSpan for &FootprintSyntax {
     }
 }
 
+impl HasSpan for &PartSyntax {
+    fn span(&self) -> Span {
+        self.span
+    }
+}
+
+impl HasSpan for &SymbolSyntax {
+    fn span(&self) -> Span {
+        self.span
+    }
+}
+
+impl HasSpan for (&super::syntax::Spanned<String>, Span) {
+    fn span(&self) -> Span {
+        self.1
+    }
+}
+
+impl HasSpan for &SchematicPlacementSyntax {
+    fn span(&self) -> Span {
+        self.span
+    }
+}
+
 fn register_indexed_provenance(design: &Design, provenance: &mut ProvenanceMap) {
     for (index, net) in design.nets.iter().enumerate() {
         if let Some(span) = provenance
@@ -1236,6 +1845,15 @@ fn register_indexed_provenance(design: &Design, provenance: &mut ProvenanceMap) 
             .copied()
         {
             provenance.insert_structural(format!("design.nets[{index}]"), span);
+        }
+    }
+    for (index, module) in design.modules.iter().enumerate() {
+        if let Some(span) = provenance
+            .structural_spans
+            .get(&format!("design.modules.{}", module.path))
+            .copied()
+        {
+            provenance.insert_structural(format!("design.modules[{index}]"), span);
         }
     }
     for (index, route) in design.board.routes.iter().enumerate() {
@@ -1282,60 +1900,46 @@ fn artifact_name_is_valid(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::elaborate;
+    use super::{ProvenanceMap, SemanticProvenanceKey, elaborate};
     use crate::demo::voltage_divider;
     use crate::frontend::parser::parse;
     use crate::frontend::syntax::SourceFile;
 
-    const REFERENCE: &str = r#"
-design voltage_divider {
-  net VIN;
-  net VOUT;
-  ground GND;
-  resistor divider.r_top R1 {
-    resistance 10 kohm;
-    terminals 1 2;
-    connect 1 VIN;
-    connect 2 VOUT;
-    footprint "CircuitC:R_0603_1608Metric" {
-      pad 1 at (-1 mm, 0 mm) size (0.9 mm, 0.95 mm) shape roundrect;
-      pad 2 at (1 mm, 0 mm) size (0.9 mm, 0.95 mm) shape roundrect;
-      bind 1 1;
-      bind 2 2;
-    }
-  }
-  resistor divider.r_bottom R2 {
-    resistance 10 kohm;
-    terminals 1 2;
-    connect 1 VOUT;
-    connect 2 GND;
-    footprint "CircuitC:R_0603_1608Metric" {
-      pad 1 at (-1 mm, 0 mm) size (0.9 mm, 0.95 mm) shape roundrect;
-      pad 2 at (1 mm, 0 mm) size (0.9 mm, 0.95 mm) shape roundrect;
-      bind 1 1;
-      bind 2 2;
-    }
-  }
-  dc_source analysis.input V1 {
-    voltage 10 V;
-    terminals p n;
-    connect p VIN;
-    connect n GND;
-  }
-  board {
-    rectangle at (0 mm, 0 mm) size (40 mm, 20 mm);
-    place R1 at (15 mm, 10 mm) rotation 0 deg layer front;
-    place R2 at (25 mm, 10 mm) rotation 0 deg layer front;
-    route board.routes.vout_bridge net VOUT from (16 mm, 10 mm) to (24 mm, 10 mm) width 0.25 mm layer front;
-  }
-}
-"#;
+    const REFERENCE: &str = include_str!("../../examples/voltage_divider.circuitc");
+    const PHYSICAL_NO_CONNECT: &str = include_str!("../../examples/physical_no_connect.circuitc");
 
     fn elaborate_source(
         source: &str,
     ) -> Result<super::ElaboratedDesign, Vec<crate::frontend::SourceDiagnostic>> {
         let tree = parse(SourceFile::new("test.circuitc", source))?;
         elaborate(&tree)
+    }
+
+    #[test]
+    fn large_provenance_index_resolves_derived_identity_paths() {
+        let mut provenance = ProvenanceMap {
+            source_name: "large.circuitc".to_owned(),
+            semantic_spans: std::collections::BTreeMap::new(),
+            rendered_semantic_spans: std::collections::BTreeMap::new(),
+            structural_spans: std::collections::BTreeMap::new(),
+        };
+        for index in 0..4096 {
+            provenance.insert_semantic(
+                SemanticProvenanceKey::Component(format!("root.c{index}")),
+                crate::frontend::Span {
+                    start: index,
+                    end: index + 1,
+                },
+            );
+        }
+        for index in 0..4096 {
+            assert_eq!(
+                provenance
+                    .span_for_identity(&format!("root.c{index}.symbol.pin.1"))
+                    .map(|span| span.start),
+                Some(index)
+            );
+        }
     }
 
     #[test]
@@ -1349,6 +1953,40 @@ design voltage_divider {
                 .span_for("divider.r_top.footprint.pad.1")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn source_can_author_a_physical_only_component_with_no_connect_pins() {
+        let elaborated = elaborate_source(PHYSICAL_NO_CONNECT)
+            .expect("physical-only no-connect source must elaborate");
+        let component = &elaborated.design.components[0];
+        assert!(component.physical.is_some());
+        assert!(component.simulation.is_none());
+        assert!(matches!(
+            component.value,
+            crate::design::ComponentValue::Resistance(_)
+        ));
+        assert!(component.connections.iter().all(|connection| matches!(
+            connection.state,
+            crate::design::ConnectionState::NoConnect
+        )));
+    }
+
+    #[test]
+    fn simulation_model_and_terminals_are_an_optional_pair() {
+        for source in [
+            REFERENCE.replacen("    model \"spice:R\";\n", "", 1),
+            REFERENCE.replacen("    terminals 1 2;\n", "", 1),
+        ] {
+            let diagnostics = elaborate_source(&source)
+                .expect_err("half of a simulation declaration pair must fail");
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "CC-LANG-SIM-001"),
+                "missing optional-pair diagnostic: {diagnostics:#?}"
+            );
+        }
     }
 
     #[test]
@@ -1370,6 +2008,9 @@ design voltage_divider {
                     }
                 }
                 crate::frontend::syntax::DeclarationSyntax::Board(board) => board.items.reverse(),
+                crate::frontend::syntax::DeclarationSyntax::Module(module) => {
+                    module.ports.reverse()
+                }
                 crate::frontend::syntax::DeclarationSyntax::Net(_) => {}
             }
         }
@@ -1404,7 +2045,11 @@ design voltage_divider {
                 "terminals 1 missing",
                 "CC-LANG-RESOLVE-002",
             ),
-            ("bind 1 1", "bind 1 missing", "CC-LANG-RESOLVE-003"),
+            (
+                "footprint \"CircuitC:R_0603_1608Metric\" {\n      bind 1 1;",
+                "footprint \"CircuitC:R_0603_1608Metric\" {\n      bind 1 missing;",
+                "CC-LANG-RESOLVE-003",
+            ),
             ("place R1 at", "place RX at", "CC-LANG-RESOLVE-004"),
         ] {
             let diagnostics = elaborate_source(&REFERENCE.replacen(needle, replacement, 1))
@@ -1414,6 +2059,44 @@ design voltage_divider {
                 "missing {code}: {diagnostics:#?}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_unknown_catalog_bindings_models_and_orphan_modules() {
+        let unknown_symbol = REFERENCE.replacen("CircuitC:R\"", "CircuitC:UNKNOWN\"", 1);
+        let diagnostics = elaborate_source(&unknown_symbol).expect_err("unknown symbol must fail");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CC-LANG-SYMBOL-003")
+        );
+
+        let unknown_footprint =
+            REFERENCE.replacen("CircuitC:R_0603_1608Metric", "CircuitC:UNKNOWN", 1);
+        let diagnostics =
+            elaborate_source(&unknown_footprint).expect_err("unknown footprint must fail");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CC-LANG-FOOTPRINT-003")
+        );
+
+        let orphan_module = REFERENCE.replacen("module divider.analysis", "module orphan.child", 1);
+        let diagnostics = elaborate_source(&orphan_module).expect_err("orphan module must fail");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CC-LANG-MODULE-003")
+        );
+
+        let unknown_model = REFERENCE.replacen("model \"spice:R\"", "model \"spice:X\"", 1);
+        let diagnostics = crate::frontend::compile_source("model.circuitc", unknown_model)
+            .expect_err("unsupported simulator model must fail");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CC-SIM-010")
+        );
     }
 
     #[test]
@@ -1428,7 +2111,7 @@ design voltage_divider {
     }
 
     #[test]
-    fn reports_duplicate_semantic_identities_references_and_pads() {
+    fn reports_duplicate_semantic_identities_references_and_symbol_pins() {
         let duplicate_component =
             REFERENCE.replace("resistor divider.r_bottom R2", "resistor divider.r_top R1");
         let diagnostics = elaborate_source(&duplicate_component)
@@ -1440,13 +2123,13 @@ design voltage_divider {
             );
         }
 
-        let duplicate_pad = REFERENCE.replacen("pad 2 at (1 mm, 0 mm)", "pad 1 at (1 mm, 0 mm)", 1);
-        let diagnostics =
-            elaborate_source(&duplicate_pad).expect_err("duplicate pad identities must fail");
+        let duplicate_symbol_pin = REFERENCE.replacen("bind 2 2 passive;", "bind 1 2 passive;", 1);
+        let diagnostics = elaborate_source(&duplicate_symbol_pin)
+            .expect_err("duplicate logical symbol pin identities must fail");
         assert!(
             diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.code == "CC-LANG-PAD-001")
+                .any(|diagnostic| diagnostic.code == "CC-LANG-SYMBOL-004")
         );
     }
 

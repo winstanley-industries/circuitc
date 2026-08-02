@@ -1,6 +1,6 @@
 # EPIC-0002: Useful KiCad project compiler
 
-- Status: Planned
+- Status: Complete
 - Architecture milestone: M1B
 - Depends on: EPIC-0001
 
@@ -29,11 +29,59 @@ PCB, and isolated project configuration accepted by KiCad ERC and DRC.
 - APGAR route search.
 - Broad manufacturing release management.
 
+## Completed vertical slice
+
+The reference voltage divider expands M1A through one canonical lowering:
+
+```text
+CircuitC source
+  -> module-instance hierarchy and typed ports
+  -> explicit part, symbol-pin, footprint-pad, and simulator-model bindings
+  -> canonical Design IR with connected/no-connect pin states
+  -> deterministic KiCad project bundle
+       voltage_divider.kicad_sch
+       voltage_divider.kicad_pcb
+       voltage_divider.kicad_pro
+       sym-lib-table / fp-lib-table
+       CircuitC.kicad_sym / CircuitC.pretty/*.kicad_mod
+       voltage_divider.kicad-map.json
+  -> isolated KiCad 10 ERC, DRC, connectivity, and schematic-parity policy
+```
+
+Module paths describe elaborated instances rather than reusable source
+templates in this milestone. A dotted child module requires its parent, every
+component belongs to the module named by the parent of its semantic path, and
+ports explicitly carry direction, electrical pin type, and connected or
+no-connect state. Reusable parameterized module definitions remain compatible
+with this instance-tree IR but are not required to prove M1B.
+
+The initial vendored library catalog deliberately contains only the symbols
+and footprints exercised by the vertical slice. Source bindings are resolved
+against that catalog during elaboration; an unknown symbol, footprint, pin, or
+pad is a source diagnostic. Extending catalog coverage is additive and does
+not give KiCad library display names authority over CircuitC identities.
+
+The schematic is a deterministic projection of canonical connectivity. It is
+laid out from exact source-authored schematic positions, embeds the resolved
+symbol definitions, labels every connected pin with its canonical net, and
+places a KiCad no-connect marker on every explicit no-connect pin. PCB
+footprint paths use the corresponding schematic symbol UUID. Physical
+no-connect pads receive deterministic KiCad-only unconnected nets, while the
+canonical Design IR remains unnetted, so KiCad's parity checker is an authority
+rather than a separate heuristic.
+
+The generated identity map joins every emitted KiCad UUID to a CircuitC
+semantic path and, for source compilation, its UTF-8 source span. Normalized
+host reports use this map to retain stable source ownership while removing host
+paths, timestamps, and finding order.
+
 ## Acceptance gates
 
 - Repeat builds produce byte-identical project artifacts under an identical
   pinned toolchain.
-- KiCad 10 parses every generated artifact.
+- KiCad 10 parses the generated schematic, PCB, symbol, and footprint
+  artifacts; CircuitC validates the exact generated project-JSON subset because
+  `kicad-cli` has no direct `.kicad_pro` parser.
 - Structured ERC and DRC contain no unexpected findings or unconnected items.
 - Schematic-to-PCB parity is clean.
 - Tests run from an isolated KiCad configuration in a clean checkout.
@@ -41,4 +89,56 @@ PCB, and isolated project configuration accepted by KiCad ERC and DRC.
 
 ## Completion evidence
 
-Not yet complete.
+Completed on 2026-08-01 in the working tree based on
+`363d016264197f92b15779309365517b95f39874` (`main`). The implementation is
+intentionally uncommitted and unpushed.
+
+| Requirement | Implementation ownership | Tests and completion evidence |
+| --- | --- | --- |
+| `CC-REQ-KICAD-001` | `src/design.rs`, `src/frontend/{syntax,parser,elaborate}.rs`, `schemas/design_ir/v1.md`, and `docs/language.md` | Module/port hierarchy, electrical types, connection-state validation, optional simulation bindings, missing-parent rejection, declaration permutations, source/Rust IR equivalence, and the source-authored physical-only/no-connect fixture pass in `//:circuitc_test`. |
+| `CC-REQ-KICAD-002` | `src/library.rs`, compiler catalog validation, explicit part/symbol/footprint/model syntax, and vendored assets under `libraries/` | Full logical-device/manufacturer/MPN tuples bind one coherent symbol/footprint definition. Unknown or incoherent tuples, symbols, footprints, pins, pad geometry, and models produce stable diagnostics; public-IR adversarial tests confirm failures do not panic. |
+| `CC-REQ-KICAD-003` | Bazel `compile_data`, `libraries/CircuitC.kicad_sym`, `libraries/CircuitC.pretty/`, and generated `${KIPRJMOD}` library tables | Catalog/asset consistency tests pass; the host gate exports the symbol and footprint with an isolated `KICAD_CONFIG_HOME` and no user-global library dependency. |
+| `CC-REQ-KICAD-004` | `src/kicad.rs`, `CompiledArtifacts`, `//cmd/circuitc`, and the Rust fixture generator | Full-bundle CLI tests compare source builds across filenames, including identity maps, and against the Rust oracle. Symlink-containment regression tests protect transactional output. The host gate compares independent source builds byte for byte. |
+| `CC-REQ-KICAD-005` | Exact schematic/board placement and explicit route lowering in the language, Design IR, and KiCad backend | Full-turn and declaration-order tests preserve canonical IR and artifacts; route UUIDs remain stable when geometry moves, and all coordinates lower from integer nanometres without floating point. |
+| `CC-REQ-KICAD-006` | Deterministic `KicadIdentity` enumeration, `<design>.kicad-map.json`, and `tools/kicad/normalize_drc.py` | Global UUID and rendered-semantic-path collision tests include source primary/related spans. Schema/type/exact-field/source/UUID/path/missing/duplicate/location manifest tests, unknown-finding rejection, exact severity and ignored-check policy, and complete source-correlated ERC/DRC/unconnected/parity aggregation pass under Bazel. |
+| `CC-REQ-KICAD-007` | `//:kicad10_drc_test`, `//:kicad_project_validator_test` | KiCad 10.0.5 parsed/exported the vendored libraries and ran isolated ERC/DRC/parity for both the voltage divider and physical-only/no-connect source. Each reported 0 ERC violations, 0 DRC violations, 0 unconnected items, and 0 parity issues. The deterministic project validator accepts both generated project files and rejects malformed JSON, invalid or nonempty nested structure, and filename mismatch. |
+
+Exact successful gates from the completed working tree:
+
+```text
+bazel lint //...
+bazel build //...
+bazel test //...
+bazel test --lockfile_mode=error //...
+bazel mod graph --lockfile_mode=error
+bazel test //:kicad10_drc_test --test_output=all
+```
+
+The implementation and documentation above were copied without repository or
+Bazel output state into an isolated repository under `/private/tmp`, committed
+as clean validation snapshot
+`b6d163720cc56cb17be6b0d0ef5d03cf7774367a`, and exercised with the same five
+repository gates plus an uncached KiCad host gate. The snapshot was clean both
+before and after validation. A final independent three-agent adversarial wave
+covering correctness, contracts and documentation, performance, CLI security,
+and host evidence reported no remaining actionable findings after remediation.
+This evidence paragraph and the adjacent CLI platform clarification are the
+only changes made after that snapshot; the final handoff records a second clean
+snapshot of the exact final payload.
+
+The host gate produced identical normalized project, ERC, and DRC evidence for
+two independent builds of each source fixture. The physical-only fixture proves
+that both explicit no-connect pads survive schematic-to-PCB parity without a
+canonical net. The generated reference bundle has these SHA-256 values:
+
+```text
+271039f04a30790249b2a59e1df4ce3324cc19e4d7936d466c8b8ea0ed32e707  voltage_divider.kicad_sch
+e4c1005f461e8d88078d51fba779580d08d9bf4917e484810e0f80df66b144cb  voltage_divider.kicad_pcb
+201bc75180ca7d38f797023bf001f2d39575f281d2440cae505bdf382a39a7a7  voltage_divider.kicad_pro
+6b853363a4daefffb57c6ba13a51d5592fe6e7e1ba93a5f058f6e17858223633  CircuitC.kicad_sym
+e3b8b6c35c80e5d84c23d4a929a8aad42a784301485580206e7282e2870381ae  CircuitC.pretty/R_0603_1608Metric.kicad_mod
+b3c0b7098fe43935a8fd3942b85261f17462ca069a2f0aa76cef599db9b26d22  sym-lib-table
+080eb955b8d15f67e9f6ee383a1a3707aec6fdc41bfb8b5dc8a0d0a8d9a1fdc2  fp-lib-table
+400f46fd9009aced611803481399ee742d11cf4be94bffea6e6b45b2446376e1  voltage_divider.kicad-map.json
+43a5f70c8f1e4bbdf428027a1b88e450f02ea6eacf9015f2cd953d65b174c0a8  voltage_divider.spice
+```

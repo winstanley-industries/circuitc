@@ -2,9 +2,10 @@ use super::diagnostic::{SourceDiagnostic, sort_diagnostics};
 use super::lexer::{Token, TokenKind, lex, token_word};
 use super::syntax::{
     BindingSyntax, BoardItemSyntax, BoardSyntax, ComponentItemSyntax, ComponentKindSyntax,
-    ComponentSyntax, DeclarationSyntax, DesignSyntax, FootprintItemSyntax, FootprintSyntax,
-    NetSyntax, PadSyntax, PlacementSyntax, PointSyntax, QuantitySyntax, RectangleSyntax,
-    RouteSyntax, SourceFile, Span, Spanned, SyntaxTree,
+    ComponentSyntax, ConnectionStateSyntax, DeclarationSyntax, DesignSyntax, FootprintItemSyntax,
+    FootprintSyntax, ModuleSyntax, NetSyntax, PartSyntax, PlacementSyntax, PointSyntax, PortSyntax,
+    QuantitySyntax, RectangleSyntax, RouteSyntax, SchematicPlacementSyntax, SourceFile, Span,
+    Spanned, SymbolPinSyntax, SymbolSyntax, SyntaxTree,
 };
 
 pub(crate) fn parse(source: SourceFile) -> Result<SyntaxTree, Vec<SourceDiagnostic>> {
@@ -91,6 +92,9 @@ impl Parser<'_> {
         if self.at_keyword("ground") {
             return self.parse_net(true).map(DeclarationSyntax::Net);
         }
+        if self.at_keyword("module") {
+            return self.parse_module().map(DeclarationSyntax::Module);
+        }
         if self.at_keyword("resistor") {
             return self
                 .parse_component(ComponentKindSyntax::Resistor)
@@ -120,6 +124,62 @@ impl Parser<'_> {
         })
     }
 
+    fn parse_module(&mut self) -> Option<ModuleSyntax> {
+        let start = self.take().span;
+        let path = self.expect_name("module instance path")?;
+        if !self.expect_kind(TokenKind::LeftBrace, "`{` to open the module") {
+            self.recover_item();
+            return None;
+        }
+        let mut ports = Vec::new();
+        while !self.at_kind(&TokenKind::RightBrace) && !self.at_end() {
+            let before = self.cursor;
+            if self.at_keyword("port") {
+                if let Some(port) = self.parse_port() {
+                    ports.push(port);
+                }
+            } else {
+                self.unsupported("module declaration");
+                self.recover_item();
+            }
+            if self.cursor == before {
+                self.advance();
+            }
+        }
+        let end = self.expect_closing_brace("module")?;
+        Some(ModuleSyntax {
+            path,
+            ports,
+            span: start.through(end),
+        })
+    }
+
+    fn parse_port(&mut self) -> Option<PortSyntax> {
+        let start = self.take().span;
+        let direction = self.expect_name("module port direction")?;
+        let name = self.expect_name("module port name")?;
+        let electrical_type = self.expect_name("module port electrical type")?;
+        let state = if self.at_keyword("connect") {
+            self.advance();
+            ConnectionStateSyntax::Connected(self.expect_name("connected net")?)
+        } else if self.at_keyword("no_connect") {
+            let span = self.take().span;
+            ConnectionStateSyntax::NoConnect(span)
+        } else {
+            self.error_expected("`connect NET` or `no_connect`");
+            self.recover_item();
+            return None;
+        };
+        let end = self.expect_semicolon()?;
+        Some(PortSyntax {
+            direction,
+            name,
+            electrical_type,
+            state,
+            span: start.through(end),
+        })
+    }
+
     fn parse_component(&mut self, kind: ComponentKindSyntax) -> Option<ComponentSyntax> {
         let start = self.take().span;
         let path = self.expect_name("component semantic path")?;
@@ -131,12 +191,23 @@ impl Parser<'_> {
         let mut items = Vec::new();
         while !self.at_kind(&TokenKind::RightBrace) && !self.at_end() {
             let before = self.cursor;
-            let item = if self.at_keyword("resistance") || self.at_keyword("voltage") {
+            let item = if self.at_keyword("part") {
+                self.parse_part().map(ComponentItemSyntax::Part)
+            } else if self.at_keyword("symbol") {
+                self.parse_symbol().map(ComponentItemSyntax::Symbol)
+            } else if self.at_keyword("model") {
+                self.parse_model()
+            } else if self.at_keyword("schematic") {
+                self.parse_schematic_placement()
+                    .map(ComponentItemSyntax::SchematicPlacement)
+            } else if self.at_keyword("resistance") || self.at_keyword("voltage") {
                 self.parse_value()
             } else if self.at_keyword("terminals") {
                 self.parse_terminals()
             } else if self.at_keyword("connect") {
                 self.parse_connection()
+            } else if self.at_keyword("no_connect") {
+                self.parse_no_connect()
             } else if self.at_keyword("footprint") {
                 self.parse_footprint().map(ComponentItemSyntax::Footprint)
             } else {
@@ -157,6 +228,97 @@ impl Parser<'_> {
             path,
             reference,
             items,
+            span: start.through(end),
+        })
+    }
+
+    fn parse_part(&mut self) -> Option<PartSyntax> {
+        let start = self.take().span;
+        let logical_device = self.expect_string("quoted logical device identity")?;
+        let (manufacturer, manufacturer_part_number) = if self.at_keyword("virtual") {
+            self.advance();
+            (None, None)
+        } else {
+            self.require_keyword("manufacturer")?;
+            let manufacturer = self.expect_string("quoted manufacturer identity")?;
+            self.require_keyword("number")?;
+            let number = self.expect_string("quoted manufacturer part number")?;
+            (Some(manufacturer), Some(number))
+        };
+        let end = self.expect_semicolon()?;
+        Some(PartSyntax {
+            logical_device,
+            manufacturer,
+            manufacturer_part_number,
+            span: start.through(end),
+        })
+    }
+
+    fn parse_symbol(&mut self) -> Option<SymbolSyntax> {
+        let start = self.take().span;
+        let library_id = self.expect_string("quoted symbol library identifier")?;
+        if !self.expect_kind(TokenKind::LeftBrace, "`{` to open the symbol binding") {
+            self.recover_item();
+            return None;
+        }
+        let mut pins = Vec::new();
+        while !self.at_kind(&TokenKind::RightBrace) && !self.at_end() {
+            let before = self.cursor;
+            if self.at_keyword("bind") {
+                if let Some(pin) = self.parse_symbol_pin() {
+                    pins.push(pin);
+                }
+            } else {
+                self.unsupported("symbol binding declaration");
+                self.recover_item();
+            }
+            if self.cursor == before {
+                self.advance();
+            }
+        }
+        let end = self.expect_closing_brace("symbol binding")?;
+        Some(SymbolSyntax {
+            library_id,
+            pins,
+            span: start.through(end),
+        })
+    }
+
+    fn parse_symbol_pin(&mut self) -> Option<SymbolPinSyntax> {
+        let start = self.take().span;
+        let pin = self.expect_name("logical pin in symbol binding")?;
+        let symbol_pin = self.expect_name("library symbol pin number")?;
+        let electrical_type = self.expect_name("symbol pin electrical type")?;
+        let end = self.expect_semicolon()?;
+        Some(SymbolPinSyntax {
+            pin,
+            symbol_pin,
+            electrical_type,
+            span: start.through(end),
+        })
+    }
+
+    fn parse_model(&mut self) -> Option<ComponentItemSyntax> {
+        let start = self.take().span;
+        let library_id = self.expect_string("quoted simulation model identifier")?;
+        let end = self.expect_semicolon()?;
+        Some(ComponentItemSyntax::Model {
+            library_id,
+            span: start.through(end),
+        })
+    }
+
+    fn parse_schematic_placement(&mut self) -> Option<SchematicPlacementSyntax> {
+        let start = self.take().span;
+        self.require_keyword("at")?;
+        let position = self.parse_point()?;
+        self.require_keyword("rotation")?;
+        let rotation = self.expect_number("schematic rotation in degrees")?;
+        self.require_keyword("deg")?;
+        let end = self.expect_semicolon()?;
+        Some(SchematicPlacementSyntax {
+            position,
+            rotation,
             span: start.through(end),
         })
     }
@@ -194,6 +356,16 @@ impl Parser<'_> {
         })
     }
 
+    fn parse_no_connect(&mut self) -> Option<ComponentItemSyntax> {
+        let start = self.take().span;
+        let pin = self.expect_name("logical no-connect pin")?;
+        let end = self.expect_semicolon()?;
+        Some(ComponentItemSyntax::NoConnect {
+            pin,
+            span: start.through(end),
+        })
+    }
+
     fn parse_footprint(&mut self) -> Option<FootprintSyntax> {
         let start = self.take().span;
         let library_id = self.expect_string("quoted footprint library identifier")?;
@@ -204,10 +376,7 @@ impl Parser<'_> {
         let mut items = Vec::new();
         while !self.at_kind(&TokenKind::RightBrace) && !self.at_end() {
             let before = self.cursor;
-            let item = if self.at_keyword("pad") {
-                self.parse_pad()
-                    .map(|pad| FootprintItemSyntax::Pad(Box::new(pad)))
-            } else if self.at_keyword("bind") {
+            let item = if self.at_keyword("bind") {
                 self.parse_binding().map(FootprintItemSyntax::Binding)
             } else {
                 self.unsupported("footprint declaration");
@@ -225,25 +394,6 @@ impl Parser<'_> {
         Some(FootprintSyntax {
             library_id,
             items,
-            span: start.through(end),
-        })
-    }
-
-    fn parse_pad(&mut self) -> Option<PadSyntax> {
-        let start = self.take().span;
-        let number = self.expect_name("pad number")?;
-        self.require_keyword("at")?;
-        let offset = self.parse_point()?;
-        self.require_keyword("size")?;
-        let size = self.parse_point()?;
-        self.require_keyword("shape")?;
-        let shape = self.expect_name("pad shape")?;
-        let end = self.expect_semicolon()?;
-        Some(PadSyntax {
-            number,
-            offset,
-            size,
-            shape,
             span: start.through(end),
         })
     }

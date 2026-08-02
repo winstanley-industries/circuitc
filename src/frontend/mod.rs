@@ -15,6 +15,7 @@ use crate::CompiledArtifacts;
 pub struct CompiledSource {
     pub elaborated: ElaboratedDesign,
     pub artifacts: CompiledArtifacts,
+    pub kicad_identity_map: String,
 }
 
 pub fn parse_source(
@@ -45,20 +46,109 @@ pub fn compile_source(
     let artifacts = crate::compile(&elaborated.design).map_err(|error| {
         elaborate::map_ir_diagnostics(&syntax.source, &elaborated.provenance, error.diagnostics)
     })?;
+    let logical_source_name = format!("{}.circuitc", elaborated.design.name);
+    let kicad_identity_map = render_kicad_identity_map(
+        &syntax.source,
+        &logical_source_name,
+        &elaborated.provenance,
+        &artifacts.kicad_identities,
+    );
     Ok(CompiledSource {
         elaborated,
         artifacts,
+        kicad_identity_map,
     })
+}
+
+fn render_kicad_identity_map(
+    source: &SourceFile,
+    logical_source_name: &str,
+    provenance: &ProvenanceMap,
+    identities: &[crate::KicadIdentity],
+) -> String {
+    let mut output = String::from("{\n  \"schema_version\": 1,\n  \"source\": ");
+    write_json_string(&mut output, logical_source_name);
+    output.push_str(",\n  \"identities\": [\n");
+    for (index, identity) in identities.iter().enumerate() {
+        output.push_str("    {\n      \"uuid\": ");
+        write_json_string(&mut output, &identity.uuid);
+        output.push_str(",\n      \"semantic_path\": ");
+        write_json_string(&mut output, &identity.semantic_path);
+        if let Some(span) = provenance.span_for_identity(&identity.semantic_path) {
+            let (line, column) = source.line_column(span.start);
+            output.push_str(",\n      \"location\": {\"start\": ");
+            output.push_str(&span.start.to_string());
+            output.push_str(", \"end\": ");
+            output.push_str(&span.end.to_string());
+            output.push_str(", \"line\": ");
+            output.push_str(&line.to_string());
+            output.push_str(", \"column\": ");
+            output.push_str(&column.to_string());
+            output.push('}');
+        } else {
+            output.push_str(",\n      \"location\": null");
+        }
+        output.push_str("\n    }");
+        if index + 1 != identities.len() {
+            output.push(',');
+        }
+        output.push('\n');
+    }
+    output.push_str("  ]\n}\n");
+    output
+}
+
+fn write_json_string(output: &mut String, value: &str) {
+    output.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            character if character.is_control() => {
+                use std::fmt::Write as _;
+                write!(output, "\\u{:04x}", u32::from(character)).unwrap();
+            }
+            character => output.push(character),
+        }
+    }
+    output.push('"');
 }
 
 #[cfg(test)]
 mod tests {
     use super::{DiagnosticFormat, compile_source, render_diagnostics};
 
+    const MINIMAL_VIRTUAL_SOURCE: &str = r#"design d {
+  ground GND;
+  module root {}
+  dc_source root.input V1 {
+    part "dc_voltage_source" virtual;
+    symbol "CircuitC:VDC" {
+      bind p 1 passive;
+      bind n 2 passive;
+    }
+    model "spice:Vdc";
+    schematic at (60.96 mm, 81.28 mm) rotation 0 deg;
+    voltage 1 V;
+    terminals p n;
+    connect p GND;
+    connect n GND;
+  }
+  board {
+    rectangle at (0 mm, 0 mm) size (1 mm, 1 mm);
+  }
+}"#;
+
     #[test]
     fn backend_diagnostics_map_to_authored_route_span() {
-        let source = "design d { ground GND; dc_source input V1 { voltage 1 V; terminals p n; connect p GND; connect n GND; } board { rectangle at (0 mm, 0 mm) size (1 mm, 1 mm); route bad net GND from (0 mm, 0 mm) to (2 mm, 0 mm) width 1 nm layer front; } }";
-        let diagnostics = compile_source("bad-route.circuitc", source)
+        let source = MINIMAL_VIRTUAL_SOURCE.replace(
+            "    rectangle at (0 mm, 0 mm) size (1 mm, 1 mm);",
+            "    rectangle at (0 mm, 0 mm) size (1 mm, 1 mm);\n    route bad net GND from (0 mm, 0 mm) to (2 mm, 0 mm) width 1 nm layer front;",
+        );
+        let diagnostics = compile_source("bad-route.circuitc", &source)
             .expect_err("out-of-board route must fail through Design validation");
         let route = diagnostics
             .iter()
@@ -72,50 +162,71 @@ mod tests {
     }
 
     #[test]
-    fn structural_provenance_cannot_be_overwritten_by_component_paths() {
+    fn structural_identity_collision_reports_outline_and_component_origins() {
         let source = r#"design d {
   ground GND;
+  module design {}
+  module design.board {}
   dc_source design.board.outline V1 {
+    part "dc_voltage_source" virtual;
+    symbol "CircuitC:VDC" {
+      bind p 1 passive;
+      bind n 2 passive;
+    }
+    model "spice:Vdc";
+    schematic at (60.96 mm, 81.28 mm) rotation 0 deg;
     voltage 1 V;
     terminals p n;
     connect p GND;
     connect n GND;
   }
   board {
-    rectangle at (999999 mm, 0 mm) size (2 mm, 1 mm);
+    rectangle at (0 mm, 0 mm) size (1 mm, 1 mm);
   }
 }"#;
         let diagnostics = compile_source("collision.circuitc", source)
-            .expect_err("outline beyond the coordinate envelope must fail");
-        let outline = diagnostics
+            .expect_err("component path colliding with the outline identity must fail");
+        let collision = diagnostics
             .iter()
-            .find(|diagnostic| diagnostic.code == "CC-BOARD-004")
-            .expect("mapped outline diagnostic must exist");
-        assert_eq!(outline.line, 10);
-        assert_eq!(
-            &source[outline.start..outline.start + "rectangle".len()],
-            "rectangle"
-        );
+            .find(|diagnostic| diagnostic.code == "CC-KICAD-ID-002")
+            .expect("semantic collision diagnostic must exist");
+        assert!(source[collision.start..].starts_with("dc_source design.board.outline"));
+        assert_eq!(collision.related.len(), 1);
+        assert!(source[collision.related[0].start..].starts_with("rectangle"));
     }
 
     #[test]
-    fn component_provenance_cannot_be_overwritten_by_synthesized_semantic_paths() {
+    fn synthesized_footprint_collision_reports_both_component_origins() {
         let source = r#"design d {
   net N;
   ground GND;
-  resistor x R1 {
+  module root {}
+  module root.x {}
+  resistor root.x R1 {
+    part "resistor" manufacturer "Yageo" number "RC0603FR-0710KL";
+    symbol "CircuitC:R" {
+      bind 1 1 passive;
+      bind 2 2 passive;
+    }
+    model "spice:R";
+    schematic at (81.28 mm, 81.28 mm) rotation 0 deg;
     resistance 1 kohm;
     terminals 1 2;
     connect 1 N;
     connect 2 GND;
-    footprint "CircuitC:R" {
-      pad 1 at (0 mm, 0 mm) size (1 mm, 1 mm) shape rect;
-      pad 2 at (1 mm, 0 mm) size (1 mm, 1 mm) shape rect;
+    footprint "CircuitC:R_0603_1608Metric" {
       bind 1 1;
       bind 2 2;
     }
   }
-  dc_source x.footprint X1 {
+  dc_source root.x.footprint V1 {
+    part "dc_voltage_source" virtual;
+    symbol "CircuitC:VDC" {
+      bind p 1 passive;
+      bind n 2 passive;
+    }
+    model "spice:Vdc";
+    schematic at (60.96 mm, 81.28 mm) rotation 0 deg;
     voltage 1 V;
     terminals p n;
     connect p N;
@@ -127,12 +238,14 @@ mod tests {
   }
 }"#;
         let diagnostics = compile_source("semantic-collision.circuitc", source)
-            .expect_err("an invalid voltage-source reference must fail");
-        let source_reference = diagnostics
+            .expect_err("component path colliding with a generated footprint must fail");
+        let collision = diagnostics
             .iter()
-            .find(|diagnostic| diagnostic.code == "CC-SIM-007")
-            .expect("mapped voltage-source diagnostic must exist");
-        assert!(source[source_reference.start..].starts_with("dc_source x.footprint"));
+            .find(|diagnostic| diagnostic.code == "CC-KICAD-ID-002")
+            .expect("semantic collision diagnostic must exist");
+        assert!(source[collision.start..].starts_with("dc_source root.x.footprint"));
+        assert_eq!(collision.related.len(), 1);
+        assert!(source[collision.related[0].start..].starts_with("footprint \"CircuitC:R"));
     }
 
     #[test]
@@ -153,17 +266,88 @@ mod tests {
 
     #[test]
     fn requested_filename_does_not_change_artifacts() {
-        let source = "design d { ground GND; dc_source input V1 { voltage 1 V; terminals p n; connect p GND; connect n GND; } board { rectangle at (0 mm, 0 mm) size (1 mm, 1 mm); } }";
-        let first = compile_source("relative.circuitc", source).expect("source must compile");
-        let second = compile_source("/absolute/elsewhere/input.circuitc", source)
+        let first = compile_source("relative.circuitc", MINIMAL_VIRTUAL_SOURCE)
+            .expect("source must compile");
+        let second = compile_source("/absolute/elsewhere/input.circuitc", MINIMAL_VIRTUAL_SOURCE)
             .expect("source path must not affect compilation");
         assert_eq!(first.elaborated.design, second.elaborated.design);
         assert_eq!(first.artifacts, second.artifacts);
+        assert_eq!(first.kicad_identity_map, second.kicad_identity_map);
+        assert!(
+            first
+                .kicad_identity_map
+                .contains("\"source\": \"d.circuitc\"")
+        );
+    }
+
+    #[test]
+    fn source_semantic_collision_reports_both_authored_entities() {
+        let source = include_str!("../../examples/voltage_divider.circuitc")
+            .replace("board.routes.vout_bridge", "divider.r_top");
+        let diagnostics = compile_source("collision.circuitc", &source)
+            .expect_err("route/component identity collision must fail before emission");
+        let collision = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "CC-KICAD-ID-002")
+            .expect("source collision diagnostic must exist");
+        assert!(source[collision.start..].starts_with("route divider.r_top"));
+        assert_eq!(collision.related.len(), 1);
+        assert!(source[collision.related[0].start..].starts_with("resistor divider.r_top R1"));
+    }
+
+    #[test]
+    fn kicad_identity_manifest_maps_uuid_to_authored_component_span() {
+        let source = include_str!("../../examples/voltage_divider.circuitc");
+        let compiled = compile_source("examples/voltage_divider.circuitc", source)
+            .expect("reference source must compile");
+        let component_start = source
+            .find("resistor divider.r_top R1")
+            .expect("reference component exists");
+        let span = compiled
+            .elaborated
+            .provenance
+            .span_for("divider.r_top")
+            .expect("component provenance exists");
+        assert_eq!(span.start, component_start);
+        let prefix = &source[..span.start];
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+        let column = prefix
+            .rsplit_once('\n')
+            .map_or(prefix.len(), |(_, tail)| tail.len())
+            + 1;
+        assert!(
+            compiled
+                .kicad_identity_map
+                .contains("\"semantic_path\": \"divider.r_top\"")
+        );
+        assert!(
+            compiled
+                .kicad_identity_map
+                .contains(&format!("\"start\": {component_start}, \"end\":"))
+        );
+        assert!(
+            compiled
+                .kicad_identity_map
+                .contains(&format!("\"line\": {line}, \"column\": {column}"))
+        );
+        assert!(
+            compiled
+                .kicad_identity_map
+                .contains("\"semantic_path\": \"board.routes.vout_bridge\"")
+        );
+        assert!(
+            !compiled
+                .kicad_identity_map
+                .contains("design.board.routes.board.routes.vout_bridge")
+        );
     }
 
     #[test]
     fn digit_leading_identifiers_resolve_end_to_end() {
-        let source = "design d { ground 1G; dc_source input V1 { voltage 1 V; terminals p n; connect p 1G; connect n 1G; } board { rectangle at (0 mm, 0 mm) size (1 mm, 1 mm); } }";
+        let source = MINIMAL_VIRTUAL_SOURCE
+            .replace("ground GND", "ground 1G")
+            .replace("connect p GND", "connect p 1G")
+            .replace("connect n GND", "connect n 1G");
         let compiled = compile_source("digits.circuitc", source)
             .expect("digit-leading canonical identifiers must compile");
         assert!(
@@ -178,7 +362,7 @@ mod tests {
 
     #[test]
     fn adjacent_line_comments_do_not_enter_semantic_identity() {
-        let source = "design d { ground GND// adjacent comment\n; board { rectangle at (0 mm, 0 mm) size (1 mm, 1 mm); } }";
+        let source = "design d { ground GND// adjacent comment\n; module root {} board { rectangle at (0 mm, 0 mm) size (1 mm, 1 mm); } }";
         let compiled = compile_source("comment.circuitc", source)
             .expect("an adjacent line comment must remain trivia");
         assert_eq!(compiled.elaborated.design.nets[0].name, "GND");

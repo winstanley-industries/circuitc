@@ -5,8 +5,21 @@ use crate::spice::SpiceNameMap;
 use crate::{kicad, spice};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KicadIdentity {
+    pub uuid: String,
+    pub semantic_path: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledArtifacts {
+    pub kicad_schematic: String,
     pub kicad_pcb: String,
+    pub kicad_project: String,
+    pub kicad_symbol_library: String,
+    pub kicad_footprint_library: String,
+    pub kicad_symbol_table: String,
+    pub kicad_footprint_table: String,
+    pub kicad_identities: Vec<KicadIdentity>,
     pub spice: String,
     pub spice_name_map: SpiceNameMap,
 }
@@ -41,8 +54,16 @@ pub fn compile(design: &Design) -> Result<CompiledArtifacts, CompileError> {
         });
     }
     let lowered_spice = spice::lower_netlist(design);
+    let project = kicad::emit_project(design);
     Ok(CompiledArtifacts {
-        kicad_pcb: kicad::emit_board(design),
+        kicad_schematic: project.schematic,
+        kicad_pcb: project.board,
+        kicad_project: project.project,
+        kicad_symbol_library: crate::library::SYMBOL_LIBRARY.to_owned(),
+        kicad_footprint_library: crate::library::RESISTOR_FOOTPRINT_LIBRARY.to_owned(),
+        kicad_symbol_table: project.symbol_table,
+        kicad_footprint_table: project.footprint_table,
+        kicad_identities: project.identities,
         spice: lowered_spice.netlist,
         spice_name_map: lowered_spice.name_map,
     })
@@ -50,10 +71,10 @@ pub fn compile(design: &Design) -> Result<CompiledArtifacts, CompileError> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
     use std::panic::catch_unwind;
 
     use crate::demo::voltage_divider;
+    use crate::design::{ConnectionState, ModuleInstance};
 
     use super::compile;
 
@@ -77,10 +98,15 @@ mod tests {
         let expected = compile(&design).expect("reference design must compile");
         let mut permuted = design;
         permuted.nets.reverse();
+        permuted.modules.reverse();
         permuted.components.reverse();
         permuted.board.routes.reverse();
+        for module in &mut permuted.modules {
+            module.ports.reverse();
+        }
         for component in &mut permuted.components {
             component.connections.reverse();
+            component.symbol.pins.reverse();
             if let Some(physical) = &mut component.physical {
                 physical.footprint.pads.reverse();
                 physical.pin_pad_bindings.reverse();
@@ -90,6 +116,75 @@ mod tests {
             compile(&permuted).expect("permuted design must compile"),
             expected
         );
+    }
+
+    #[test]
+    fn explicit_no_connect_emits_schematic_and_kicad_board_intent() {
+        let mut design = voltage_divider();
+        let component = design
+            .components
+            .iter_mut()
+            .find(|component| component.reference == "R1")
+            .expect("reference resistor exists");
+        component.simulation = None;
+        component.connections[0].state = ConnectionState::NoConnect;
+        design.canonicalize();
+
+        let artifacts = compile(&design).expect("physical-only no-connect must compile");
+        assert!(artifacts.kicad_schematic.contains("  (no_connect (at "));
+        assert!(artifacts.kicad_identities.iter().any(|identity| {
+            identity.semantic_path == "divider.r_top.connection.1"
+                && artifacts.kicad_schematic.contains(&identity.uuid)
+        }));
+
+        let footprint_start = artifacts
+            .kicad_pcb
+            .find("(property \"Reference\" \"R1\"")
+            .expect("R1 footprint must exist");
+        let footprint_end = artifacts.kicad_pcb[footprint_start..]
+            .find("\n  )")
+            .map(|offset| footprint_start + offset)
+            .expect("R1 footprint must terminate");
+        let footprint = &artifacts.kicad_pcb[footprint_start..footprint_end];
+        let pad = pad_stanza(footprint, "1");
+        assert!(
+            pad.contains("(net \"unconnected-(R1-Pad1)\")"),
+            "no-connect pad must receive KiCad's deterministic parity-only net"
+        );
+        assert!(
+            !design
+                .nets
+                .iter()
+                .any(|net| net.name.contains("unconnected-"))
+        );
+
+        let connected_pad = pad_stanza(footprint, "2");
+        assert!(connected_pad.contains("(net \"VOUT\")"));
+    }
+
+    #[test]
+    fn source_authored_physical_no_connect_fixture_compiles() {
+        let source = include_str!("../examples/physical_no_connect.circuitc");
+        let compiled = crate::frontend::compile_source("physical_no_connect.circuitc", source)
+            .expect("source-authored physical no-connect fixture must compile");
+        let component = &compiled.elaborated.design.components[0];
+        assert!(component.simulation.is_none());
+        assert!(
+            component
+                .connections
+                .iter()
+                .all(|connection| connection.state == ConnectionState::NoConnect)
+        );
+        assert!(!compiled.artifacts.spice.contains("R1 "));
+
+        let footprint_start = compiled
+            .artifacts
+            .kicad_pcb
+            .find("(property \"Reference\" \"R1\"")
+            .expect("R1 footprint must exist");
+        let footprint = &compiled.artifacts.kicad_pcb[footprint_start..];
+        assert!(pad_stanza(footprint, "1").contains("(net \"unconnected-(R1-Pad1)\")"));
+        assert!(pad_stanza(footprint, "2").contains("(net \"unconnected-(R1-Pad2)\")"));
     }
 
     #[test]
@@ -114,6 +209,79 @@ mod tests {
         let result = catch_unwind(|| compile(&design));
         assert!(result.is_ok(), "outline overflow must not panic");
         assert!(result.expect("checked above").is_err());
+
+        let mut design = voltage_divider();
+        design.components[0].schematic_placement.position.y = crate::design::MAX_ABS_COORDINATE_NM;
+        let result = catch_unwind(|| compile(&design));
+        let diagnostics = result
+            .expect("derived schematic pin overflow must not panic")
+            .expect_err("derived schematic pin beyond the envelope must fail")
+            .diagnostics;
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CC-KICAD-SCHEMATIC-001")
+        );
+    }
+
+    #[test]
+    fn invalid_kicad_catalog_bindings_return_diagnostics_without_panicking() {
+        let mut design = voltage_divider();
+        design.components[0].part.manufacturer = Some("Texas Instruments".to_owned());
+        design.components[0].part.manufacturer_part_number = Some("CC3551EN0UNRGER".to_owned());
+        let diagnostics = compile(&design)
+            .expect_err("incoherent manufacturer part identity must fail")
+            .diagnostics;
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CC-KICAD-PART-001")
+        );
+
+        let mut design = voltage_divider();
+        design.components[0].symbol.library_id = "CircuitC:UNKNOWN".to_owned();
+        let result = catch_unwind(|| compile(&design));
+        let diagnostics = result
+            .expect("unknown symbols must not panic")
+            .expect_err("unknown symbols must fail")
+            .diagnostics;
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CC-KICAD-SYMBOL-006")
+        );
+
+        let mut design = voltage_divider();
+        let physical = design.components[0]
+            .physical
+            .as_mut()
+            .expect("reference resistor is physical");
+        physical.footprint.pads[0].size.width += 1;
+        let diagnostics = compile(&design)
+            .expect_err("catalog geometry drift must fail")
+            .diagnostics;
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CC-KICAD-FOOTPRINT-001")
+        );
+
+        let mut design = voltage_divider();
+        let component = &mut design.components[0];
+        let physical = component
+            .physical
+            .as_mut()
+            .expect("reference resistor is physical");
+        physical.pin_pad_bindings[0].pad = "2".to_owned();
+        physical.pin_pad_bindings[1].pad = "1".to_owned();
+        let diagnostics = compile(&design)
+            .expect_err("cross-mapped symbol pins and pads must fail closed")
+            .diagnostics;
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CC-KICAD-BIND-001")
+        );
     }
 
     #[test]
@@ -147,21 +315,50 @@ mod tests {
     }
 
     #[test]
-    fn emitted_kicad_uuids_are_globally_unique_for_adversarial_paths() {
+    fn rejects_component_paths_that_collide_with_generated_kicad_paths() {
         let mut design = voltage_divider();
-        design.components[0].path = "x".to_owned();
-        let first_physical = design.components[0]
-            .physical
-            .as_mut()
-            .expect("reference resistor is physical");
-        first_physical.footprint.pads[0].number = "1.footprint".to_owned();
-        first_physical.pin_pad_bindings[0].pad = "1.footprint".to_owned();
-        design.components[1].path = "x.footprint.pad.1".to_owned();
+        design.modules.extend([
+            ModuleInstance {
+                path: "root".to_owned(),
+                ports: Vec::new(),
+            },
+            ModuleInstance {
+                path: "root.x".to_owned(),
+                ports: Vec::new(),
+            },
+            ModuleInstance {
+                path: "root.x.footprint".to_owned(),
+                ports: Vec::new(),
+            },
+            ModuleInstance {
+                path: "root.x.footprint.pad".to_owned(),
+                ports: Vec::new(),
+            },
+        ]);
+        design.components[0].path = "root.x".to_owned();
+        design.components[0].module_path = "root".to_owned();
+        design.components[1].path = "root.x.footprint.pad.1".to_owned();
+        design.components[1].module_path = "root.x.footprint.pad".to_owned();
 
-        let artifacts = compile(&design).expect("adversarial identities must remain distinct");
-        let uuids = board_uuids(&artifacts.kicad_pcb);
-        let unique: BTreeSet<_> = uuids.iter().copied().collect();
-        assert_eq!(uuids.len(), unique.len());
+        let diagnostics = compile(&design)
+            .expect_err("rendered KiCad semantic paths must be globally unique")
+            .diagnostics;
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "CC-KICAD-ID-002" && diagnostic.path == "root.x.footprint.pad.1"
+        }));
+    }
+
+    #[test]
+    fn rejects_route_paths_that_collide_with_component_paths() {
+        let mut design = voltage_divider();
+        design.board.routes[0].path = design.components[0].path.clone();
+
+        let diagnostics = compile(&design)
+            .expect_err("component and route semantic paths must not collide")
+            .diagnostics;
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "CC-KICAD-ID-002" && diagnostic.path == "divider.r_top"
+        }));
     }
 
     #[test]
@@ -185,6 +382,16 @@ mod tests {
                     .and_then(|value| value.strip_suffix("\")"))
             })
             .collect()
+    }
+
+    fn pad_stanza<'a>(footprint: &'a str, pad: &str) -> &'a str {
+        let marker = format!("    (pad \"{pad}\"");
+        let start = footprint.find(&marker).expect("pad stanza must exist");
+        let end = footprint[start..]
+            .find("\n    )")
+            .map(|offset| start + offset + "\n    )".len())
+            .expect("pad stanza must terminate");
+        &footprint[start..end]
     }
 
     fn segment_uuid(board: &str) -> &str {

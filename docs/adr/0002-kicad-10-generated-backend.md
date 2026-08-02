@@ -22,14 +22,11 @@ KiCad project files are deterministic outputs and are regenerated from that
 intent. CircuitC does not attempt a silent three-way merge with arbitrary
 manual edits.
 
-The first backend slice emits the KiCad 10 board format stamped `20260206`,
-identifies the generator as `circuitc`, and uses exact nanometre-to-millimetre
-decimal conversion. The backend is not complete until KiCad 10 can parse the
-artifact and emit structured DRC output.
-
-KiCad schematic and project emission follow in M1. Until then, the M0 board
-artifact demonstrates only placement, pads, nets, an outline, and route
-segments.
+The first backend slice emitted the KiCad 10 board format stamped `20260206`,
+identified the generator as `circuitc`, and used exact
+nanometre-to-millimetre decimal conversion. M1B extends that decision with the
+isolated project bundle, vendored catalog, schematic parity, and identity
+manifest specified by [ADR-0005](0005-isolated-kicad-project-bundle.md).
 
 ## Consequences
 

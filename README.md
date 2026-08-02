@@ -7,8 +7,9 @@ backends rather than the source of truth.
 
 The first backend is KiCad 10. The current vertical slice is deliberately small
 but end to end: a file-authored voltage-divider design is parsed, elaborated,
-validated once, and lowered deterministically to both a KiCad PCB and a SPICE
-netlist. The original Rust fixture remains an equivalence oracle.
+validated once, and lowered deterministically to an isolated KiCad schematic,
+PCB, project and vendored-library bundle, plus a SPICE netlist. The original
+Rust fixture remains an equivalence oracle.
 
 ## Why Rust
 
@@ -55,7 +56,14 @@ bazel run //cmd/circuitc -- compile \
 
 This writes:
 
+- `/tmp/circuitc-voltage-divider/voltage_divider.kicad_sch`
 - `/tmp/circuitc-voltage-divider/voltage_divider.kicad_pcb`
+- `/tmp/circuitc-voltage-divider/voltage_divider.kicad_pro`
+- `/tmp/circuitc-voltage-divider/CircuitC.kicad_sym`
+- `/tmp/circuitc-voltage-divider/CircuitC.pretty/R_0603_1608Metric.kicad_mod`
+- `/tmp/circuitc-voltage-divider/sym-lib-table`
+- `/tmp/circuitc-voltage-divider/fp-lib-table`
+- `/tmp/circuitc-voltage-divider/voltage_divider.kicad-map.json`
 - `/tmp/circuitc-voltage-divider/voltage_divider.spice`
 
 When KiCad 10 is installed, run the Bazel-owned host validation gate with:
@@ -66,13 +74,10 @@ bazel test //:kicad10_drc_test
 
 The gate discovers `kicad-cli` on `PATH` and at the standard macOS KiCad 10
 application path. Set `CIRCUITC_KICAD_CLI` through Bazel's test environment for
-another installation location. It parses the raw JSON rather than trusting the
-host exit code and compares two normalized reports for determinism.
-
-The reference board's present pads are connected. The host gate reports zero
-unconnected items and two expected warnings because the embedded bootstrap
-`CircuitC` footprint is not yet installed as a vendored KiCad library. Library
-ingestion and warning-free host DRC are M1B work.
+another installation location. It generates the full bundle twice, byte-checks
+it, parses the vendored symbol and footprint in an isolated KiCad configuration,
+and accepts only normalized structured ERC/DRC reports with zero unexpected,
+unconnected, or schematic-parity findings.
 
 ## Current boundary
 
@@ -83,21 +88,24 @@ Implemented now:
 - deterministic human and JSON source diagnostics plus a headless Bazel CLI;
 - exact integer-nanometre board coordinates;
 - exact decimal electrical quantities;
-- a versioned, validated semantic Design IR with explicit route identity and
-  logical-pin-to-pad bindings;
+- a versioned, validated semantic Design IR with module-instance hierarchy,
+  typed ports and pins, explicit connection state, part identity, and
+  symbol-pin/footprint-pad/model bindings;
 - deterministic RFC 9562 UUIDv8 identifiers derived from semantic paths;
-- code-authored placement and route segments;
-- KiCad 10 PCB output; and
+- code-authored schematic and PCB placement plus route segments;
+- deterministic KiCad 10 schematic, PCB, project, local library tables, and
+  source identity-map output;
+- a small vendored KiCad symbol/footprint catalog resolved during elaboration;
+- isolated KiCad 10 symbol/footprint parsing, ERC, DRC, connectivity, and
+  schematic-parity validation; and
 - SPICE output plus a reversible backend-name map suitable for the supported
   Ohmnivore subset.
 
 Not implemented yet:
 
-- KiCad schematic and project emission;
-- vendored symbol/footprint library ingestion;
 - direct Ohmnivore execution;
 - APGAR Board IR lowering and route import; or
-- production ERC/DRC rule coverage.
+- broad component-library, multi-sheet, and production ERC/DRC rule coverage.
 
 The Rust-authored reference remains a regression oracle for frontend and
 backend equivalence; `.circuitc` is the primary authored form.

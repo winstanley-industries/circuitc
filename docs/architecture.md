@@ -68,7 +68,8 @@ of truth.
 
 The Design IR contains concepts common to all useful views:
 
-- source-stable identity and source spans;
+- source-stable identity, with source spans retained in a frontend provenance
+  side table rather than embedded in canonical IR values;
 - module and instance hierarchy;
 - typed interfaces, ports, pins, and nets;
 - exact dimensional quantities, ranges, and tolerances;
@@ -111,20 +112,35 @@ recorded in the schema and ADRs.
 ### 6.1 KiCad
 
 CircuitC writes documented s-expression files and identifies itself as the
-generator. The first slice emits a KiCad 10 PCB. Schematic emission, project
-configuration, symbol libraries, and footprint ingestion are the next backend
-milestone.
+generator. The M1B slice emits an isolated KiCad 10 schematic, PCB, project,
+local library tables, and the vendored symbol and footprint resources needed by
+the design. Library bindings are resolved before emission, and a deterministic
+identity manifest maps emitted KiCad UUIDs back to CircuitC semantic paths and
+source spans. KiCad objects and library display names remain backend artifacts,
+not canonical compiler intent.
+
+The bootstrap KiCad catalog supports only parts whose symbol pin numbers equal
+their corresponding footprint pad numbers. The canonical IR keeps the two
+bindings explicit and independent; the KiCad backend rejects cross-mapped
+parts instead of misrepresenting their connectivity.
 
 Every backend integration test has three levels:
 
 1. CircuitC structural and golden tests;
 2. repeat-build byte comparison; and
-3. host parsing plus structured `kicad-cli` ERC or DRC output.
+3. supported-host parsing plus structured `kicad-cli` ERC and DRC output,
+   including connectivity and schematic-to-PCB parity.
 
 Host validation is entered through Bazel even though the installed KiCad host
 is necessarily platform-local. CircuitC parses the raw report, enforces an
 explicit finding policy, and emits a normalized deterministic summary. A
-successful `kicad-cli` exit status alone is not acceptance evidence.
+successful `kicad-cli` exit status alone is not acceptance evidence. Tests use
+an isolated KiCad configuration and reject unexpected ERC, DRC, unconnected,
+or parity findings after joining UUIDs through the identity manifest.
+KiCad 10 directly parses the schematic, PCB, symbol, and footprint artifacts
+used by this gate. Its CLI has no direct `.kicad_pro` parser, so CircuitC also
+parses that JSON and enforces the exact deterministic project subset it emits,
+including the artifact filename contract.
 
 The KiCad IPC API is not the primary headless boundary for versions 9 and 10
 because it requires a running GUI. It may later support interactive preview or

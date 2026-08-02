@@ -60,10 +60,78 @@ pub struct Net {
     pub is_ground: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ElectricalPinType {
+    Input,
+    Output,
+    Bidirectional,
+    Passive,
+    PowerInput,
+    PowerOutput,
+    OpenCollector,
+    OpenEmitter,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum PortDirection {
+    Input,
+    Output,
+    InOut,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ConnectionState {
+    Connected(String),
+    NoConnect,
+}
+
+impl ConnectionState {
+    pub fn net(&self) -> Option<&str> {
+        match self {
+            Self::Connected(net) => Some(net),
+            Self::NoConnect => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Connection {
     pub pin: String,
-    pub net: String,
+    pub state: ConnectionState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModulePort {
+    pub name: String,
+    pub direction: PortDirection,
+    pub electrical_type: ElectricalPinType,
+    pub state: ConnectionState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModuleInstance {
+    pub path: String,
+    pub ports: Vec<ModulePort>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PartIdentity {
+    pub logical_device: String,
+    pub manufacturer: Option<String>,
+    pub manufacturer_part_number: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SymbolPinBinding {
+    pub pin: String,
+    pub symbol_pin: String,
+    pub electrical_type: ElectricalPinType,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SymbolBinding {
+    pub library_id: String,
+    pub pins: Vec<SymbolPinBinding>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -91,6 +159,12 @@ pub struct Placement {
     pub position: PointNm,
     pub rotation_degrees: i16,
     pub layer: CopperLayer,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SchematicPlacement {
+    pub position: PointNm,
+    pub rotation_degrees: i16,
 }
 
 impl Placement {
@@ -124,27 +198,34 @@ pub struct PinPadBinding {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ComponentValue {
+    Resistance(Quantity),
+    DcVoltage(Quantity),
+}
+
+impl ComponentValue {
+    pub fn quantity(&self) -> Quantity {
+        match self {
+            Self::Resistance(quantity) | Self::DcVoltage(quantity) => *quantity,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SimulationModel {
     Resistor {
-        resistance: Quantity,
+        model_id: String,
         positive_pin: String,
         negative_pin: String,
     },
     DcVoltageSource {
-        voltage: Quantity,
+        model_id: String,
         positive_pin: String,
         negative_pin: String,
     },
 }
 
 impl SimulationModel {
-    pub fn value(&self) -> Quantity {
-        match self {
-            Self::Resistor { resistance, .. } => *resistance,
-            Self::DcVoltageSource { voltage, .. } => *voltage,
-        }
-    }
-
     fn pins(&self) -> (&str, &str) {
         match self {
             Self::Resistor {
@@ -159,12 +240,23 @@ impl SimulationModel {
             } => (positive_pin, negative_pin),
         }
     }
+
+    pub fn model_id(&self) -> &str {
+        match self {
+            Self::Resistor { model_id, .. } | Self::DcVoltageSource { model_id, .. } => model_id,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Component {
     pub path: String,
+    pub module_path: String,
     pub reference: String,
+    pub part: PartIdentity,
+    pub symbol: SymbolBinding,
+    pub schematic_placement: SchematicPlacement,
+    pub value: ComponentValue,
     pub connections: Vec<Connection>,
     pub physical: Option<PhysicalImplementation>,
     pub simulation: Option<SimulationModel>,
@@ -175,13 +267,18 @@ impl Component {
         self.connections
             .iter()
             .find(|connection| connection.pin == pin)
-            .map(|connection| connection.net.as_str())
+            .and_then(|connection| connection.state.net())
+    }
+
+    pub fn connection_for_pin(&self, pin: &str) -> Option<&ConnectionState> {
+        self.connections
+            .iter()
+            .find(|connection| connection.pin == pin)
+            .map(|connection| &connection.state)
     }
 
     pub fn value_label(&self) -> String {
-        self.simulation
-            .as_ref()
-            .map_or_else(String::new, |model| model.value().engineering_label())
+        self.value.quantity().engineering_label()
     }
 
     pub fn pin_for_pad(&self, pad: &str) -> Option<&str> {
@@ -219,6 +316,7 @@ pub struct Design {
     pub schema_version: u32,
     pub name: String,
     pub nets: Vec<Net>,
+    pub modules: Vec<ModuleInstance>,
     pub components: Vec<Component>,
     pub board: Board,
 }
@@ -248,6 +346,13 @@ impl Design {
         self.nets.sort_by(|left, right| {
             (left.is_ground, &left.name).cmp(&(right.is_ground, &right.name))
         });
+        self.modules
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        for module in &mut self.modules {
+            module
+                .ports
+                .sort_by(|left, right| left.name.cmp(&right.name));
+        }
         self.components.sort_by(|left, right| {
             (left.physical.is_none(), &left.reference, &left.path).cmp(&(
                 right.physical.is_none(),
@@ -256,14 +361,12 @@ impl Design {
             ))
         });
         for component in &mut self.components {
-            if let Some(simulation) = &mut component.simulation {
-                match simulation {
-                    SimulationModel::Resistor { resistance, .. } => {
-                        *resistance = resistance.canonicalized();
-                    }
-                    SimulationModel::DcVoltageSource { voltage, .. } => {
-                        *voltage = voltage.canonicalized();
-                    }
+            match &mut component.value {
+                ComponentValue::Resistance(resistance) => {
+                    *resistance = resistance.canonicalized();
+                }
+                ComponentValue::DcVoltage(voltage) => {
+                    *voltage = voltage.canonicalized();
                 }
             }
             let terminal_rank =
@@ -273,12 +376,20 @@ impl Design {
                     _ => 2,
                 };
             component.connections.sort_by(|left, right| {
-                (terminal_rank(&left.pin), &left.pin, &left.net).cmp(&(
+                (terminal_rank(&left.pin), &left.pin, &left.state).cmp(&(
                     terminal_rank(&right.pin),
                     &right.pin,
-                    &right.net,
+                    &right.state,
                 ))
             });
+            component
+                .symbol
+                .pins
+                .sort_by(|left, right| left.pin.cmp(&right.pin));
+            component.schematic_placement.rotation_degrees = component
+                .schematic_placement
+                .rotation_degrees
+                .rem_euclid(360);
             if let Some(physical) = &mut component.physical {
                 physical.placement.rotation_degrees =
                     physical.placement.rotation_degrees.rem_euclid(360);
@@ -366,6 +477,77 @@ impl Design {
             );
         }
 
+        let mut module_paths = BTreeSet::new();
+        if self.modules.is_empty() {
+            push(
+                &mut diagnostics,
+                "CC-MODULE-001",
+                "design.modules",
+                "design must contain at least one elaborated module instance",
+            );
+        }
+        for (index, module) in self.modules.iter().enumerate() {
+            let path = format!("design.modules[{index}]");
+            if !semantic_path_is_valid(&module.path) {
+                push(
+                    &mut diagnostics,
+                    "CC-MODULE-002",
+                    &path,
+                    "module semantic path is invalid",
+                );
+            }
+            if !module_paths.insert(module.path.as_str()) {
+                push(
+                    &mut diagnostics,
+                    "CC-MODULE-003",
+                    &path,
+                    format!("duplicate module path {}", module.path),
+                );
+            }
+        }
+        for (index, module) in self.modules.iter().enumerate() {
+            let path = format!("design.modules[{index}]");
+            if let Some((parent, _)) = module.path.rsplit_once('.')
+                && !module_paths.contains(parent)
+            {
+                push(
+                    &mut diagnostics,
+                    "CC-MODULE-004",
+                    &path,
+                    format!("module {} requires parent module {parent}", module.path),
+                );
+            }
+            let mut ports = BTreeSet::new();
+            for port in &module.ports {
+                if !token_is_valid(&port.name) {
+                    push(
+                        &mut diagnostics,
+                        "CC-PORT-001",
+                        &path,
+                        "module port name must be a non-empty canonical token",
+                    );
+                }
+                if !ports.insert(port.name.as_str()) {
+                    push(
+                        &mut diagnostics,
+                        "CC-PORT-002",
+                        &path,
+                        format!("duplicate module port {}", port.name),
+                    );
+                }
+                if let ConnectionState::Connected(net) = &port.state
+                    && !net_names.contains(net.as_str())
+                {
+                    push(
+                        &mut diagnostics,
+                        "CC-PORT-003",
+                        &path,
+                        format!("port {} references unknown net {net}", port.name),
+                    );
+                }
+            }
+        }
+
         let mut paths = BTreeSet::new();
         let mut references = BTreeSet::new();
         for component in &self.components {
@@ -373,6 +555,7 @@ impl Design {
                 component,
                 self.board.outline,
                 &net_names,
+                &module_paths,
                 &mut paths,
                 &mut references,
                 &mut diagnostics,
@@ -575,6 +758,7 @@ fn validate_component<'a>(
     component: &'a Component,
     outline: RectNm,
     net_names: &BTreeSet<&str>,
+    module_paths: &BTreeSet<&str>,
     paths: &mut BTreeSet<&'a str>,
     references: &mut BTreeSet<&'a str>,
     diagnostics: &mut Vec<Diagnostic>,
@@ -598,6 +782,26 @@ fn validate_component<'a>(
             "CC-COMP-002",
             path,
             "duplicate component semantic path",
+        );
+    }
+    let derived_module = component.path.rsplit_once('.').map(|(parent, _)| parent);
+    if derived_module != Some(component.module_path.as_str()) {
+        push(
+            diagnostics,
+            "CC-COMP-006",
+            path,
+            "component module path must equal the parent of its semantic path",
+        );
+    }
+    if !module_paths.contains(component.module_path.as_str()) {
+        push(
+            diagnostics,
+            "CC-COMP-007",
+            path,
+            format!(
+                "component references unknown module {}",
+                component.module_path
+            ),
         );
     }
     if !token_is_valid(&component.reference) {
@@ -624,6 +828,107 @@ fn validate_component<'a>(
             "component must have a physical implementation, a simulation model, or both",
         );
     }
+    if component.part.logical_device.trim().is_empty()
+        || component.part.logical_device.chars().any(char::is_control)
+    {
+        push(
+            diagnostics,
+            "CC-PART-001",
+            path,
+            "logical device identity must be non-empty and contain no control characters",
+        );
+    }
+    match (
+        &component.part.manufacturer,
+        &component.part.manufacturer_part_number,
+    ) {
+        (Some(manufacturer), Some(number))
+            if !manufacturer.trim().is_empty()
+                && !number.trim().is_empty()
+                && !manufacturer.chars().any(char::is_control)
+                && !number.chars().any(char::is_control) => {}
+        (None, None) if component.physical.is_none() => {}
+        (None, None) => push(
+            diagnostics,
+            "CC-PART-002",
+            path,
+            "physical component requires manufacturer and manufacturer part number",
+        ),
+        _ => push(
+            diagnostics,
+            "CC-PART-003",
+            path,
+            "manufacturer and manufacturer part number must be supplied together",
+        ),
+    }
+
+    if component.symbol.library_id.trim().is_empty()
+        || component.symbol.library_id.chars().any(char::is_control)
+    {
+        push(
+            diagnostics,
+            "CC-SYMBOL-001",
+            path,
+            "symbol library identifier must be non-empty and contain no control characters",
+        );
+    }
+    if component.symbol.pins.is_empty() {
+        push(
+            diagnostics,
+            "CC-SYMBOL-002",
+            path,
+            "symbol must bind at least one logical pin",
+        );
+    }
+    let mut symbol_pins = BTreeSet::new();
+    let mut logical_pins = BTreeSet::new();
+    for binding in &component.symbol.pins {
+        if !token_is_valid(&binding.pin) || !token_is_valid(&binding.symbol_pin) {
+            push(
+                diagnostics,
+                "CC-SYMBOL-003",
+                path,
+                "symbol pin bindings must use non-empty canonical tokens",
+            );
+        }
+        if !logical_pins.insert(binding.pin.as_str()) {
+            push(
+                diagnostics,
+                "CC-SYMBOL-004",
+                path,
+                format!("logical pin {} is bound more than once", binding.pin),
+            );
+        }
+        if !symbol_pins.insert(binding.symbol_pin.as_str()) {
+            push(
+                diagnostics,
+                "CC-SYMBOL-005",
+                path,
+                format!("symbol pin {} is bound more than once", binding.symbol_pin),
+            );
+        }
+    }
+    if !matches!(
+        component
+            .schematic_placement
+            .rotation_degrees
+            .rem_euclid(360),
+        0 | 90 | 180 | 270
+    ) {
+        push(
+            diagnostics,
+            "CC-SCHEMATIC-001",
+            path,
+            "schematic rotation must be a multiple of 90 degrees",
+        );
+    }
+    validate_point(
+        component.schematic_placement.position,
+        "schematic.position",
+        path,
+        "CC-SCHEMATIC-002",
+        diagnostics,
+    );
 
     let mut connections = BTreeMap::new();
     for connection in &component.connections {
@@ -646,24 +951,108 @@ fn validate_component<'a>(
                 format!("pin {} is connected more than once", connection.pin),
             );
         }
-        if !net_names.contains(connection.net.as_str()) {
+        if !logical_pins.contains(connection.pin.as_str()) {
             push(
                 diagnostics,
                 "CC-PIN-003",
                 path,
                 format!(
-                    "pin {} references unknown net {}",
-                    connection.pin, connection.net
+                    "connection references unknown logical pin {}",
+                    connection.pin
                 ),
             );
         }
+        if let ConnectionState::Connected(net) = &connection.state
+            && !net_names.contains(net.as_str())
+        {
+            push(
+                diagnostics,
+                "CC-PIN-004",
+                path,
+                format!("pin {} references unknown net {net}", connection.pin),
+            );
+        }
     }
+    for pin in logical_pins {
+        if !connections.contains_key(pin) {
+            push(
+                diagnostics,
+                "CC-PIN-005",
+                path,
+                format!("symbol logical pin {pin} has no explicit connection state"),
+            );
+        }
+    }
+
+    validate_component_value(component, path, diagnostics);
 
     if let Some(physical) = &component.physical {
         validate_physical(component, physical, outline, &connections, diagnostics);
     }
     if let Some(simulation) = &component.simulation {
         validate_simulation(component, simulation, &connections, path, diagnostics);
+    }
+}
+
+fn validate_component_value(component: &Component, path: &str, diagnostics: &mut Vec<Diagnostic>) {
+    let quantity = component.value.quantity();
+    if !quantity.is_canonical() {
+        push(
+            diagnostics,
+            "CC-VALUE-001",
+            path,
+            "component value must use its canonical exact decimal representation",
+        );
+    }
+    if !quantity.exponent_is_valid() {
+        push(
+            diagnostics,
+            "CC-VALUE-002",
+            path,
+            format!(
+                "component value exponent {} is outside [-18, 18]",
+                quantity.exponent
+            ),
+        );
+    }
+
+    match &component.value {
+        ComponentValue::Resistance(resistance) => {
+            if component.part.logical_device != "resistor" {
+                push(
+                    diagnostics,
+                    "CC-VALUE-003",
+                    path,
+                    "resistance value requires logical device resistor",
+                );
+            }
+            if resistance.unit != Unit::Ohm || resistance.coefficient <= 0 {
+                push(
+                    diagnostics,
+                    "CC-VALUE-004",
+                    path,
+                    "resistor value must be a positive resistance",
+                );
+            }
+        }
+        ComponentValue::DcVoltage(voltage) => {
+            if component.part.logical_device != "dc_voltage_source" {
+                push(
+                    diagnostics,
+                    "CC-VALUE-003",
+                    path,
+                    "DC voltage value requires logical device dc_voltage_source",
+                );
+            }
+            if voltage.unit != Unit::Volt {
+                push(
+                    diagnostics,
+                    "CC-VALUE-005",
+                    path,
+                    "DC voltage value must have voltage dimension",
+                );
+            }
+        }
     }
 }
 
@@ -839,8 +1228,8 @@ fn validate_physical(
             );
         }
     }
-    for pin in connections.keys() {
-        if !bound_pins.contains(pin) {
+    for (pin, connection) in connections {
+        if matches!(connection.state, ConnectionState::Connected(_)) && !bound_pins.contains(pin) {
             push(
                 diagnostics,
                 "CC-BIND-004",
@@ -858,27 +1247,6 @@ fn validate_simulation(
     path: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    let quantity = simulation.value();
-    if !quantity.is_canonical() {
-        push(
-            diagnostics,
-            "CC-SIM-009",
-            path,
-            "quantity must use its canonical exact decimal representation",
-        );
-    }
-    if !quantity.exponent_is_valid() {
-        push(
-            diagnostics,
-            "CC-SIM-002",
-            path,
-            format!(
-                "quantity exponent {} is outside [-18, 18]",
-                quantity.exponent
-            ),
-        );
-    }
-
     let (positive_pin, negative_pin) = simulation.pins();
     if positive_pin == negative_pin {
         push(
@@ -889,24 +1257,33 @@ fn validate_simulation(
         );
     }
     for pin in [positive_pin, negative_pin] {
-        if !connections.contains_key(pin) {
-            push(
+        match connections.get(pin).map(|connection| &connection.state) {
+            Some(ConnectionState::Connected(_)) => {}
+            _ => push(
                 diagnostics,
                 "CC-SIM-003",
                 path,
                 format!("simulation terminal references unconnected pin {pin}"),
-            );
+            ),
         }
     }
 
     match simulation {
-        SimulationModel::Resistor { resistance, .. } => {
-            if resistance.unit != Unit::Ohm || resistance.coefficient <= 0 {
+        SimulationModel::Resistor { model_id, .. } => {
+            if component.part.logical_device != "resistor" {
                 push(
                     diagnostics,
-                    "CC-SIM-004",
+                    "CC-SIM-011",
                     path,
-                    "resistor value must be a positive resistance",
+                    "resistor simulation model requires logical device resistor",
+                );
+            }
+            if model_id != "spice:R" {
+                push(
+                    diagnostics,
+                    "CC-SIM-010",
+                    path,
+                    format!("unsupported resistor model identifier {model_id}"),
                 );
             }
             if !component.reference.starts_with('R') {
@@ -918,13 +1295,21 @@ fn validate_simulation(
                 );
             }
         }
-        SimulationModel::DcVoltageSource { voltage, .. } => {
-            if voltage.unit != Unit::Volt {
+        SimulationModel::DcVoltageSource { model_id, .. } => {
+            if component.part.logical_device != "dc_voltage_source" {
                 push(
                     diagnostics,
-                    "CC-SIM-006",
+                    "CC-SIM-011",
                     path,
-                    "DC voltage source value must have voltage dimension",
+                    "DC voltage-source simulation model requires logical device dc_voltage_source",
+                );
+            }
+            if model_id != "spice:Vdc" {
+                push(
+                    diagnostics,
+                    "CC-SIM-010",
+                    path,
+                    format!("unsupported voltage-source model identifier {model_id}"),
                 );
             }
             if !component.reference.starts_with('V') {
@@ -968,9 +1353,11 @@ fn push(
 
 #[cfg(test)]
 mod tests {
+    use std::panic::catch_unwind;
+
     use crate::demo::voltage_divider;
 
-    use super::{MAX_ABS_COORDINATE_NM, PinPadBinding, PointNm};
+    use super::{ComponentValue, ConnectionState, MAX_ABS_COORDINATE_NM, PinPadBinding, PointNm};
 
     fn has_code(diagnostics: &[super::Diagnostic], code: &str) -> bool {
         diagnostics.iter().any(|diagnostic| diagnostic.code == code)
@@ -982,11 +1369,63 @@ mod tests {
     }
 
     #[test]
+    fn physical_only_component_retains_and_validates_its_exact_value() {
+        let mut design = voltage_divider();
+        let component = &mut design.components[0];
+        component.simulation = None;
+        component.connections[0].state = ConnectionState::NoConnect;
+
+        assert_eq!(
+            component.value,
+            ComponentValue::Resistance(crate::quantity::Quantity::new(
+                10,
+                3,
+                crate::quantity::Unit::Ohm,
+            ))
+        );
+        assert_eq!(component.value_label(), "10kΩ");
+        assert_eq!(design.validate(), Ok(()));
+    }
+
+    #[test]
+    fn rejects_value_kind_that_disagrees_with_the_component_contract() {
+        let mut design = voltage_divider();
+        design.components[0].value = ComponentValue::DcVoltage(crate::quantity::Quantity::new(
+            10,
+            0,
+            crate::quantity::Unit::Volt,
+        ));
+
+        let diagnostics = design
+            .validate()
+            .expect_err("resistor with voltage value must be rejected");
+        assert!(has_code(&diagnostics, "CC-VALUE-003"));
+    }
+
+    #[test]
+    fn invalid_public_component_values_return_diagnostics_without_panicking() {
+        let mut design = voltage_divider();
+        design.components[0].value = ComponentValue::Resistance(crate::quantity::Quantity {
+            coefficient: 10,
+            exponent: 19,
+            unit: crate::quantity::Unit::Ohm,
+        });
+
+        let result = catch_unwind(|| design.validate());
+        let diagnostics = result
+            .expect("public component value validation must not panic")
+            .expect_err("out-of-contract exact value must fail validation");
+        assert!(has_code(&diagnostics, "CC-VALUE-001"));
+        assert!(has_code(&diagnostics, "CC-VALUE-002"));
+    }
+
+    #[test]
     fn rejects_unknown_connection_net() {
         let mut design = voltage_divider();
-        design.components[0].connections[0].net = "MISSING".to_owned();
+        design.components[0].connections[0].state =
+            ConnectionState::Connected("MISSING".to_owned());
         let diagnostics = design.validate().expect_err("invalid net must be rejected");
-        assert!(has_code(&diagnostics, "CC-PIN-003"));
+        assert!(has_code(&diagnostics, "CC-PIN-004"));
     }
 
     #[test]
@@ -1051,6 +1490,8 @@ mod tests {
         let component = &mut design.components[0];
         component.connections[0].pin = "POSITIVE".to_owned();
         component.connections[1].pin = "NEGATIVE".to_owned();
+        component.symbol.pins[0].pin = "POSITIVE".to_owned();
+        component.symbol.pins[1].pin = "NEGATIVE".to_owned();
         let physical = component
             .physical
             .as_mut()
@@ -1138,6 +1579,16 @@ mod tests {
             .validate()
             .expect_err("simulation terminals must be distinct");
         assert!(has_code(&diagnostics, "CC-SIM-008"));
+    }
+
+    #[test]
+    fn rejects_simulator_model_that_disagrees_with_logical_device() {
+        let mut design = voltage_divider();
+        design.components[0].part.logical_device = "dc_voltage_source".to_owned();
+        let diagnostics = design
+            .validate()
+            .expect_err("logical device and simulation primitive must agree");
+        assert!(has_code(&diagnostics, "CC-SIM-011"));
     }
 
     #[test]
