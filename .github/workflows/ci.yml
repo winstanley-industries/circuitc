@@ -98,7 +98,7 @@ jobs:
         if: steps.gate.outputs.run == 'true'
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          fetch-depth: 1
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Prepare immutable review context
@@ -112,6 +112,7 @@ jobs:
           set -euo pipefail
           metadata_file="$RUNNER_TEMP/claude-pr-review-metadata.json"
           diff_file="$RUNNER_TEMP/claude-pr-review.diff"
+          delta_file="$RUNNER_TEMP/claude-pr-review-delta.diff"
           baseline_file="$RUNNER_TEMP/claude-pr-review-baseline.json"
 
           head_before=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq '.headRefOid')
@@ -129,22 +130,68 @@ jobs:
             exit 1
           fi
 
+          prior_head=$(jq -r '
+            [.[]
+              | select(
+                  (.user.login | ascii_downcase | startswith("claude"))
+                  and (.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
+                  and ((.commit_id // "") != "")
+                )]
+            | sort_by(.submitted_at)
+            | last
+            | .commit_id // empty
+          ' "$baseline_file")
+          blocking_rounds=$(jq '[.[]
+            | select(
+                (.user.login | ascii_downcase | startswith("claude"))
+                and (
+                  .state == "CHANGES_REQUESTED"
+                  or (
+                    .state == "DISMISSED"
+                    and ((.body // "") | contains("<!-- circuitc-claude-verdict: request-changes -->"))
+                    and ((.body // "") | contains("<!-- circuitc-claude-verdict: approve -->") | not)
+                  )
+                )
+              )]
+            | unique_by(.commit_id)
+            | length' "$baseline_file")
+
+          review_mode=initial
+          cp "$diff_file" "$delta_file"
+          if [ -n "$prior_head" ] \
+            && git cat-file -e "$prior_head^{commit}" 2>/dev/null \
+            && git merge-base --is-ancestor "$prior_head" "$head_before"; then
+            git diff --binary --full-index "$prior_head..$head_before" > "$delta_file"
+            review_mode=follow-up
+            if [ "$blocking_rounds" -ge 2 ]; then
+              review_mode=convergence
+            fi
+          fi
+
           echo "head_sha=$head_before" >> "$GITHUB_OUTPUT"
           echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
           echo "metadata_file=$metadata_file" >> "$GITHUB_OUTPUT"
           echo "diff_file=$diff_file" >> "$GITHUB_OUTPUT"
+          echo "history_file=$baseline_file" >> "$GITHUB_OUTPUT"
+          echo "delta_file=$delta_file" >> "$GITHUB_OUTPUT"
+          echo "review_mode=$review_mode" >> "$GITHUB_OUTPUT"
+          echo "review_round=$((blocking_rounds + 1))" >> "$GITHUB_OUTPUT"
           echo "baseline_file=$baseline_file" >> "$GITHUB_OUTPUT"
 
       - name: Run Claude Code review
         if: steps.gate.outputs.run == 'true'
         id: review
-        uses: anthropics/claude-code-action@e90deca47693f9457b72f2b53c17d7c445a87342 # v1.0.171
+        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1.0.183
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: >-
             /pr-review ${{ github.event.pull_request.html_url }} --comment
             --metadata ${{ steps.review_context.outputs.metadata_file }}
             --diff ${{ steps.review_context.outputs.diff_file }}
+            --history ${{ steps.review_context.outputs.history_file }}
+            --delta ${{ steps.review_context.outputs.delta_file }}
+            --mode ${{ steps.review_context.outputs.review_mode }}
+            --round ${{ steps.review_context.outputs.review_round }}
           settings: |
             {
               "env": {
@@ -153,7 +200,8 @@ jobs:
             }
           claude_args: |
             --allowedTools "Agent,Read,Grep,Glob,mcp__github_inline_comment__create_inline_comment,Bash(gh pr review:*)"
-            --model "claude-opus-5"
+            --model "claude-sonnet-5"
+            --effort "high"
 
       - name: Gate on fresh Claude verdict
         if: ${{ always() && steps.gate.outputs.run == 'true' }}
@@ -222,6 +270,22 @@ jobs:
           fi
 
           verdict_state=$(jq -r '.[0].state' <<< "$fresh_verdicts")
+          verdict_body=$(jq -r '.[0].body // ""' <<< "$fresh_verdicts")
+          if [ "$verdict_state" = "CHANGES_REQUESTED" ]; then
+            expected_marker='<!-- circuitc-claude-verdict: request-changes -->'
+            opposite_marker='<!-- circuitc-claude-verdict: approve -->'
+          else
+            expected_marker='<!-- circuitc-claude-verdict: approve -->'
+            opposite_marker='<!-- circuitc-claude-verdict: request-changes -->'
+          fi
+          body_without_marker=${verdict_body/"$expected_marker"/}
+          if [[ "$verdict_body" != *"$expected_marker" ]] \
+            || [[ "$verdict_body" == *"$opposite_marker"* ]] \
+            || [[ "$body_without_marker" == *"$expected_marker"* ]]; then
+            echo "::error::Fresh Claude verdict must end with exactly one matching marker."
+            exit 1
+          fi
+
           echo "Fresh Claude verdict on $EXPECTED_HEAD: $verdict_state"
           if [ "$verdict_state" = "CHANGES_REQUESTED" ]; then
             echo "::error::Claude requested changes on the current PR head."
