@@ -98,7 +98,7 @@ fn render_kicad_identity_map(
     output
 }
 
-fn write_json_string(output: &mut String, value: &str) {
+pub(crate) fn write_json_string(output: &mut String, value: &str) {
     output.push('"');
     for character in value.chars() {
         match character {

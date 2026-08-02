@@ -93,14 +93,39 @@ fn run(arguments: Vec<OsString>) -> Result<(), u8> {
         );
         EXIT_IO
     })?;
-    if let Some(error) = write_outcome.cleanup_warning {
-        eprintln!(
+    let mut stdout = io::stdout().lock();
+    let mut stderr = io::stderr().lock();
+    report_successful_publication(
+        &output_directory,
+        &outputs,
+        &write_outcome,
+        &mut stdout,
+        &mut stderr,
+    )
+}
+
+fn report_successful_publication(
+    output_directory: &Path,
+    outputs: &[(String, &[u8])],
+    write_outcome: &WriteOutcome,
+    stdout: &mut impl io::Write,
+    stderr: &mut impl io::Write,
+) -> Result<(), u8> {
+    if let Some(error) = &write_outcome.cleanup_warning {
+        writeln!(
+            stderr,
             "CC-CLI-IO-003: output publication to {} succeeded, but backup staging cleanup was incomplete: {error}",
             output_directory.display()
-        );
+        )
+        .map_err(|_| EXIT_IO)?;
     }
     for (filename, _) in outputs {
-        println!("wrote {}", output_directory.join(filename).display());
+        writeln!(
+            stdout,
+            "wrote {}",
+            output_directory.join(filename).display()
+        )
+        .map_err(|_| EXIT_IO)?;
     }
     Ok(())
 }
@@ -1338,6 +1363,34 @@ mod tests {
             ),
             std::path::Path::new("/workspace/out")
         );
+    }
+
+    #[test]
+    fn cleanup_warning_is_reported_without_failing_publication() {
+        let output_directory = std::path::Path::new("/output");
+        let outputs = [("result.txt".to_owned(), b"generated".as_slice())];
+        let write_outcome = super::WriteOutcome {
+            cleanup_warning: Some(std::io::Error::other(
+                "remove backup for result.txt: residue .result.txt.backup-test",
+            )),
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = super::report_successful_publication(
+            output_directory,
+            &outputs,
+            &write_outcome,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, Ok(()));
+        let stderr = String::from_utf8(stderr).expect("cleanup warning must be UTF-8");
+        assert!(stderr.contains("CC-CLI-IO-003"));
+        assert!(stderr.contains(".result.txt.backup-test"));
+        let stdout = String::from_utf8(stdout).expect("publication output must be UTF-8");
+        assert!(stdout.contains("wrote /output/result.txt"));
     }
 
     #[cfg(any(

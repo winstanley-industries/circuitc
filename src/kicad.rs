@@ -900,9 +900,11 @@ fn published_symbol_definition(
 }
 
 fn emit_project_file(design: &Design) -> String {
+    debug_assert!(crate::design::artifact_name_is_valid(&design.name));
+    let mut filename = String::new();
+    crate::frontend::write_json_string(&mut filename, &format!("{}.kicad_pro", design.name));
     format!(
-        "{{\n  \"board\": {{}},\n  \"boards\": [],\n  \"cvpcb\": {{}},\n  \"erc\": {{}},\n  \"libraries\": {{\"pinned_footprint_libs\": [], \"pinned_symbol_libs\": []}},\n  \"meta\": {{\"filename\": \"{}.kicad_pro\", \"version\": 1}},\n  \"net_settings\": {{}},\n  \"pcbnew\": {{}},\n  \"schematic\": {{}},\n  \"sheets\": [],\n  \"text_variables\": {{}}\n}}\n",
-        design.name
+        "{{\n  \"board\": {{}},\n  \"boards\": [],\n  \"cvpcb\": {{}},\n  \"erc\": {{}},\n  \"libraries\": {{\"pinned_footprint_libs\": [], \"pinned_symbol_libs\": []}},\n  \"meta\": {{\"filename\": {filename}, \"version\": 1}},\n  \"net_settings\": {{}},\n  \"pcbnew\": {{}},\n  \"schematic\": {{}},\n  \"sheets\": [],\n  \"text_variables\": {{}}\n}}\n"
     )
 }
 

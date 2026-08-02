@@ -1641,6 +1641,24 @@ mod tests {
             super::SimulationModel::DcVoltageSource { .. } => unreachable!(),
         }
         assert_rejected(design, "CC-SIM-010");
+
+        let mut design = voltage_divider();
+        design.components[0].reference = "X1".to_owned();
+        assert_rejected(design, "CC-SIM-005");
+
+        let mut design = voltage_divider();
+        design
+            .components
+            .iter_mut()
+            .find(|component| {
+                matches!(
+                    component.simulation.as_ref(),
+                    Some(super::SimulationModel::DcVoltageSource { .. })
+                )
+            })
+            .expect("reference voltage source is simulated")
+            .reference = "X1".to_owned();
+        assert_rejected(design, "CC-SIM-007");
     }
 
     #[test]

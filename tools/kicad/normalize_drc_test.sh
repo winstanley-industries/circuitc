@@ -54,6 +54,12 @@ python3 "${normalizer}" \
   --allow-ignored-check simulation_model_issue
 grep -F '"report_kind": "erc"' "${TEST_TMPDIR}/erc.normalized.json"
 
+expect_failure erc-version-mismatch 'does not match supported version' \
+  --raw "${erc_raw}" \
+  --normalized "${TEST_TMPDIR}/erc-mismatch.normalized.json" \
+  --expected-major 9 \
+  --allow-ignored-check simulation_model_issue
+
 expect_failure erc-library-allowlist \
   'library-warning allowlists apply only to DRC reports' \
   --raw "${erc_raw}" \
@@ -124,14 +130,17 @@ expect_failure unexpected-parity board.routes.vout_bridge \
   --identity-map "${identity_map}"
 grep -F 'schematic_parity' "${TEST_TMPDIR}/unexpected-parity.stderr"
 
-python3 - "${erc_raw}" "${TEST_TMPDIR}/erc-multiple.json" <<'PY'
+python3 - "${erc_raw}" "${TEST_TMPDIR}" <<'PY'
+import copy
 import json
 import pathlib
 import sys
 
 report = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+target = pathlib.Path(sys.argv[2])
 uuid = "33333333-3333-8333-8333-333333333333"
-report["sheets"][0]["violations"] = [
+multiple = copy.deepcopy(report)
+multiple["sheets"][0]["violations"] = [
     {
         "description": "First ERC failure",
         "items": [{"description": "First mapped item", "uuid": uuid}],
@@ -145,8 +154,44 @@ report["sheets"][0]["violations"] = [
         "type": "second_failure",
     },
 ]
-pathlib.Path(sys.argv[2]).write_text(json.dumps(report), encoding="utf-8")
+(target / "erc-multiple.json").write_text(json.dumps(multiple), encoding="utf-8")
+
+sheet_not_object = copy.deepcopy(report)
+sheet_not_object["sheets"] = ["not-an-object"]
+(target / "erc-sheet-not-object.json").write_text(
+    json.dumps(sheet_not_object), encoding="utf-8"
+)
+
+missing_uuid_path = copy.deepcopy(report)
+missing_uuid_path["sheets"][0].pop("uuid_path")
+(target / "erc-missing-uuid-path.json").write_text(
+    json.dumps(missing_uuid_path), encoding="utf-8"
+)
+
+violations_not_list = copy.deepcopy(report)
+violations_not_list["sheets"][0]["violations"] = {}
+(target / "erc-violations-not-list.json").write_text(
+    json.dumps(violations_not_list), encoding="utf-8"
+)
 PY
+
+expect_failure erc-sheet-not-object 'every KiCad ERC sheet must be an object' \
+  --raw "${TEST_TMPDIR}/erc-sheet-not-object.json" \
+  --normalized "${TEST_TMPDIR}/erc-sheet-not-object.normalized.json" \
+  --expected-major 10 \
+  --allow-ignored-check simulation_model_issue
+
+expect_failure erc-missing-uuid-path 'requires path and uuid_path' \
+  --raw "${TEST_TMPDIR}/erc-missing-uuid-path.json" \
+  --normalized "${TEST_TMPDIR}/erc-missing-uuid-path.normalized.json" \
+  --expected-major 10 \
+  --allow-ignored-check simulation_model_issue
+
+expect_failure erc-violations-not-list 'requires a violations list' \
+  --raw "${TEST_TMPDIR}/erc-violations-not-list.json" \
+  --normalized "${TEST_TMPDIR}/erc-violations-not-list.normalized.json" \
+  --expected-major 10 \
+  --allow-ignored-check simulation_model_issue
 
 expect_failure unexpected-erc 'First ERC failure' \
   --raw "${TEST_TMPDIR}/erc-multiple.json" \
