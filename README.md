@@ -59,6 +59,11 @@ symlinked output-directory ancestors, and `/tmp` is a symlink there.
 An existing output artifact must be a readable or writable regular file so
 CircuitC can verify its type through the anchored directory descriptor before
 replacement.
+Transactional output publication is supported on Linux and macOS on x86_64
+and aarch64. The output filesystem must also support atomic no-replace rename;
+when that operation is unavailable (commonly on NFS, CIFS, 9p/WSL mounts, or
+some FUSE and bind mounts), CircuitC fails closed and the output directory must
+be moved to a supporting filesystem.
 
 This writes:
 

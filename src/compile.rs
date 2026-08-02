@@ -470,11 +470,14 @@ mod tests {
         let diagnostics = compile(&design)
             .expect_err("differently connected schematic pins may not share a point")
             .diagnostics;
-        assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "CC-KICAD-SCHEMATIC-002"),
-            "missing schematic collision diagnostic: {diagnostics:#?}"
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "CC-KICAD-SCHEMATIC-002")
+            .unwrap_or_else(|| panic!("missing schematic collision diagnostic: {diagnostics:#?}"));
+        assert_eq!(
+            diagnostic.related_path.as_deref(),
+            Some("divider.r_bottom.connection.1"),
+            "schematic collision diagnostic lost its counterpart: {diagnostic:#?}"
         );
     }
 

@@ -13,6 +13,8 @@ invalid_version_type_project="$9"
 invalid_libraries_shape_project="${10}"
 invalid_libraries_content_project="${11}"
 invalid_list_content_project="${12}"
+invalid_extra_field_project="${13}"
+invalid_root_project="${14}"
 
 expect_fixture_failure() {
   local label="$1"
@@ -32,17 +34,8 @@ expect_fixture_failure() {
   grep -F "${expected}" "${directory}/stderr"
 }
 
-mkdir -p \
-  "${TEST_TMPDIR}/valid" \
-  "${TEST_TMPDIR}/invalid-json" \
-  "${TEST_TMPDIR}/invalid-structure" \
-  "${TEST_TMPDIR}/invalid-content"
+mkdir -p "${TEST_TMPDIR}/valid"
 cp "${valid_project}" "${TEST_TMPDIR}/valid/voltage_divider.kicad_pro"
-cp "${invalid_json_project}" "${TEST_TMPDIR}/invalid-json/voltage_divider.kicad_pro"
-cp "${invalid_structure_project}" \
-  "${TEST_TMPDIR}/invalid-structure/voltage_divider.kicad_pro"
-cp "${invalid_content_project}" \
-  "${TEST_TMPDIR}/invalid-content/voltage_divider.kicad_pro"
 
 python3 "${validator}" \
   --project "${TEST_TMPDIR}/valid/voltage_divider.kicad_pro" \
@@ -50,14 +43,21 @@ python3 "${validator}" \
   --normalized "${TEST_TMPDIR}/project.normalized.json"
 grep -F '"artifact_kind": "kicad_project"' "${TEST_TMPDIR}/project.normalized.json"
 
-if python3 "${validator}" \
-  --project "${TEST_TMPDIR}/invalid-json/voltage_divider.kicad_pro" \
-  --expected-filename voltage_divider.kicad_pro \
-  --normalized "${TEST_TMPDIR}/invalid-json.normalized.json"; then
-  echo "project validator accepted invalid JSON" >&2
-  exit 1
-fi
-
+expect_fixture_failure invalid-json \
+  'CircuitC KiCad project validation failed:' \
+  "${invalid_json_project}"
+expect_fixture_failure invalid-root \
+  'KiCad project root must be an object' \
+  "${invalid_root_project}"
+expect_fixture_failure invalid-structure \
+  'KiCad project fields do not match the CircuitC project contract' \
+  "${invalid_structure_project}"
+expect_fixture_failure invalid-extra-field \
+  'KiCad project fields do not match the CircuitC project contract' \
+  "${invalid_extra_field_project}"
+expect_fixture_failure invalid-content \
+  "KiCad project field 'board' must be an empty object" \
+  "${invalid_content_project}"
 expect_fixture_failure invalid-meta-filename \
   'KiCad project filename does not match its artifact' \
   "${invalid_meta_filename_project}"
@@ -79,22 +79,6 @@ expect_fixture_failure invalid-libraries-content \
 expect_fixture_failure invalid-list-content \
   "KiCad project field 'sheets' must be an empty list" \
   "${invalid_list_content_project}"
-
-if python3 "${validator}" \
-  --project "${TEST_TMPDIR}/invalid-structure/voltage_divider.kicad_pro" \
-  --expected-filename voltage_divider.kicad_pro \
-  --normalized "${TEST_TMPDIR}/invalid-structure.normalized.json"; then
-  echo "project validator accepted invalid project structure" >&2
-  exit 1
-fi
-
-if python3 "${validator}" \
-  --project "${TEST_TMPDIR}/invalid-content/voltage_divider.kicad_pro" \
-  --expected-filename voltage_divider.kicad_pro \
-  --normalized "${TEST_TMPDIR}/invalid-content.normalized.json"; then
-  echo "project validator accepted unexpected nested content" >&2
-  exit 1
-fi
 
 if python3 "${validator}" \
   --project "${TEST_TMPDIR}/valid/voltage_divider.kicad_pro" \

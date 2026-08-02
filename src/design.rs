@@ -328,6 +328,7 @@ pub struct Design {
 pub struct Diagnostic {
     pub code: &'static str,
     pub path: String,
+    pub related_path: Option<String>,
     pub message: String,
 }
 
@@ -1368,6 +1369,7 @@ fn push(
     diagnostics.push(Diagnostic {
         code,
         path: path.into(),
+        related_path: None,
         message: message.into(),
     });
 }

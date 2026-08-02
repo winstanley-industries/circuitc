@@ -95,6 +95,7 @@ pub(crate) fn validate(design: &Design) -> Validation {
                 diagnostics.push(Diagnostic {
                     code: "CC-KICAD-ID-002",
                     path: duplicate.semantic_path.clone(),
+                    related_path: None,
                     message: format!(
                         "generated KiCad semantic path is shared by UUIDs {} and {}",
                         first.uuid, duplicate.uuid
@@ -108,6 +109,7 @@ pub(crate) fn validate(design: &Design) -> Validation {
                 diagnostics.push(Diagnostic {
                     code: "CC-KICAD-ID-001",
                     path: identity.semantic_path.clone(),
+                    related_path: Some(first_path.to_owned()),
                     message: format!(
                         "generated KiCad UUID {} collides with entity {first_path}",
                         identity.uuid
@@ -151,6 +153,10 @@ fn validate_schematic_connection_points(design: &Design, diagnostics: &mut Vec<D
                 diagnostics.push(Diagnostic {
                     code: "CC-KICAD-SCHEMATIC-002",
                     path: format!("{}.connection.{}", component.path, binding.pin),
+                    related_path: Some(format!(
+                        "{}.connection.{}",
+                        first_component, first_pin
+                    )),
                     message: format!(
                         "schematic pin {} on {} shares connection point ({}, {}) nm with pin {} on {}; {conflict}",
                         binding.pin,
@@ -178,6 +184,7 @@ fn validate_catalog_bindings(design: &Design, diagnostics: &mut Vec<Diagnostic>)
             diagnostics.push(Diagnostic {
                 code: "CC-KICAD-PART-001",
                 path: path.to_owned(),
+                related_path: None,
                 message: format!(
                     "part identity {} / {} / {} has no vendored KiCad binding",
                     component.part.logical_device,
@@ -199,6 +206,7 @@ fn validate_catalog_bindings(design: &Design, diagnostics: &mut Vec<Diagnostic>)
             diagnostics.push(Diagnostic {
                 code: "CC-KICAD-SYMBOL-001",
                 path: path.to_owned(),
+                related_path: None,
                 message: format!(
                     "logical device {} requires symbol {}",
                     part.logical_device, part.symbol_library_id
@@ -224,6 +232,7 @@ fn validate_catalog_bindings(design: &Design, diagnostics: &mut Vec<Diagnostic>)
                     Some(_) => diagnostics.push(Diagnostic {
                         code: "CC-KICAD-SYMBOL-002",
                         path: path.to_owned(),
+                        related_path: None,
                         message: format!(
                             "symbol pin {} electrical type differs from the vendored catalog",
                             catalog_pin.number
@@ -232,6 +241,7 @@ fn validate_catalog_bindings(design: &Design, diagnostics: &mut Vec<Diagnostic>)
                     None => diagnostics.push(Diagnostic {
                         code: "CC-KICAD-SYMBOL-003",
                         path: path.to_owned(),
+                        related_path: None,
                         message: format!(
                             "vendored symbol pin {} has no logical binding",
                             catalog_pin.number
@@ -248,6 +258,7 @@ fn validate_catalog_bindings(design: &Design, diagnostics: &mut Vec<Diagnostic>)
                     diagnostics.push(Diagnostic {
                         code: "CC-KICAD-SYMBOL-004",
                         path: path.to_owned(),
+                        related_path: None,
                         message: format!(
                             "symbol pin {} is absent from the vendored catalog",
                             binding.symbol_pin
@@ -263,6 +274,7 @@ fn validate_catalog_bindings(design: &Design, diagnostics: &mut Vec<Diagnostic>)
                     _ => diagnostics.push(Diagnostic {
                         code: "CC-KICAD-SCHEMATIC-001",
                         path: path.to_owned(),
+                        related_path: None,
                         message: format!(
                             "transformed schematic pin {} is outside the coordinate envelope",
                             binding.symbol_pin
@@ -274,6 +286,7 @@ fn validate_catalog_bindings(design: &Design, diagnostics: &mut Vec<Diagnostic>)
                 diagnostics.push(Diagnostic {
                     code: "CC-KICAD-SYMBOL-005",
                     path: path.to_owned(),
+                    related_path: None,
                     message: "symbol board participation does not match physical implementation"
                         .to_owned(),
                 });
@@ -282,6 +295,7 @@ fn validate_catalog_bindings(design: &Design, diagnostics: &mut Vec<Diagnostic>)
             diagnostics.push(Diagnostic {
                 code: "CC-KICAD-SYMBOL-006",
                 path: path.to_owned(),
+                related_path: None,
                 message: format!(
                     "symbol {} is absent from the vendored catalog",
                     component.symbol.library_id
@@ -312,6 +326,7 @@ fn validate_catalog_bindings(design: &Design, diagnostics: &mut Vec<Diagnostic>)
                         diagnostics.push(Diagnostic {
                             code: "CC-KICAD-BIND-001",
                             path: format!("{}.footprint.pad.{}", path, binding.pad),
+                            related_path: None,
                             message: format!(
                                 "KiCad 10 catalog lowering requires logical pin {} to use matching symbol pin and pad numbers; found symbol pin {} and pad {}",
                                 binding.pin, symbol_binding.symbol_pin, binding.pad
@@ -323,6 +338,7 @@ fn validate_catalog_bindings(design: &Design, diagnostics: &mut Vec<Diagnostic>)
             (Some(_), Some(expected)) => diagnostics.push(Diagnostic {
                 code: "CC-KICAD-FOOTPRINT-002",
                 path: path.to_owned(),
+                related_path: None,
                 message: format!(
                     "logical device {} requires footprint {expected}",
                     part.logical_device
@@ -331,6 +347,7 @@ fn validate_catalog_bindings(design: &Design, diagnostics: &mut Vec<Diagnostic>)
             (Some(_), None) => diagnostics.push(Diagnostic {
                 code: "CC-KICAD-FOOTPRINT-003",
                 path: path.to_owned(),
+                related_path: None,
                 message: format!(
                     "logical device {} does not support a physical footprint",
                     part.logical_device
@@ -339,6 +356,7 @@ fn validate_catalog_bindings(design: &Design, diagnostics: &mut Vec<Diagnostic>)
             (None, Some(expected)) => diagnostics.push(Diagnostic {
                 code: "CC-KICAD-FOOTPRINT-004",
                 path: path.to_owned(),
+                related_path: None,
                 message: format!(
                     "logical device {} requires footprint {expected}",
                     part.logical_device
@@ -361,6 +379,7 @@ fn validate_catalog_footprint(
         diagnostics.push(Diagnostic {
             code: "CC-KICAD-FOOTPRINT-005",
             path: path.to_owned(),
+            related_path: None,
             message: format!("part catalog footprint {expected} is unavailable"),
         });
         return false;
@@ -369,6 +388,7 @@ fn validate_catalog_footprint(
         diagnostics.push(Diagnostic {
             code: "CC-KICAD-FOOTPRINT-006",
             path: path.to_owned(),
+            related_path: None,
             message: format!(
                 "part catalog footprint {expected} has no publishable vendored library file"
             ),
@@ -378,6 +398,7 @@ fn validate_catalog_footprint(
         diagnostics.push(Diagnostic {
             code: "CC-KICAD-FOOTPRINT-007",
             path: path.to_owned(),
+            related_path: None,
             message: format!("part catalog footprint {expected} has no vendored drawing geometry"),
         });
     }
@@ -385,6 +406,7 @@ fn validate_catalog_footprint(
         diagnostics.push(Diagnostic {
             code: "CC-KICAD-FOOTPRINT-001",
             path: path.to_owned(),
+            related_path: None,
             message: format!("footprint {expected} geometry differs from the vendored catalog"),
         });
     }
@@ -412,6 +434,7 @@ fn validate_publishable_symbol(
         diagnostics.push(Diagnostic {
             code: "CC-KICAD-SYMBOL-007",
             path: path.to_owned(),
+            related_path: None,
             message,
         });
     }

@@ -371,42 +371,54 @@ pub(crate) fn map_ir_diagnostics(
     let mut mapped: Vec<_> = diagnostics
         .into_iter()
         .map(|diagnostic| {
-            let structural = diagnostic.code.starts_with("CC-IR-")
-                || diagnostic.code.starts_with("CC-NET-")
-                || diagnostic.code.starts_with("CC-MODULE-")
-                || diagnostic.code.starts_with("CC-PORT-")
-                || diagnostic.code.starts_with("CC-BOARD-")
-                || diagnostic.code.starts_with("CC-ROUTE-")
-                || diagnostic.code == "CC-SIM-001";
-            let semantic_span = if diagnostic.code.starts_with("CC-KICAD-") {
-                provenance
-                    .kicad_span(&diagnostic.path)
-                    .or_else(|| provenance.component_span(&diagnostic.path))
-            } else {
-                provenance.component_span(&diagnostic.path)
+            let span_for_path = |path: &str| {
+                let structural = diagnostic.code.starts_with("CC-IR-")
+                    || diagnostic.code.starts_with("CC-NET-")
+                    || diagnostic.code.starts_with("CC-MODULE-")
+                    || diagnostic.code.starts_with("CC-PORT-")
+                    || diagnostic.code.starts_with("CC-BOARD-")
+                    || diagnostic.code.starts_with("CC-ROUTE-")
+                    || diagnostic.code == "CC-SIM-001";
+                let semantic_span = if diagnostic.code.starts_with("CC-KICAD-") {
+                    provenance
+                        .kicad_span(path)
+                        .or_else(|| provenance.component_span(path))
+                } else {
+                    provenance.component_span(path)
+                };
+                if structural {
+                    provenance.best_structural_span(path).or(semantic_span)
+                } else if diagnostic.code.starts_with("CC-KICAD-") {
+                    provenance
+                        .structural_spans
+                        .get(path)
+                        .copied()
+                        .or(semantic_span)
+                        .or_else(|| provenance.span_for_identity(path))
+                } else {
+                    semantic_span.or_else(|| provenance.best_structural_span(path))
+                }
             };
-            let span = if structural {
-                provenance
-                    .best_structural_span(&diagnostic.path)
-                    .or(semantic_span)
-            } else if diagnostic.code.starts_with("CC-KICAD-") {
-                provenance
-                    .structural_spans
-                    .get(&diagnostic.path)
-                    .copied()
-                    .or(semantic_span)
-                    .or_else(|| provenance.span_for_identity(&diagnostic.path))
-            } else {
-                semantic_span.or_else(|| provenance.best_structural_span(&diagnostic.path))
-            }
-            .unwrap_or(Span::new(0, source.text.len()));
-            SourceDiagnostic::new(
+            let span = span_for_path(&diagnostic.path).unwrap_or(Span::new(0, source.text.len()));
+            let related = diagnostic
+                .related_path
+                .as_deref()
+                .and_then(|path| span_for_path(path).map(|span| (path, span)));
+            let mut mapped = SourceDiagnostic::new(
                 diagnostic.code,
                 source,
                 span,
                 Some(diagnostic.path),
                 diagnostic.message,
-            )
+            );
+            if let Some((related_path, related_span)) = related {
+                mapped = mapped.with_related(
+                    source,
+                    related_span,
+                    format!("related entity `{related_path}` is here"),
+                );
+            }
+            mapped
         })
         .collect();
     sort_diagnostics(&mut mapped);
@@ -2023,6 +2035,8 @@ mod tests {
             &source[diagnostic.start..diagnostic.start + "resistor".len()],
             "resistor"
         );
+        assert_eq!(diagnostic.related.len(), 1);
+        assert!(source[diagnostic.related[0].start..].starts_with("resistor divider.r_bottom"));
     }
 
     #[test]
