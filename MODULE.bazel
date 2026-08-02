@@ -41,6 +41,19 @@ crate.spec(
     package = "sha2",
     version = "=0.10.9",
 )
+crate.spec(
+    package = "libc",
+    version = "=0.2.177",
+)
+crate.spec(
+    git = "https://github.com/winstanley-industries/ohmnivore.git",
+    package = "ohmnivore",
+    rev = "c2189a651d4879211019e109b2136dee836a5c5d",
+)
+crate.annotation(
+    crate = "ohmnivore",
+    gen_binaries = ["ohmnivore"],
+)
 crate.from_specs()
 use_repo(crate, "crates")
 

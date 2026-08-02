@@ -76,24 +76,7 @@ impl SimulationInputBundle {
             ));
         }
 
-        let expected_comments = identity_comment_lines(&map);
-        let actual_comments: Vec<_> = self
-            .netlist
-            .lines()
-            .filter(|line| {
-                line.starts_with("* @circuitc-net ") || line.starts_with("* @circuitc-device ")
-            })
-            .map(str::to_owned)
-            .collect();
-        if actual_comments != expected_comments {
-            return Err(lower_diagnostic(
-                LOWER_CONTRACT,
-                format!("design.analyses.{}", self.analysis_path),
-                None,
-                "SPICE identity comments do not exactly match the standalone identity map",
-            ));
-        }
-        verify_netlist_identity_coverage(&self.netlist, &map, self.analysis_kind).map_err(
+        verify_spice_identity_binding(&self.netlist, &map, self.analysis_kind).map_err(
             |message| {
                 lower_diagnostic(
                     LOWER_CONTRACT,
@@ -614,25 +597,72 @@ fn artifact_path_stem(design: &str, analysis: &str) -> String {
     sha256_hex(source.as_bytes())
 }
 
-fn identity_comment_lines(map: &SpiceIdentityMap) -> Vec<String> {
-    map.nets
-        .iter()
-        .map(|net| {
-            format!(
-                "* @circuitc-net {} {}",
-                hex_encode(net.canonical.as_bytes()),
-                net.backend
-            )
-        })
-        .chain(map.devices.iter().map(|device| {
-            format!(
-                "* @circuitc-device {} {} {}",
-                hex_encode(device.semantic_path.as_bytes()),
-                hex_encode(device.reference.as_bytes()),
-                device.backend
-            )
-        }))
-        .collect()
+pub(crate) fn verify_spice_identity_binding(
+    netlist: &str,
+    map: &SpiceIdentityMap,
+    analysis_kind: AnalysisKind,
+) -> Result<(), &'static str> {
+    let mut actual_comments = netlist.lines().filter(|line| {
+        line.starts_with("* @circuitc-net ") || line.starts_with("* @circuitc-device ")
+    });
+    for net in &map.nets {
+        let mut fields = actual_comments
+            .next()
+            .unwrap_or_default()
+            .split_ascii_whitespace();
+        if fields.next() != Some("*")
+            || fields.next() != Some("@circuitc-net")
+            || !fields
+                .next()
+                .is_some_and(|hex| exact_upper_hex(hex, net.canonical.as_bytes()))
+            || fields.next() != Some(net.backend.as_str())
+            || fields.next().is_some()
+        {
+            return Err("SPICE identity comments do not exactly match the standalone identity map");
+        }
+    }
+    for device in &map.devices {
+        let mut fields = actual_comments
+            .next()
+            .unwrap_or_default()
+            .split_ascii_whitespace();
+        if fields.next() != Some("*")
+            || fields.next() != Some("@circuitc-device")
+            || !fields
+                .next()
+                .is_some_and(|hex| exact_upper_hex(hex, device.semantic_path.as_bytes()))
+            || !fields
+                .next()
+                .is_some_and(|hex| exact_upper_hex(hex, device.reference.as_bytes()))
+            || fields.next() != Some(device.backend.as_str())
+            || fields.next().is_some()
+        {
+            return Err("SPICE identity comments do not exactly match the standalone identity map");
+        }
+    }
+    if actual_comments.next().is_some() {
+        return Err("SPICE identity comments do not exactly match the standalone identity map");
+    }
+    verify_netlist_identity_coverage(netlist, map, analysis_kind)
+}
+
+fn exact_upper_hex(encoded: &str, bytes: &[u8]) -> bool {
+    encoded.len() == bytes.len().saturating_mul(2)
+        && encoded
+            .as_bytes()
+            .chunks_exact(2)
+            .zip(bytes)
+            .all(|(encoded, byte)| {
+                encoded[0] == upper_hex_digit(byte >> 4)
+                    && encoded[1] == upper_hex_digit(byte & 0x0f)
+            })
+}
+
+const fn upper_hex_digit(nibble: u8) -> u8 {
+    match nibble {
+        0..=9 => b'0' + nibble,
+        _ => b'A' + (nibble - 10),
+    }
 }
 
 fn verify_netlist_identity_coverage(
@@ -660,18 +690,18 @@ fn verify_netlist_identity_coverage(
             }
             continue;
         }
-        let fields: Vec<_> = line.split_ascii_whitespace().collect();
-        if fields.len() < 3 {
+        let mut fields = line.split_ascii_whitespace();
+        let (Some(device), Some(first_node), Some(second_node)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
             return Err("SPICE device lines must contain one mapped device and two mapped nodes");
-        }
-        let device = fields[0];
+        };
         if !mapped_devices.contains(&device) || !used_devices.insert(device) {
             return Err(
                 "SPICE device tokens must map exactly once through the standalone identity map",
             );
         }
-        for node in &fields[1..=2] {
-            let node = *node;
+        for node in [first_node, second_node] {
             if !mapped_nets.contains(&node) {
                 return Err(
                     "every emitted SPICE node token must resolve through the standalone identity map",
@@ -708,16 +738,6 @@ fn verify_netlist_identity_coverage(
         return Err("a simulation netlist must contain exactly one matching analysis directive");
     }
     Ok(())
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        write!(encoded, "{byte:02X}").unwrap();
-    }
-    encoded
 }
 
 fn contract_diagnostic(

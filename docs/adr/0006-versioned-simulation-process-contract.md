@@ -55,6 +55,43 @@ ephemeral. CircuitC parses them strictly, maps results only through the
 identity map, rejects non-finite or incomplete values, and emits normalized
 contracts. Successful exit status alone is not acceptance.
 
+The `ohmnivore-cli-csv/v1` adapter grammar is recorded under
+`schemas/ohmnivore_cli_csv/v1.md`. Each invocation uses a fresh private working
+directory, an empty environment plus a fixed locale/timezone/thread allowlist,
+null standard input, `--cpu`, and no statistics flag. The default handshake and
+analysis wall limits are 2 and 30 seconds within one five-minute aggregate
+runner budget. Standard output and error are drained
+concurrently and bounded to 16 MiB and 64 KiB; normalized result construction
+remains bounded by the 64 MiB contract envelope. CPU time, output file size,
+open descriptors, and core files are limited before `exec`. Linux additionally
+applies an 8 GiB hard address-space limit. Darwin does not implement a usable
+finite `RLIMIT_AS`; its adapter therefore claims wall/CPU/output/file/descriptor
+bounds, not a hard RSS ceiling. A hard cross-platform process-tree memory
+ceiling requires a future platform containment decision rather than a silent
+portability approximation.
+
+Bazel copies the configured executable to a fixed first-party runfile and
+generates its immutable provenance sidecar. Production callers supply only a
+work root; they cannot substitute executable or sidecar paths. The sidecar
+records the exact backend tuple and source revision plus SHA-256 of the platform
+executable. The runner accepts only bounded regular runfiles, verifies that
+sidecar and executable digest once per runner under a 30-second identity
+deadline, and then performs
+the exact `ohmnivore 0.1.0` runtime handshake. One Bazel constant supplies the
+Rust contract and provenance writer revision; a Bazel test also requires the
+module pin and committed resolved Git commit to match it. The committed Bazel
+module lock, rather than Ohmnivore's Cargo lock, owns the resolved transitive
+graph for this process binary.
+
+The version handshake and analysis use different private directories. The
+analysis netlist is atomically created with exclusive/no-follow semantics before
+the backend enters that directory, and every post-creation outcome performs
+checked cleanup before returning. Process-group termination contains accidental
+descendants of the exact provenance-authenticated Ohmnivore binary; it is not a
+general sandbox against a malicious same-user executable that deliberately
+escapes its process group. Supporting interchangeable untrusted simulator
+binaries would require a separate OS containment decision.
+
 The pinned linear AC grid has a deterministic backend operation order, so the
 adapter can lower an exact authored frequency to its generated backend row in
 advance. Ohmnivore's transient solver is adaptive even for the initial R/Vdc
