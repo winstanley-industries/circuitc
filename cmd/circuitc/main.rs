@@ -110,23 +110,35 @@ fn report_successful_publication(
     stdout: &mut impl io::Write,
     stderr: &mut impl io::Write,
 ) -> Result<(), u8> {
-    if let Some(error) = &write_outcome.cleanup_warning {
-        writeln!(
-            stderr,
-            "CC-CLI-IO-003: output publication to {} succeeded, but backup staging cleanup was incomplete: {error}",
-            output_directory.display()
-        )
-        .map_err(|_| EXIT_IO)?;
+    let report_result = (|| -> io::Result<()> {
+        if let Some(error) = &write_outcome.cleanup_warning {
+            writeln!(
+                stderr,
+                "CC-CLI-IO-003: output publication to {} succeeded, but backup staging cleanup was incomplete: {error}",
+                output_directory.display()
+            )?;
+        }
+        for (filename, _) in outputs {
+            writeln!(
+                stdout,
+                "wrote {}",
+                output_directory.join(filename).display()
+            )?;
+        }
+        Ok(())
+    })();
+    match report_result {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => {
+            let _ = writeln!(
+                stderr,
+                "CC-CLI-IO-004: outputs were published to {}, but reporting them failed: {error}",
+                output_directory.display()
+            );
+            Err(EXIT_IO)
+        }
     }
-    for (filename, _) in outputs {
-        writeln!(
-            stdout,
-            "wrote {}",
-            output_directory.join(filename).display()
-        )
-        .map_err(|_| EXIT_IO)?;
-    }
-    Ok(())
 }
 
 fn resolve_input_path(input: &Path, bazel_workspace: Option<&std::ffi::OsStr>) -> PathBuf {
@@ -1315,6 +1327,18 @@ mod tests {
     use super::{DiagnosticFormat, parse_arguments, resolve_input_path};
     use std::ffi::OsString;
 
+    struct FailingWriter(std::io::ErrorKind);
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(self.0))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
     }
@@ -1406,6 +1430,51 @@ mod tests {
         assert!(stderr.contains(".result.txt.backup-test"));
         let stdout = String::from_utf8(stdout).expect("publication output must be UTF-8");
         assert!(stdout.contains("wrote /output/result.txt"));
+    }
+
+    #[test]
+    fn broken_pipe_while_reporting_does_not_misreport_publication_as_failed() {
+        let outputs = [("result.txt".to_owned(), b"generated".as_slice())];
+        let write_outcome = super::WriteOutcome {
+            cleanup_warning: None,
+        };
+        let mut stdout = FailingWriter(std::io::ErrorKind::BrokenPipe);
+        let mut stderr = Vec::new();
+
+        let status = super::report_successful_publication(
+            std::path::Path::new("/output"),
+            &outputs,
+            &write_outcome,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, Ok(()));
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn non_pipe_reporting_failure_identifies_already_published_outputs() {
+        let outputs = [("result.txt".to_owned(), b"generated".as_slice())];
+        let write_outcome = super::WriteOutcome {
+            cleanup_warning: None,
+        };
+        let mut stdout = FailingWriter(std::io::ErrorKind::Other);
+        let mut stderr = Vec::new();
+
+        let status = super::report_successful_publication(
+            std::path::Path::new("/output"),
+            &outputs,
+            &write_outcome,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, Err(super::EXIT_IO));
+        let stderr = String::from_utf8(stderr).expect("reporting diagnostic must be UTF-8");
+        assert!(stderr.contains("CC-CLI-IO-004"));
+        assert!(stderr.contains("outputs were published to /output"));
+        assert!(stderr.contains("reporting them failed"));
     }
 
     #[cfg(any(

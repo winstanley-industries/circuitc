@@ -146,7 +146,10 @@ path rather than the `/tmp` symlink.
 Once every artifact has been published, failure to remove backup staging does
 not misreport publication as failed: the CLI emits `CC-CLI-IO-003`, names the
 cleanup residue, and exits successfully. Failures before complete publication
-still roll back and exit `3` with `CC-CLI-IO-002`.
+still roll back and exit `3` with `CC-CLI-IO-002`. A broken output pipe after
+publication is also treated as success. Other success-reporting stream failures
+emit `CC-CLI-IO-004`, explicitly state that outputs were already published, and
+exit `3`.
 
 Human diagnostics are the default. JSON diagnostics contain stable codes, the
 requested filename, UTF-8 byte spans, one-based line and column, semantic path
