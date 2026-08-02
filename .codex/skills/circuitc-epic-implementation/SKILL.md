@@ -183,8 +183,8 @@ Use `github:gh-address-comments` to fetch paginated, thread-aware state. If it i
 2. Cluster the full set by root cause and ledger row before editing.
 3. Classify each item:
    - **blocking and valid:** fix in the current layer;
-   - **valid but belongs to another contract:** move it to the correct stacked layer;
-   - **advisory:** fix only when it materially improves the current claim without destabilizing an approved head; otherwise record a follow-up;
+   - **valid but belongs to another contract:** move it to the correct stacked layer, reply with the linked destination, and obtain acceptance of that disposition before resolving the current thread;
+   - **advisory:** fix only when it materially improves the current claim without destabilizing an approved head; otherwise record a linked follow-up and obtain acceptance of that disposition before resolving;
    - **stale, duplicate, or incorrect:** reply with concrete evidence and make no code change.
 4. Make one coherent patch per cluster rather than one commit per comment. Add a regression test that fails without each behavioral fix.
 5. Run focused tests, required full gates, and host gates proportionate to the change. Commit and push one validated round.
@@ -200,7 +200,7 @@ Thread resolution is a distinct delivery operation. After a fix is pushed and th
 1. Reply to each addressed thread with the fixing commit and specific validation evidence.
 2. Resolve the thread only when the code now satisfies it, the changed code makes it inapplicable, or the reviewer accepted the evidence.
 3. For rejected feedback, explain why with a contract or test citation; resolve only when authorized and the disposition is unambiguous.
-4. Leave unresolved any partially addressed, disputed, or newly failing issue.
+4. Leave unresolved any partially addressed, disputed, or newly failing issue; it blocks merge until it is fixed, accepted as transferred/deferred, or conclusively disposed and resolved.
 5. Re-fetch the thread-aware snapshot immediately and require zero unresolved threads before merge.
 
 Prefer `github:gh-address-comments`. If the connector cannot expose thread state or resolution, use authenticated `gh api graphql` as described in [references/github-closeout.md](references/github-closeout.md). Keep reply and resolution operations auditable, use small mutation batches, and verify every returned thread state. Do not defer thread cleanup until the merge command fails.

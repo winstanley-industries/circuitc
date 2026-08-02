@@ -64,7 +64,26 @@ query ReviewThreads(
 }
 ```
 
-Submit it with authenticated `gh api graphql`, using raw `-f` fields for `owner`, `name`, and `after`, and typed `-F` for `number`. Continue with each review-thread `endCursor` until `hasNextPage` is false. If a thread's comment connection has another page, fetch that thread's remaining comments before classifying it. Require the same non-empty `headRefOid` on every page; restart if it moves. Count every node where `isResolved` is false, preserving `isOutdated` in the report. This operation is a query and must not be combined with reply or resolution mutations.
+Submit it with authenticated `gh api graphql`, using raw `-f` fields for `owner` and `name`, and typed `-F` for `number`. Omit `after` on the first request so the nullable variable is unset; pass the cursor with `-f after=END_CURSOR` only on subsequent pages. Continue with each review-thread `endCursor` until `hasNextPage` is false. Require the same non-empty `headRefOid` on every page; restart if it moves. Count every node where `isResolved` is false, preserving `isOutdated` in the report. This operation is a query and must not be combined with reply or resolution mutations.
+
+If an unresolved thread's comment connection has another page, fetch its remaining context before classification:
+
+```graphql
+query ThreadComments($threadId: ID!, $after: String) {
+  node(id: $threadId) {
+    ... on PullRequestReviewThread {
+      id
+      isResolved
+      comments(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes { id author { login } body url createdAt }
+      }
+    }
+  }
+}
+```
+
+Pass `threadId` with raw `-f`, omit `after` on the first request, and pass each later cursor with raw `-f`. Recheck the PR head before and after paging nested comments and restart the whole snapshot if it moved.
 
 When a thread-aware reply tool is unavailable, post the factual reply with GraphQL:
 
@@ -78,13 +97,14 @@ mutation ReplyToReviewThread($threadId: ID!, $body: String!) {
 }
 ```
 
-Invoke it with authenticated `gh`, passing both variables as raw strings:
+Write the reply body to a task-scoped file so shell quoting cannot alter the evidence, then invoke the mutation with authenticated `gh`. Use typed `-F body=@FILE` to read the file; raw `-f body=@FILE` would post the literal filename.
 
 ```sh
+reply_file=.agent-scratch/pr-review-reply.md
 gh api graphql \
   -f 'query=mutation ReplyToReviewThread($threadId: ID!, $body: String!) { addPullRequestReviewThreadReply(input: { pullRequestReviewThreadId: $threadId, body: $body }) { comment { id url } } }' \
   -f threadId=THREAD_NODE_ID \
-  -f body='Addressed in COMMIT: EVIDENCE'
+  -F body=@"$reply_file"
 ```
 
 When resolution support is missing, resolve individual addressed threads with GraphQL:
@@ -107,16 +127,16 @@ gh api graphql \
 
 Post the factual reply before resolution using the available thread-aware GitHub tool. Include the fixing commit and the narrow/full validation that confirmed it. Reply and resolution are separate writes; verify both.
 
-After each mutation batch, run the read-only thread query again and require zero unresolved current and outdated threads before merge.
+After each mutation batch, run the read-only thread query again and require zero unresolved current and outdated threads before merge. A partially addressed or disputed thread blocks merge until fixed or conclusively disposed and resolved; a recorded note alone does not waive the gate.
 
 If batching GraphQL aliases, keep batches at 24 threads or fewer and inspect every result. Large alias batches can exceed GitHub's GraphQL complexity limit. Never use a blanket resolve-all mutation without first classifying every unresolved thread.
 
 ## Interpret feedback without looping
 
 - Fix contract, correctness, security, and missing-regression-test blockers on the owning layer.
-- Move a valid cross-contract issue to the correct upper layer.
+- Move a valid cross-contract issue to the correct upper layer, link the destination in the reply, and obtain acceptance before resolving the current thread.
 - Answer stale or incorrect feedback with repository evidence.
-- Avoid changing an approved exact head for ordinary nits; record a follow-up instead.
+- Avoid changing an approved exact head for ordinary nits; record and link a follow-up, then obtain acceptance before resolving the current thread.
 - After two rounds that uncover blockers in different new subsystems, split or restack before making another broad patch.
 
 ## Merge with expected-head protection
