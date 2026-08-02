@@ -1422,6 +1422,34 @@ mod tests {
     }
 
     #[test]
+    fn rejects_no_connect_simulation_terminal() {
+        let mut design = voltage_divider();
+        let component = design
+            .components
+            .iter_mut()
+            .find(|component| component.reference == "R1")
+            .expect("reference resistor must exist");
+        let positive_pin = match component
+            .simulation
+            .as_ref()
+            .expect("reference resistor must retain its simulation model")
+        {
+            super::SimulationModel::Resistor { positive_pin, .. } => positive_pin.clone(),
+            super::SimulationModel::DcVoltageSource { .. } => {
+                panic!("reference resistor must use a resistor simulation model")
+            }
+        };
+        component
+            .connections
+            .iter_mut()
+            .find(|connection| connection.pin == positive_pin)
+            .expect("simulation terminal must resolve to a connection")
+            .state = ConnectionState::NoConnect;
+
+        assert_rejected(design, "CC-SIM-003");
+    }
+
+    #[test]
     fn rejects_value_kind_that_disagrees_with_the_component_contract() {
         let mut design = voltage_divider();
         design.components[0].value = ComponentValue::DcVoltage(crate::quantity::Quantity::new(

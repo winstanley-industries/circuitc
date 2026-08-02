@@ -206,16 +206,12 @@ fn validate_catalog_bindings(design: &Design, diagnostics: &mut Vec<Diagnostic>)
             });
         }
         if let Some(symbol) = crate::library::symbol(&component.symbol.library_id) {
-            if crate::library::symbol_library_file(&component.symbol.library_id).is_none() {
-                diagnostics.push(Diagnostic {
-                    code: "CC-KICAD-SYMBOL-007",
-                    path: path.to_owned(),
-                    message: format!(
-                        "symbol {} has no publishable vendored library file",
-                        component.symbol.library_id
-                    ),
-                });
-            }
+            validate_publishable_symbol(
+                path,
+                symbol,
+                crate::library::symbol_library_file(&component.symbol.library_id),
+                diagnostics,
+            );
             let bound_pins: BTreeMap<_, _> = component
                 .symbol
                 .pins
@@ -380,6 +376,32 @@ fn validate_catalog_bindings(design: &Design, diagnostics: &mut Vec<Diagnostic>)
     }
 }
 
+fn validate_publishable_symbol(
+    path: &str,
+    symbol: crate::library::SymbolDefinition,
+    file: Option<crate::library::LibraryFileDefinition>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let message = match file {
+        None => Some(format!(
+            "symbol {} has no publishable vendored library file",
+            symbol.library_id
+        )),
+        Some(file) if published_symbol_definition(symbol, Some(file)).is_none() => Some(format!(
+            "symbol {} has no extractable definition in its publishable vendored library file",
+            symbol.library_id
+        )),
+        Some(_) => None,
+    };
+    if let Some(message) = message {
+        diagnostics.push(Diagnostic {
+            code: "CC-KICAD-SYMBOL-007",
+            path: path.to_owned(),
+            message,
+        });
+    }
+}
+
 fn identities(design: &Design) -> Vec<KicadIdentity> {
     let mut result = Vec::new();
     let mut register = |semantic_path: String, kind: &str, fields: &[&str]| {
@@ -486,8 +508,11 @@ fn emit_schematic(design: &Design) -> String {
     for library_id in used_symbols {
         let definition = crate::library::symbol(library_id)
             .expect("validated symbol binding must resolve in the vendored catalog");
-        let block = extract_symbol_definition(crate::library::SYMBOL_LIBRARY, definition.name)
-            .expect("vendored catalog symbol must be extractable");
+        let block = published_symbol_definition(
+            definition,
+            crate::library::symbol_library_file(library_id),
+        )
+        .expect("validated vendored catalog symbol must be extractable");
         let qualified = block.replacen(
             &format!("(symbol \"{}\"", definition.name),
             &format!("(symbol {library_id}", library_id = quoted(library_id)),
@@ -747,6 +772,14 @@ fn extract_symbol_definition<'a>(library: &'a str, name: &str) -> Option<&'a str
         }
     }
     None
+}
+
+fn published_symbol_definition(
+    symbol: crate::library::SymbolDefinition,
+    file: Option<crate::library::LibraryFileDefinition>,
+) -> Option<&'static str> {
+    let file = file?;
+    extract_symbol_definition(file.contents, symbol.name)
 }
 
 fn emit_project_file(design: &Design) -> String {
@@ -1269,7 +1302,9 @@ fn fnv1a64(seed: u64, bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{millimeters, stable_uuid};
+    use crate::library::{LibraryFileDefinition, symbol, symbol_library_file};
+
+    use super::{millimeters, stable_uuid, validate_publishable_symbol};
 
     #[test]
     fn converts_nanometers_without_floating_point() {
@@ -1297,5 +1332,24 @@ mod tests {
             stable_uuid("divider", "test", &["a", "bc"]),
             stable_uuid("divider", "test", &["ab", "c"])
         );
+    }
+
+    #[test]
+    fn missing_vendored_symbol_definition_is_a_machine_readable_diagnostic() {
+        let symbol = symbol("CircuitC:R").expect("resistor symbol must exist");
+        let valid_file =
+            symbol_library_file(symbol.library_id).expect("symbol library file must exist");
+        let malformed_file = LibraryFileDefinition {
+            contents: "(kicad_symbol_lib (version 20251024))",
+            ..valid_file
+        };
+
+        for file in [None, Some(malformed_file)] {
+            let mut diagnostics = Vec::new();
+            validate_publishable_symbol("divider.r_top", symbol, file, &mut diagnostics);
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].code, "CC-KICAD-SYMBOL-007");
+            assert_eq!(diagnostics[0].path, "divider.r_top");
+        }
     }
 }

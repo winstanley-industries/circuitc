@@ -145,6 +145,88 @@ mod tests {
     }
 
     #[test]
+    fn no_connect_simulation_terminal_returns_diagnostics_without_panicking() {
+        let mut design = voltage_divider();
+        let component = design
+            .components
+            .iter_mut()
+            .find(|component| component.reference == "R1")
+            .expect("reference resistor must exist");
+        component
+            .connections
+            .iter_mut()
+            .find(|connection| connection.pin == "1")
+            .expect("positive simulation terminal must exist")
+            .state = ConnectionState::NoConnect;
+
+        let result = catch_unwind(|| compile(&design));
+        let diagnostics = result
+            .expect("an unconnected simulation terminal must not panic in SPICE lowering")
+            .expect_err("an unconnected simulation terminal must fail validation")
+            .diagnostics;
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CC-SIM-003"),
+            "missing CC-SIM-003: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn schematic_participation_and_board_sheetfile_are_design_derived() {
+        let design = voltage_divider();
+        let artifacts = compile(&design).expect("reference design must compile");
+        let physical_uuid = artifacts
+            .kicad_identities
+            .iter()
+            .find(|identity| identity.semantic_path == "divider.r_top")
+            .expect("physical symbol identity must exist")
+            .uuid
+            .as_str();
+        let virtual_uuid = artifacts
+            .kicad_identities
+            .iter()
+            .find(|identity| identity.semantic_path == "divider.analysis.input")
+            .expect("virtual symbol identity must exist")
+            .uuid
+            .as_str();
+        let physical_symbol = balanced_block_containing(
+            &artifacts.kicad_schematic,
+            "  (symbol\n",
+            &format!("    (uuid \"{physical_uuid}\")"),
+        );
+        let virtual_symbol = balanced_block_containing(
+            &artifacts.kicad_schematic,
+            "  (symbol\n",
+            &format!("    (uuid \"{virtual_uuid}\")"),
+        );
+        for expected in ["    (in_bom yes)", "    (on_board yes)"] {
+            assert!(physical_symbol.contains(expected));
+        }
+        for expected in ["    (in_bom no)", "    (on_board no)"] {
+            assert!(virtual_symbol.contains(expected));
+        }
+
+        let footprint = balanced_block_containing(
+            &artifacts.kicad_pcb,
+            "  (footprint ",
+            "(property \"Reference\" \"R1\"",
+        );
+        assert!(footprint.contains("    (sheetfile \"voltage_divider.kicad_sch\")"));
+
+        let mut renamed = design;
+        renamed.name = "renamed_divider".to_owned();
+        let renamed_artifacts = compile(&renamed).expect("renamed design must compile");
+        let renamed_footprint = balanced_block_containing(
+            &renamed_artifacts.kicad_pcb,
+            "  (footprint ",
+            "(property \"Reference\" \"R1\"",
+        );
+        assert!(renamed_footprint.contains("    (sheetfile \"renamed_divider.kicad_sch\")"));
+        assert!(!renamed_footprint.contains("voltage_divider.kicad_sch"));
+    }
+
+    #[test]
     fn every_emitted_kicad_uuid_has_exactly_one_identity() {
         let reference = compile(&voltage_divider()).expect("reference design must compile");
         assert_identity_map_is_total(&reference);

@@ -51,7 +51,9 @@ derived from canonical intent.
   KiCad's schematic-parity check owns acceptance.
 - Component schematic anchors are unique, and lowering rejects transformed
   pin connection-point collisions when their canonical connection states
-  differ. Coincident labels cannot silently merge distinct CircuitC nets.
+  differ or when both pins are no-connect. Coincident labels cannot silently
+  merge distinct CircuitC nets, and coincident no-connect markers are not
+  merged.
 - Source compilation emits a deterministic KiCad identity manifest mapping
   UUIDs to globally unique semantic paths and UTF-8 source locations. Its
   source field is derived from the design name rather than the requested input
