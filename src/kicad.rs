@@ -311,6 +311,25 @@ fn identities(design: &Design) -> Vec<KicadIdentity> {
                     &[&component.path, &pad.number],
                 );
             }
+            if let Some(graphics) =
+                crate::library::footprint_graphics(&physical.footprint.library_id)
+            {
+                for line in graphics.silkscreen_lines {
+                    register(
+                        format!(
+                            "{}.footprint.graphic.silkscreen.{}",
+                            component.path, line.semantic_name
+                        ),
+                        "footprint-silkscreen-line",
+                        &[&component.path, line.semantic_name],
+                    );
+                }
+                register(
+                    format!("{}.footprint.graphic.courtyard", component.path),
+                    "footprint-courtyard",
+                    &[&component.path],
+                );
+            }
         }
     }
     for route in &design.board.routes {
@@ -818,6 +837,7 @@ fn emit_footprint(output: &mut String, design: &Design, component: &Component) {
     .unwrap();
     output.push_str("    (attr smd)\n");
     output.push_str("    (duplicate_pad_numbers_are_jumpers no)\n");
+    emit_footprint_graphics(output, design, component);
 
     let mut pads: Vec<_> = physical.footprint.pads.iter().collect();
     pads.sort_by(|left, right| left.number.cmp(&right.number));
@@ -868,6 +888,91 @@ fn emit_footprint(output: &mut String, design: &Design, component: &Component) {
         output.push_str("    )\n");
     }
     output.push_str("    (embedded_fonts no)\n  )\n");
+}
+
+fn emit_footprint_graphics(output: &mut String, design: &Design, component: &Component) {
+    let physical = component
+        .physical
+        .as_ref()
+        .expect("filtered physical component must have an implementation");
+    let graphics = crate::library::footprint_graphics(&physical.footprint.library_id)
+        .expect("validated catalog footprint must have drawing geometry");
+    for line in graphics.silkscreen_lines {
+        output.push_str("    (fp_line\n");
+        writeln!(
+            output,
+            "      (start {} {})",
+            millimeters(line.start.x),
+            millimeters(line.start.y)
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "      (end {} {})",
+            millimeters(line.end.x),
+            millimeters(line.end.y)
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "      (stroke (width {}) (type default))",
+            millimeters(line.width_nm)
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "      (layer \"{}\")",
+            silk_layer(physical.placement.layer)
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "      (uuid \"{}\")",
+            stable_uuid(
+                &design.name,
+                "footprint-silkscreen-line",
+                &[&component.path, line.semantic_name]
+            )
+        )
+        .unwrap();
+        output.push_str("    )\n");
+    }
+
+    output.push_str("    (fp_rect\n");
+    writeln!(
+        output,
+        "      (start {} {})",
+        millimeters(graphics.courtyard_start.x),
+        millimeters(graphics.courtyard_start.y)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "      (end {} {})",
+        millimeters(graphics.courtyard_end.x),
+        millimeters(graphics.courtyard_end.y)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "      (stroke (width {}) (type default))",
+        millimeters(graphics.courtyard_width_nm)
+    )
+    .unwrap();
+    output.push_str("      (fill none)\n");
+    writeln!(
+        output,
+        "      (layer \"{}\")",
+        courtyard_layer(physical.placement.layer)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "      (uuid \"{}\")",
+        stable_uuid(&design.name, "footprint-courtyard", &[&component.path])
+    )
+    .unwrap();
+    output.push_str("    )\n");
 }
 
 fn kicad_net_for_pad<'a>(component: &'a Component, pad: &str) -> Option<Cow<'a, str>> {
@@ -944,6 +1049,13 @@ fn silk_layer(layer: CopperLayer) -> &'static str {
     match layer {
         CopperLayer::Front => "F.SilkS",
         CopperLayer::Back => "B.SilkS",
+    }
+}
+
+fn courtyard_layer(layer: CopperLayer) -> &'static str {
+    match layer {
+        CopperLayer::Front => "F.CrtYd",
+        CopperLayer::Back => "B.CrtYd",
     }
 }
 

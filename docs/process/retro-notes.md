@@ -38,3 +38,16 @@
 - Keep provenance lookup costs explicit. Pre-index rendered semantic paths,
   line starts, and UTF-8 character starts so large or minified sources do not
   make identity-manifest generation quadratic.
+- A manual host gate cannot be the only test for compiler-owned semantics.
+  Default tests must independently pin connectivity projection, every
+  coordinate-transform branch, and generated project/library configuration.
+- Completion evidence must name a reachable repository base or PR commit and
+  state when a host-only gate is not reproduced by CI; scratch-repository
+  commits are useful local evidence but not durable project provenance.
+- Host DRC is meaningful only for geometry actually embedded in the generated
+  board. Vendoring courtyard data without lowering it into board footprints
+  would leave courtyard-overlap policy vacuous.
+- Publication and post-publication cleanup are distinct outcomes. Roll back
+  incomplete publication, but report successful publication plus staging
+  residue with a dedicated warning instead of claiming the outputs were not
+  written.

@@ -146,7 +146,7 @@ pub(crate) fn elaborate(tree: &SyntaxTree) -> Result<ElaboratedDesign, Vec<Sourc
     provenance.insert_structural("design", tree.design.span);
     provenance.insert_structural("design.name", tree.design.name.span);
 
-    if !artifact_name_is_valid(&tree.design.name.value) {
+    if !crate::design::artifact_name_is_valid(&tree.design.name.value) {
         diagnostics.push(SourceDiagnostic::new(
             "CC-LANG-DESIGN-001",
             source,
@@ -1888,16 +1888,6 @@ fn semantic_path_is_valid(value: &str) -> bool {
         && !value.ends_with('.')
 }
 
-fn artifact_name_is_valid(value: &str) -> bool {
-    value
-        .chars()
-        .next()
-        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
-        && value
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{ProvenanceMap, SemanticProvenanceKey, elaborate};
@@ -2096,6 +2086,33 @@ mod tests {
             diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.code == "CC-SIM-010")
+        );
+    }
+
+    #[test]
+    fn rejects_symbol_catalog_electrical_type_drift_and_missing_bindings() {
+        let electrical_drift = REFERENCE.replacen("bind 1 1 passive;", "bind 1 1 power_output;", 1);
+        let expected_start = electrical_drift
+            .find("bind 1 1 power_output")
+            .map(|start| start + "bind 1 1 ".len())
+            .expect("mutated electrical type token exists");
+        let diagnostics = elaborate_source(&electrical_drift)
+            .expect_err("catalog electrical-type drift must fail");
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "CC-LANG-SYMBOL-008")
+            .expect("electrical-type catalog diagnostic must exist");
+        assert_eq!(diagnostic.start, expected_start);
+        assert_eq!(diagnostic.end, expected_start + "power_output".len());
+
+        let missing_binding = REFERENCE.replacen("      bind 2 2 passive;\n", "", 1);
+        let diagnostics =
+            elaborate_source(&missing_binding).expect_err("missing catalog pin binding must fail");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CC-LANG-SYMBOL-009"),
+            "missing CC-LANG-SYMBOL-009: {diagnostics:#?}"
         );
     }
 

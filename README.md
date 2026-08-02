@@ -51,20 +51,20 @@ Compile the reference source design:
 ```sh
 bazel run //cmd/circuitc -- compile \
   examples/voltage_divider.circuitc \
-  --output-dir /tmp/circuitc-voltage-divider
+  --output-dir /private/tmp/circuitc-voltage-divider
 ```
 
 This writes:
 
-- `/tmp/circuitc-voltage-divider/voltage_divider.kicad_sch`
-- `/tmp/circuitc-voltage-divider/voltage_divider.kicad_pcb`
-- `/tmp/circuitc-voltage-divider/voltage_divider.kicad_pro`
-- `/tmp/circuitc-voltage-divider/CircuitC.kicad_sym`
-- `/tmp/circuitc-voltage-divider/CircuitC.pretty/R_0603_1608Metric.kicad_mod`
-- `/tmp/circuitc-voltage-divider/sym-lib-table`
-- `/tmp/circuitc-voltage-divider/fp-lib-table`
-- `/tmp/circuitc-voltage-divider/voltage_divider.kicad-map.json`
-- `/tmp/circuitc-voltage-divider/voltage_divider.spice`
+- `/private/tmp/circuitc-voltage-divider/voltage_divider.kicad_sch`
+- `/private/tmp/circuitc-voltage-divider/voltage_divider.kicad_pcb`
+- `/private/tmp/circuitc-voltage-divider/voltage_divider.kicad_pro`
+- `/private/tmp/circuitc-voltage-divider/CircuitC.kicad_sym`
+- `/private/tmp/circuitc-voltage-divider/CircuitC.pretty/R_0603_1608Metric.kicad_mod`
+- `/private/tmp/circuitc-voltage-divider/sym-lib-table`
+- `/private/tmp/circuitc-voltage-divider/fp-lib-table`
+- `/private/tmp/circuitc-voltage-divider/voltage_divider.kicad-map.json`
+- `/private/tmp/circuitc-voltage-divider/voltage_divider.spice`
 
 When KiCad 10 is installed, run the Bazel-owned host validation gate with:
 

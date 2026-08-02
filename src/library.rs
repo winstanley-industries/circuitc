@@ -28,6 +28,22 @@ pub(crate) struct PartDefinition {
     pub footprint_library_id: Option<&'static str>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GraphicLineDefinition {
+    pub semantic_name: &'static str,
+    pub start: PointNm,
+    pub end: PointNm,
+    pub width_nm: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FootprintGraphicsDefinition {
+    pub silkscreen_lines: &'static [GraphicLineDefinition],
+    pub courtyard_start: PointNm,
+    pub courtyard_end: PointNm,
+    pub courtyard_width_nm: i64,
+}
+
 pub(crate) fn part(identity: &PartIdentity) -> Option<PartDefinition> {
     match (
         identity.logical_device.as_str(),
@@ -106,11 +122,40 @@ pub(crate) fn footprint(library_id: &str) -> Option<Footprint> {
     }
 }
 
+const RESISTOR_SILKSCREEN: &[GraphicLineDefinition] = &[
+    GraphicLineDefinition {
+        semantic_name: "top",
+        start: PointNm::new(-450_000, -500_000),
+        end: PointNm::new(450_000, -500_000),
+        width_nm: 120_000,
+    },
+    GraphicLineDefinition {
+        semantic_name: "bottom",
+        start: PointNm::new(-450_000, 500_000),
+        end: PointNm::new(450_000, 500_000),
+        width_nm: 120_000,
+    },
+];
+
+pub(crate) fn footprint_graphics(library_id: &str) -> Option<FootprintGraphicsDefinition> {
+    match library_id {
+        "CircuitC:R_0603_1608Metric" => Some(FootprintGraphicsDefinition {
+            silkscreen_lines: RESISTOR_SILKSCREEN,
+            courtyard_start: PointNm::new(-1_700_000, -750_000),
+            courtyard_end: PointNm::new(1_700_000, 750_000),
+            courtyard_width_nm: 50_000,
+        }),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::design::{PadShape, PartIdentity, PointNm, SizeNm};
 
-    use super::{RESISTOR_FOOTPRINT_LIBRARY, SYMBOL_LIBRARY, footprint, part, symbol};
+    use super::{
+        RESISTOR_FOOTPRINT_LIBRARY, SYMBOL_LIBRARY, footprint, footprint_graphics, part, symbol,
+    };
 
     #[test]
     fn vendored_assets_match_the_catalog() {
@@ -165,6 +210,13 @@ mod tests {
             RESISTOR_FOOTPRINT_LIBRARY
                 .contains("(pad \"2\" smd roundrect\n    (at 1 0)\n    (size 0.9 0.95)")
         );
+        let graphics = footprint_graphics("CircuitC:R_0603_1608Metric")
+            .expect("catalog footprint graphics must exist");
+        assert_eq!(graphics.silkscreen_lines.len(), 2);
+        assert_eq!(graphics.courtyard_start, PointNm::new(-1_700_000, -750_000));
+        assert_eq!(graphics.courtyard_end, PointNm::new(1_700_000, 750_000));
+        assert!(RESISTOR_FOOTPRINT_LIBRARY.contains("(layer \"F.CrtYd\")"));
+        assert!(RESISTOR_FOOTPRINT_LIBRARY.contains("(fp_line\n    (start -0.45 -0.5)"));
         assert!(
             SYMBOL_LIBRARY
                 .contains("(pin passive line\n        (at 0 3.81 270)\n        (length 1.27)")

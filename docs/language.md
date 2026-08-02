@@ -141,6 +141,11 @@ path rather than the `/tmp` symlink.
 - `2`: invalid invocation or unsupported option; and
 - `3`: input or output I/O failure.
 
+Once every artifact has been published, failure to remove backup staging does
+not misreport publication as failed: the CLI emits `CC-CLI-IO-003`, names the
+cleanup residue, and exits successfully. Failures before complete publication
+still roll back and exit `3` with `CC-CLI-IO-002`.
+
 Human diagnostics are the default. JSON diagnostics contain stable codes, the
 requested filename, UTF-8 byte spans, one-based line and column, semantic path
 when available, deterministic messages, and related locations for duplicates.

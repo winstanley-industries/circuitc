@@ -93,6 +93,74 @@ mod tests {
     }
 
     #[test]
+    fn schematic_connectivity_labels_cover_every_connected_symbol_pin() {
+        let design = voltage_divider();
+        let connected_pin_count = design
+            .components
+            .iter()
+            .flat_map(|component| &component.connections)
+            .filter(|connection| matches!(connection.state, ConnectionState::Connected(_)))
+            .count();
+        let artifacts = compile(&design).expect("reference design must compile");
+        let label_count = artifacts
+            .kicad_schematic
+            .lines()
+            .filter(|line| line.trim_start().starts_with("(global_label "))
+            .count();
+
+        assert_eq!(label_count, connected_pin_count);
+        for net in ["VIN", "VOUT", "GND"] {
+            assert!(
+                artifacts
+                    .kicad_schematic
+                    .contains(&format!("  (global_label \"{net}\"")),
+                "missing schematic label for {net}"
+            );
+        }
+        assert!(global_label_at(
+            &artifacts.kicad_schematic,
+            "VIN",
+            "81.28 77.47"
+        ));
+    }
+
+    #[test]
+    fn schematic_pin_coordinates_cover_every_orthogonal_rotation() {
+        for (rotation, no_connect_at, connected_at) in [
+            (90, "85.09 81.28", "77.47 81.28"),
+            (180, "81.28 85.09", "81.28 77.47"),
+            (270, "77.47 81.28", "85.09 81.28"),
+        ] {
+            let mut design = voltage_divider();
+            let component = design
+                .components
+                .iter_mut()
+                .find(|component| component.reference == "R1")
+                .expect("reference resistor exists");
+            component.simulation = None;
+            component.schematic_placement.rotation_degrees = rotation;
+            component
+                .connections
+                .iter_mut()
+                .find(|connection| connection.pin == "1")
+                .expect("pin 1 connection exists")
+                .state = ConnectionState::NoConnect;
+
+            let artifacts = compile(&design).expect("orthogonally rotated design must compile");
+            assert!(
+                artifacts
+                    .kicad_schematic
+                    .contains(&format!("  (no_connect (at {no_connect_at})")),
+                "rotation {rotation} emitted the wrong no-connect coordinate"
+            );
+            assert!(
+                global_label_at(&artifacts.kicad_schematic, "VOUT", connected_at),
+                "rotation {rotation} emitted the wrong connected-pin coordinate"
+            );
+        }
+    }
+
+    #[test]
     fn declaration_permutations_do_not_change_artifacts() {
         let design = voltage_divider();
         let expected = compile(&design).expect("reference design must compile");
@@ -252,6 +320,29 @@ mod tests {
         );
 
         let mut design = voltage_divider();
+        design.components[0].symbol.pins[0].electrical_type =
+            crate::design::ElectricalPinType::PowerOutput;
+        let diagnostics = compile(&design)
+            .expect_err("catalog electrical-type drift must fail")
+            .diagnostics;
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CC-KICAD-SYMBOL-002")
+        );
+
+        let mut design = voltage_divider();
+        design.components[0].symbol.pins[0].symbol_pin = "3".to_owned();
+        let diagnostics = compile(&design)
+            .expect_err("missing catalog pin binding must fail")
+            .diagnostics;
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CC-KICAD-SYMBOL-003")
+        );
+
+        let mut design = voltage_divider();
         let physical = design.components[0]
             .physical
             .as_mut()
@@ -400,5 +491,11 @@ mod tests {
             .nth(1)
             .and_then(|segment| board_uuids(segment).into_iter().next())
             .expect("board must contain a routed segment UUID")
+    }
+
+    fn global_label_at(schematic: &str, net: &str, coordinates: &str) -> bool {
+        schematic.contains(&format!(
+            "  (global_label \"{net}\"\n    (shape bidirectional)\n    (at {coordinates} 0)"
+        ))
     }
 }

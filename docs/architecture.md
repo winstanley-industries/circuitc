@@ -119,6 +119,11 @@ identity manifest maps emitted KiCad UUIDs back to CircuitC semantic paths and
 source spans. KiCad objects and library display names remain backend artifacts,
 not canonical compiler intent.
 
+Vendored footprint silkscreen and courtyard drawings are backend catalog data,
+not canonical physical intent. KiCad lowering copies them into each board
+footprint with design-derived identities so courtyard-dependent host DRC is an
+active acceptance check rather than a vacuous policy entry.
+
 The bootstrap KiCad catalog supports only parts whose symbol pin numbers equal
 their corresponding footprint pad numbers. The canonical IR keeps the two
 bindings explicit and independent; the KiCad backend rejects cross-mapped

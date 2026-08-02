@@ -37,6 +37,10 @@ derived from canonical intent.
 - One compile emits an isolated KiCad bundle: schematic, board, project JSON,
   local library tables, and the exact vendored symbol and footprint files.
   Library tables use `${KIPRJMOD}` paths and never refer to user-global tables.
+- Vendored footprint silkscreen and courtyard drawings remain KiCad catalog
+  data outside canonical Design IR. Board lowering copies those drawings with
+  deterministic per-component UUIDs so courtyard-overlap DRC is active for the
+  bootstrap catalog.
 - Schematic symbols and PCB footprints share a deterministically derived
   semantic identity. The PCB path points at the schematic symbol UUID so
   KiCad's schematic-parity check owns acceptance.

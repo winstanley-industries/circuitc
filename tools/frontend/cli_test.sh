@@ -8,6 +8,7 @@ invalid_fixture="$3"
 golden_diagnostic="$4"
 rust_generator="$5"
 equivalence="$6"
+project_validator="$7"
 
 first_dir="${TEST_TMPDIR}/first"
 second_dir="${TEST_TMPDIR}/second"
@@ -36,6 +37,12 @@ done
 cmp \
   "${first_dir}/voltage_divider.kicad-map.json" \
   "${second_dir}/voltage_divider.kicad-map.json"
+"${project_validator}" \
+  --project "${first_dir}/voltage_divider.kicad_pro" \
+  --expected-filename voltage_divider.kicad_pro \
+  --normalized "${TEST_TMPDIR}/voltage_divider.project.normalized.json"
+grep -F "\${KIPRJMOD}/CircuitC.kicad_sym" "${first_dir}/sym-lib-table"
+grep -F "\${KIPRJMOD}/CircuitC.pretty" "${first_dir}/fp-lib-table"
 "${equivalence}" "${source_fixture}"
 
 set +e

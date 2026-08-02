@@ -82,11 +82,13 @@ sh_test(
         "$(location tools/frontend/fixtures/duplicate_net.json)",
         "$(location :voltage_divider)",
         "$(location :frontend_equivalence)",
+        "$(location tools/kicad/validate_project.py)",
     ],
     data = [
         "examples/voltage_divider.circuitc",
         "tools/frontend/fixtures/duplicate_net.circuitc",
         "tools/frontend/fixtures/duplicate_net.json",
+        "tools/kicad/validate_project.py",
         ":frontend_equivalence",
         ":voltage_divider",
         "//cmd/circuitc",

@@ -85,13 +85,19 @@ fn run(arguments: Vec<OsString>) -> Result<(), u8> {
         ),
         (format!("{stem}.spice"), compiled.artifacts.spice.as_bytes()),
     ];
-    write_outputs(&output_directory, &outputs).map_err(|error| {
+    let write_outcome = write_outputs(&output_directory, &outputs).map_err(|error| {
         eprintln!(
             "CC-CLI-IO-002: failed to write output directory {}: {error}",
             output_directory.display()
         );
         EXIT_IO
     })?;
+    if let Some(error) = write_outcome.cleanup_warning {
+        eprintln!(
+            "CC-CLI-IO-003: output publication to {} succeeded, but backup staging cleanup was incomplete: {error}",
+            output_directory.display()
+        );
+    }
     for (filename, _) in outputs {
         println!("wrote {}", output_directory.join(filename).display());
     }
@@ -179,7 +185,15 @@ fn invocation_error<T>(message: &str) -> Result<T, u8> {
     Err(EXIT_INVOCATION)
 }
 
-fn write_outputs(output_directory: &Path, outputs: &[(String, &[u8])]) -> std::io::Result<()> {
+#[derive(Debug)]
+struct WriteOutcome {
+    cleanup_warning: Option<io::Error>,
+}
+
+fn write_outputs(
+    output_directory: &Path,
+    outputs: &[(String, &[u8])],
+) -> std::io::Result<WriteOutcome> {
     #[cfg(any(
         all(
             target_os = "linux",
@@ -442,19 +456,21 @@ mod anchored_output {
     pub(super) fn write_outputs(
         output_directory: &Path,
         outputs: &[(String, &[u8])],
-    ) -> io::Result<()> {
-        write_outputs_with_hooks(output_directory, outputs, || Ok(()), |_| Ok(()))
+    ) -> io::Result<super::WriteOutcome> {
+        write_outputs_with_hooks(output_directory, outputs, || Ok(()), |_| Ok(()), || Ok(()))
     }
 
-    fn write_outputs_with_hooks<F, G>(
+    fn write_outputs_with_hooks<F, G, H>(
         output_directory: &Path,
         outputs: &[(String, &[u8])],
         pre_anchor_hook: F,
         mut before_publish_hook: G,
-    ) -> io::Result<()>
+        after_publication_hook: H,
+    ) -> io::Result<super::WriteOutcome>
     where
         F: FnOnce() -> io::Result<()>,
         G: FnMut(usize) -> io::Result<()>,
+        H: FnOnce() -> io::Result<()>,
     {
         let relative_paths: Vec<_> = outputs
             .iter()
@@ -654,7 +670,13 @@ mod anchored_output {
             }
             published.push(index);
         }
-        cleanup_backups(&entries, &backed_up)
+        let hook_result = after_publication_hook();
+        let cleanup_result = cleanup_backups(&entries, &backed_up);
+        let cleanup_warning = match hook_result {
+            Ok(()) => cleanup_result.err(),
+            Err(error) => Some(with_cleanup_error(error, cleanup_result)),
+        };
+        Ok(super::WriteOutcome { cleanup_warning })
     }
 
     fn prepare_output_directory(
@@ -979,11 +1001,11 @@ mod anchored_output {
         output_directory: &Path,
         outputs: &[(String, &[u8])],
         hook: F,
-    ) -> io::Result<()>
+    ) -> io::Result<super::WriteOutcome>
     where
         F: FnOnce() -> io::Result<()>,
     {
-        write_outputs_with_hooks(output_directory, outputs, hook, |_| Ok(()))
+        write_outputs_with_hooks(output_directory, outputs, hook, |_| Ok(()), || Ok(()))
     }
 
     #[cfg(test)]
@@ -991,11 +1013,23 @@ mod anchored_output {
         output_directory: &Path,
         outputs: &[(String, &[u8])],
         hook: F,
-    ) -> io::Result<()>
+    ) -> io::Result<super::WriteOutcome>
     where
         F: FnMut(usize) -> io::Result<()>,
     {
-        write_outputs_with_hooks(output_directory, outputs, || Ok(()), hook)
+        write_outputs_with_hooks(output_directory, outputs, || Ok(()), hook, || Ok(()))
+    }
+
+    #[cfg(test)]
+    pub(super) fn write_outputs_after_publication_hook<F>(
+        output_directory: &Path,
+        outputs: &[(String, &[u8])],
+        hook: F,
+    ) -> io::Result<super::WriteOutcome>
+    where
+        F: FnOnce() -> io::Result<()>,
+    {
+        write_outputs_with_hooks(output_directory, outputs, || Ok(()), |_| Ok(()), hook)
     }
 }
 
@@ -1207,6 +1241,53 @@ mod tests {
             1,
             "successful publication must remove temporary and backup entries"
         );
+        fs::remove_dir_all(&scratch).expect("remove test scratch directory");
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+    ))]
+    #[test]
+    fn successful_publication_reports_backup_cleanup_failure_as_a_warning() {
+        use std::fs;
+
+        let scratch = scratch_directory("cleanup-warning");
+        let output = scratch.join("output");
+        fs::create_dir(&output).expect("create output directory");
+        fs::write(output.join("result.txt"), b"old").expect("write existing output");
+        let outputs = [("result.txt".to_owned(), b"new".as_slice())];
+        let backup = output.join(format!(".result.txt.backup-{}", std::process::id()));
+
+        let outcome =
+            super::anchored_output::write_outputs_after_publication_hook(&output, &outputs, || {
+                fs::remove_file(&backup)?;
+                fs::create_dir(&backup)
+            })
+            .expect("publication must succeed even when backup cleanup later fails");
+
+        let warning = outcome
+            .cleanup_warning
+            .expect("cleanup failure must remain visible to the caller");
+        assert!(
+            warning.to_string().contains("remove backup for result.txt"),
+            "unexpected cleanup warning: {warning}"
+        );
+        assert_eq!(
+            fs::read(output.join("result.txt")).expect("read published output"),
+            b"new"
+        );
+        assert!(
+            backup.is_dir(),
+            "injected staging residue must be observable"
+        );
+        fs::remove_dir(&backup).expect("remove injected backup directory");
         fs::remove_dir_all(&scratch).expect("remove test scratch directory");
     }
 

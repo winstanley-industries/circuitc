@@ -421,12 +421,12 @@ impl Design {
                 ),
             );
         }
-        if !token_is_valid(&self.name) {
+        if !artifact_name_is_valid(&self.name) {
             push(
                 &mut diagnostics,
                 "CC-IR-002",
                 "design.name",
-                "design name must be a non-empty canonical token",
+                "design name must be a safe single-file artifact stem starting with an ASCII letter or underscore and containing only ASCII letters, digits, `_`, or `-`",
             );
         }
         validate_outline(self.board.outline, &mut diagnostics);
@@ -1331,6 +1331,16 @@ fn token_is_valid(value: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || "_+-./".contains(character))
 }
 
+pub(crate) fn artifact_name_is_valid(value: &str) -> bool {
+    value
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+}
+
 fn semantic_path_is_valid(value: &str) -> bool {
     !value.is_empty()
         && value.split('.').all(token_is_valid)
@@ -1361,6 +1371,16 @@ mod tests {
 
     fn has_code(diagnostics: &[super::Diagnostic], code: &str) -> bool {
         diagnostics.iter().any(|diagnostic| diagnostic.code == code)
+    }
+
+    fn assert_rejected(design: super::Design, code: &str) {
+        let diagnostics = design
+            .validate()
+            .expect_err("mutated Design IR must be rejected");
+        assert!(
+            has_code(&diagnostics, code),
+            "missing diagnostic {code}: {diagnostics:#?}"
+        );
     }
 
     #[test]
@@ -1426,6 +1446,142 @@ mod tests {
             ConnectionState::Connected("MISSING".to_owned());
         let diagnostics = design.validate().expect_err("invalid net must be rejected");
         assert!(has_code(&diagnostics, "CC-PIN-004"));
+    }
+
+    #[test]
+    fn design_name_is_a_safe_single_file_artifact_stem() {
+        for name in ["", "+divider", "divider/rev_a", "divider.rev_a"] {
+            let mut design = voltage_divider();
+            design.name = name.to_owned();
+            assert_rejected(design, "CC-IR-002");
+        }
+    }
+
+    #[test]
+    fn validates_module_and_port_contracts_for_public_ir_consumers() {
+        let mut design = voltage_divider();
+        design.modules.clear();
+        assert_rejected(design, "CC-MODULE-001");
+
+        let mut design = voltage_divider();
+        design.modules[0].path = ".invalid".to_owned();
+        assert_rejected(design, "CC-MODULE-002");
+
+        let mut design = voltage_divider();
+        design.modules.push(design.modules[0].clone());
+        assert_rejected(design, "CC-MODULE-003");
+
+        let mut design = voltage_divider();
+        design.modules.push(super::ModuleInstance {
+            path: "orphan.child".to_owned(),
+            ports: Vec::new(),
+        });
+        assert_rejected(design, "CC-MODULE-004");
+
+        let mut design = voltage_divider();
+        design.modules[0].ports[0].name = "bad name".to_owned();
+        assert_rejected(design, "CC-PORT-001");
+
+        let mut design = voltage_divider();
+        let duplicate = design.modules[0].ports[0].clone();
+        design.modules[0].ports.push(duplicate);
+        assert_rejected(design, "CC-PORT-002");
+
+        let mut design = voltage_divider();
+        design.modules[0].ports[0].state = ConnectionState::Connected("MISSING".to_owned());
+        assert_rejected(design, "CC-PORT-003");
+    }
+
+    #[test]
+    fn validates_component_part_and_symbol_contracts_for_public_ir_consumers() {
+        let mut design = voltage_divider();
+        design.components[0].module_path = "divider.analysis".to_owned();
+        assert_rejected(design, "CC-COMP-006");
+
+        let mut design = voltage_divider();
+        design.components[0].path = "missing.r_top".to_owned();
+        design.components[0].module_path = "missing".to_owned();
+        assert_rejected(design, "CC-COMP-007");
+
+        let mut design = voltage_divider();
+        design.components[0].part.manufacturer = None;
+        design.components[0].part.manufacturer_part_number = None;
+        assert_rejected(design, "CC-PART-002");
+
+        let mut design = voltage_divider();
+        design.components[0].part.manufacturer_part_number = None;
+        assert_rejected(design, "CC-PART-003");
+
+        let mut design = voltage_divider();
+        design.components[0].symbol.library_id.clear();
+        assert_rejected(design, "CC-SYMBOL-001");
+
+        let mut design = voltage_divider();
+        design.components[0].symbol.pins.clear();
+        assert_rejected(design, "CC-SYMBOL-002");
+
+        let mut design = voltage_divider();
+        design.components[0].symbol.pins[0].pin = "bad pin".to_owned();
+        assert_rejected(design, "CC-SYMBOL-003");
+
+        let mut design = voltage_divider();
+        let duplicate = design.components[0].symbol.pins[0].pin.clone();
+        design.components[0].symbol.pins[1].pin = duplicate;
+        assert_rejected(design, "CC-SYMBOL-004");
+
+        let mut design = voltage_divider();
+        let duplicate = design.components[0].symbol.pins[0].symbol_pin.clone();
+        design.components[0].symbol.pins[1].symbol_pin = duplicate;
+        assert_rejected(design, "CC-SYMBOL-005");
+    }
+
+    #[test]
+    fn validates_schematic_connection_value_and_model_contracts_for_public_ir_consumers() {
+        let mut design = voltage_divider();
+        design.components[0].schematic_placement.rotation_degrees = 45;
+        assert_rejected(design, "CC-SCHEMATIC-001");
+
+        let mut design = voltage_divider();
+        design.components[0].schematic_placement.position.x = MAX_ABS_COORDINATE_NM + 1;
+        assert_rejected(design, "CC-SCHEMATIC-002");
+
+        let mut design = voltage_divider();
+        design.components[0].connections.pop();
+        assert_rejected(design, "CC-PIN-005");
+
+        let mut design = voltage_divider();
+        design.components[0].value = ComponentValue::Resistance(crate::quantity::Quantity::new(
+            -1,
+            0,
+            crate::quantity::Unit::Ohm,
+        ));
+        assert_rejected(design, "CC-VALUE-004");
+
+        let mut design = voltage_divider();
+        let voltage_source = design
+            .components
+            .iter_mut()
+            .find(|component| component.reference == "V1")
+            .expect("reference voltage source exists");
+        voltage_source.value = ComponentValue::DcVoltage(crate::quantity::Quantity::new(
+            10,
+            0,
+            crate::quantity::Unit::Ohm,
+        ));
+        assert_rejected(design, "CC-VALUE-005");
+
+        let mut design = voltage_divider();
+        match design.components[0]
+            .simulation
+            .as_mut()
+            .expect("reference resistor is simulated")
+        {
+            super::SimulationModel::Resistor { model_id, .. } => {
+                *model_id = "spice:unknown".to_owned();
+            }
+            super::SimulationModel::DcVoltageSource { .. } => unreachable!(),
+        }
+        assert_rejected(design, "CC-SIM-010");
     }
 
     #[test]
