@@ -38,7 +38,10 @@ derived from canonical intent.
   local library tables, and the exact vendored symbol and footprint files.
   The library-file collection is ordered and derived from the catalog entries
   used by the design rather than represented by fixed singleton fields.
-  Library tables use `${KIPRJMOD}` paths and never refer to user-global tables.
+  Catalog file definitions carry a typed symbol/footprint kind, table nickname,
+  and table-relative path, so table emission cannot silently drop a file based
+  on filename parsing. Library tables use `${KIPRJMOD}` paths and never refer
+  to user-global tables.
 - Vendored footprint silkscreen and courtyard drawings remain KiCad catalog
   data outside canonical Design IR. Board lowering copies those drawings with
   deterministic per-component UUIDs so courtyard-overlap DRC is active for the
@@ -69,8 +72,8 @@ derived from canonical intent.
 ## Consequences
 
 - Adding a supported library part requires a reviewed vendored asset plus a
-  matching catalog entry, drawing geometry, publishable-file mapping, and
-  ingestion tests.
+  matching catalog entry, drawing geometry, typed table metadata,
+  publishable-file mapping, and ingestion tests.
 - Display names and library file order do not participate in canonical entity
   identity.
 - KiCad-specific symbol geometry remains outside Design IR; only the explicit

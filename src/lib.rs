@@ -15,5 +15,7 @@ mod library;
 pub mod quantity;
 mod spice;
 
-pub use compile::{CompileError, CompiledArtifacts, KicadIdentity, KicadLibraryFile, compile};
+pub use compile::{
+    CompileError, CompiledArtifacts, KicadIdentity, KicadLibraryFile, KicadLibraryFileKind, compile,
+};
 pub use spice::{SpiceComponentNameMapping, SpiceNameMap, SpiceNetNameMapping};

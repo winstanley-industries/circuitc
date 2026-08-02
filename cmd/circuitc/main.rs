@@ -1063,10 +1063,9 @@ mod anchored_output {
                 ),
             )
         } else {
-            operation_error(
-                &format!("{operation} with no-replace rename"),
-                display_path,
-                error,
+            io::Error::new(
+                error.kind(),
+                format!("failed to {operation} {display_path} with no-replace rename: {error}"),
             )
         }
     }
@@ -1410,6 +1409,52 @@ mod tests {
                 .count(),
             1,
             "successful publication must remove temporary and backup entries"
+        );
+        fs::remove_dir_all(&scratch).expect("remove test scratch directory");
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+    ))]
+    #[test]
+    fn no_replace_publication_preserves_a_racing_destination() {
+        use std::fs;
+
+        let scratch = scratch_directory("no-replace-race");
+        let output = scratch.join("output");
+        fs::create_dir(&output).expect("create output directory");
+        let outputs = [("result.txt".to_owned(), b"generated".as_slice())];
+        let sentinel = b"racing writer";
+
+        let error =
+            super::anchored_output::write_outputs_before_publish_hook(&output, &outputs, |index| {
+                assert_eq!(index, 0);
+                fs::write(output.join("result.txt"), sentinel)
+            })
+            .expect_err("no-replace publication must reject a racing destination");
+
+        assert!(
+            error.to_string().contains("publish result.txt"),
+            "unexpected no-replace error: {error}"
+        );
+        assert_eq!(
+            fs::read(output.join("result.txt")).expect("read racing destination"),
+            sentinel,
+            "publication must not clobber the racing writer"
+        );
+        assert_eq!(
+            fs::read_dir(&output)
+                .expect("list output directory")
+                .count(),
+            1,
+            "failed no-replace publication must remove its staging entry"
         );
         fs::remove_dir_all(&scratch).expect("remove test scratch directory");
     }

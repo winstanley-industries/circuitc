@@ -11,9 +11,18 @@ pub struct KicadIdentity {
     pub semantic_path: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum KicadLibraryFileKind {
+    Symbol,
+    Footprint,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KicadLibraryFile {
+    pub kind: KicadLibraryFileKind,
+    pub nickname: String,
     pub relative_path: String,
+    pub table_relative_path: String,
     pub contents: String,
 }
 
@@ -80,18 +89,21 @@ fn kicad_library_files(design: &Design) -> Vec<KicadLibraryFile> {
     for component in &design.components {
         let symbol = crate::library::symbol_library_file(&component.symbol.library_id)
             .expect("validated catalog symbol must have a publishable library file");
-        files.insert(symbol.relative_path, symbol.contents);
+        files.insert(symbol.relative_path, symbol);
         if let Some(physical) = &component.physical {
             let footprint = crate::library::footprint_library_file(&physical.footprint.library_id)
                 .expect("validated catalog footprint must have a publishable library file");
-            files.insert(footprint.relative_path, footprint.contents);
+            files.insert(footprint.relative_path, footprint);
         }
     }
     files
         .into_iter()
-        .map(|(relative_path, contents)| KicadLibraryFile {
+        .map(|(relative_path, definition)| KicadLibraryFile {
+            kind: definition.kind,
+            nickname: definition.nickname.to_owned(),
             relative_path: relative_path.to_owned(),
-            contents: contents.to_owned(),
+            table_relative_path: definition.table_relative_path.to_owned(),
+            contents: definition.contents.to_owned(),
         })
         .collect()
 }
@@ -157,6 +169,61 @@ mod tests {
             embedded.matches("(pin passive line").count() >= 2,
             "embedded resistor definition must retain both catalog pins"
         );
+    }
+
+    #[test]
+    fn board_footprint_graphics_match_catalog_geometry_and_identity_map() {
+        let artifacts = compile(&voltage_divider()).expect("reference design must compile");
+        let footprint = balanced_block(
+            &artifacts.kicad_pcb,
+            "  (footprint \"CircuitC:R_0603_1608Metric\"",
+        );
+        for (semantic_path, marker, required) in [
+            (
+                "divider.r_top.footprint.graphic.silkscreen.top",
+                "    (fp_line\n      (start -0.45 -0.5)",
+                [
+                    "(end 0.45 -0.5)",
+                    "(stroke (width 0.12) (type default))",
+                    "(layer \"F.SilkS\")",
+                ],
+            ),
+            (
+                "divider.r_top.footprint.graphic.silkscreen.bottom",
+                "    (fp_line\n      (start -0.45 0.5)",
+                [
+                    "(end 0.45 0.5)",
+                    "(stroke (width 0.12) (type default))",
+                    "(layer \"F.SilkS\")",
+                ],
+            ),
+            (
+                "divider.r_top.footprint.graphic.courtyard",
+                "    (fp_rect\n      (start -1.7 -0.75)",
+                [
+                    "(end 1.7 0.75)",
+                    "(stroke (width 0.05) (type default))",
+                    "(layer \"F.CrtYd\")",
+                ],
+            ),
+        ] {
+            let graphic = balanced_block(footprint, marker);
+            for expected in required {
+                assert!(
+                    graphic.contains(expected),
+                    "{semantic_path} is missing {expected}: {graphic}"
+                );
+            }
+            let identity = artifacts
+                .kicad_identities
+                .iter()
+                .find(|identity| identity.semantic_path == semantic_path)
+                .unwrap_or_else(|| panic!("missing identity {semantic_path}"));
+            assert!(
+                graphic.contains(&format!("(uuid \"{}\")", identity.uuid)),
+                "{semantic_path} graphic and identity UUID diverged: {graphic}"
+            );
+        }
     }
 
     #[test]

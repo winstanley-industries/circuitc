@@ -116,8 +116,11 @@ generator. The M1B slice emits an isolated KiCad 10 schematic, PCB, project,
 local library tables, and the vendored symbol and footprint resources needed by
 the design. The compiler derives an ordered library-file set from the symbols
 and footprints actually selected by the design, so catalog growth remains
-additive and cannot silently omit a new footprint asset. Library bindings,
-library files, and footprint drawing geometry are resolved before emission.
+additive and cannot silently omit a new footprint asset. Each file carries an
+explicit library kind, table nickname, and table-relative path from the catalog
+to the table emitter; file-name parsing never decides whether an asset appears
+in a generated table. Library bindings, library files, and footprint drawing
+geometry are resolved before emission.
 A deterministic identity manifest maps emitted KiCad UUIDs back to CircuitC
 semantic paths and source spans. KiCad objects and library display names remain
 backend artifacts, not canonical compiler intent.

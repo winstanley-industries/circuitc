@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use crate::compile::{KicadIdentity, KicadLibraryFile};
+use crate::compile::{KicadIdentity, KicadLibraryFile, KicadLibraryFileKind};
 use crate::design::{
     Component, ConnectionState, CopperLayer, Design, Diagnostic, PadShape, PointNm,
 };
@@ -42,16 +42,18 @@ pub(crate) fn emit_project(
 
 fn emit_symbol_table(library_files: &[KicadLibraryFile]) -> String {
     let mut output = String::from("(sym_lib_table\n  (version 7)\n");
-    for file in library_files {
-        let Some(name) = file.relative_path.strip_suffix(".kicad_sym") else {
-            continue;
-        };
+    let symbol_libraries: BTreeSet<_> = library_files
+        .iter()
+        .filter(|file| file.kind == KicadLibraryFileKind::Symbol)
+        .map(|file| (file.nickname.as_str(), file.table_relative_path.as_str()))
+        .collect();
+    for (nickname, table_relative_path) in symbol_libraries {
         writeln!(
             output,
             "  (lib (name {})(type \"KiCad\")(uri {})(options \"\")(descr {}))",
-            quoted(name.rsplit('/').next().unwrap_or(name)),
-            quoted(&format!("${{KIPRJMOD}}/{}", file.relative_path)),
-            quoted(&format!("{name} vendored symbols"))
+            quoted(nickname),
+            quoted(&format!("${{KIPRJMOD}}/{table_relative_path}")),
+            quoted(&format!("{nickname} vendored symbols"))
         )
         .unwrap();
     }
@@ -61,29 +63,18 @@ fn emit_symbol_table(library_files: &[KicadLibraryFile]) -> String {
 
 fn emit_footprint_table(library_files: &[KicadLibraryFile]) -> String {
     let mut output = String::from("(fp_lib_table\n  (version 7)\n");
-    let footprint_directories: BTreeSet<_> = library_files
+    let footprint_libraries: BTreeSet<_> = library_files
         .iter()
-        .filter_map(|file| {
-            file.relative_path
-                .rsplit_once('/')
-                .map(|(parent, _)| parent)
-        })
-        .filter(|parent| parent.ends_with(".pretty"))
+        .filter(|file| file.kind == KicadLibraryFileKind::Footprint)
+        .map(|file| (file.nickname.as_str(), file.table_relative_path.as_str()))
         .collect();
-    for directory in footprint_directories {
-        let Some(name) = directory
-            .rsplit('/')
-            .next()
-            .and_then(|basename| basename.strip_suffix(".pretty"))
-        else {
-            continue;
-        };
+    for (nickname, directory) in footprint_libraries {
         writeln!(
             output,
             "  (lib (name {})(type \"KiCad\")(uri {})(options \"\")(descr {}))",
-            quoted(name),
+            quoted(nickname),
             quoted(&format!("${{KIPRJMOD}}/{directory}")),
-            quoted(&format!("{name} vendored footprints"))
+            quoted(&format!("{nickname} vendored footprints"))
         )
         .unwrap();
     }

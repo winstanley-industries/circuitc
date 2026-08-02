@@ -22,6 +22,7 @@ pub struct ProvenanceMap {
     pub source_name: String,
     semantic_spans: BTreeMap<SemanticProvenanceKey, Span>,
     rendered_semantic_spans: BTreeMap<String, Option<Span>>,
+    identity_owner_spans: BTreeMap<String, Option<Span>>,
     structural_spans: BTreeMap<String, Span>,
 }
 
@@ -62,7 +63,7 @@ impl ProvenanceMap {
     pub(crate) fn span_for_identity(&self, semantic_path: &str) -> Option<Span> {
         let mut candidate = semantic_path;
         loop {
-            if let Some(span) = self.rendered_semantic_spans.get(candidate) {
+            if let Some(span) = self.identity_owner_spans.get(candidate) {
                 return *span;
             }
             let Some((parent, _)) = candidate.rsplit_once('.') else {
@@ -104,9 +105,15 @@ impl ProvenanceMap {
     fn insert_semantic(&mut self, key: SemanticProvenanceKey, span: Span) {
         let rendered = key.rendered_path();
         self.rendered_semantic_spans
-            .entry(rendered)
+            .entry(rendered.clone())
             .and_modify(|existing| *existing = None)
             .or_insert(Some(span));
+        if !matches!(&key, SemanticProvenanceKey::Route(_)) {
+            self.identity_owner_spans
+                .entry(rendered)
+                .and_modify(|existing| *existing = None)
+                .or_insert(Some(span));
+        }
         self.semantic_spans.insert(key, span);
     }
 
@@ -141,6 +148,7 @@ pub(crate) fn elaborate(tree: &SyntaxTree) -> Result<ElaboratedDesign, Vec<Sourc
         source_name: source.name.clone(),
         semantic_spans: BTreeMap::new(),
         rendered_semantic_spans: BTreeMap::new(),
+        identity_owner_spans: BTreeMap::new(),
         structural_spans: BTreeMap::new(),
     };
     provenance.insert_structural("design", tree.design.span);
@@ -429,6 +437,7 @@ pub(crate) fn map_ir_diagnostics(
                     .get(&diagnostic.path)
                     .copied()
                     .or(semantic_span)
+                    .or_else(|| provenance.span_for_identity(&diagnostic.path))
             } else {
                 semantic_span.or_else(|| provenance.best_structural_span(&diagnostic.path))
             }
@@ -1952,6 +1961,7 @@ mod tests {
             source_name: "large.circuitc".to_owned(),
             semantic_spans: std::collections::BTreeMap::new(),
             rendered_semantic_spans: std::collections::BTreeMap::new(),
+            identity_owner_spans: std::collections::BTreeMap::new(),
             structural_spans: std::collections::BTreeMap::new(),
         };
         for index in 0..4096 {
@@ -1971,6 +1981,72 @@ mod tests {
                 Some(index)
             );
         }
+    }
+
+    #[test]
+    fn generated_identity_provenance_ignores_route_prefixes() {
+        let source = REFERENCE.replacen(
+            "route board.routes.vout_bridge",
+            "route divider.r_top.symbol",
+            1,
+        );
+        let compiled = crate::frontend::compile_source("route-prefix.circuitc", &source)
+            .expect("a route that is only a prefix of an identity may compile");
+        let component_start = source
+            .find("resistor divider.r_top")
+            .expect("component declaration exists");
+        let route_start = source
+            .find("route divider.r_top.symbol")
+            .expect("route declaration exists");
+        let semantic_path = "divider.r_top.symbol.pin.1";
+        let span = compiled
+            .elaborated
+            .provenance
+            .span_for_identity(semantic_path)
+            .expect("derived symbol-pin identity must resolve to its component");
+        assert_eq!(span.start, component_start);
+        assert_ne!(span.start, route_start);
+
+        let marker = format!("\"semantic_path\": \"{semantic_path}\"");
+        let identity = compiled
+            .kicad_identity_map
+            .split(&marker)
+            .nth(1)
+            .and_then(|tail| tail.split("\n    }").next())
+            .expect("identity-map entry must exist");
+        assert!(
+            identity.contains(&format!("\"location\": {{\"start\": {component_start},")),
+            "identity map attributed {semantic_path} to the wrong owner: {identity}"
+        );
+    }
+
+    #[test]
+    fn kicad_connection_diagnostics_map_to_the_owning_component() {
+        let source = REFERENCE
+            .replacen(
+                "schematic at (101.6 mm, 81.28 mm)",
+                "schematic at (81.28 mm, 88.9 mm)",
+                1,
+            )
+            .replacen("connect 1 VOUT;", "connect 1 GND;", 1);
+        let component_start = source
+            .find("resistor divider.r_top")
+            .expect("colliding component declaration exists");
+        let diagnostic = crate::frontend::compile_source("collision.circuitc", &source)
+            .expect_err("different connections at one schematic point must fail")
+            .into_iter()
+            .find(|diagnostic| diagnostic.code == "CC-KICAD-SCHEMATIC-002")
+            .expect("schematic collision diagnostic must exist");
+        assert_eq!(
+            diagnostic.semantic_path.as_deref(),
+            Some("divider.r_top.connection.2")
+        );
+        assert_eq!(diagnostic.start, component_start);
+        assert_ne!(diagnostic.start, 0);
+        assert_eq!(
+            &source[diagnostic.start..diagnostic.start + "resistor".len()],
+            "resistor"
+        );
     }
 
     #[test]
@@ -2009,6 +2085,62 @@ mod tests {
             connection.state,
             crate::design::ConnectionState::NoConnect
         )));
+    }
+
+    #[test]
+    fn ground_is_optional_only_when_every_component_is_physical_only() {
+        const PHYSICAL_ONLY: &str = r#"design physical_only {
+  net TEST;
+  module board_only {}
+
+  resistor board_only.unused R1 {
+    part "resistor" manufacturer "Yageo" number "RC0603FR-0710KL";
+    symbol "CircuitC:R" {
+      bind 1 1 passive;
+      bind 2 2 passive;
+    }
+    schematic at (81.28 mm, 81.28 mm) rotation 0 deg;
+    resistance 10 kohm;
+    connect 1 TEST;
+    no_connect 2;
+    footprint "CircuitC:R_0603_1608Metric" {
+      bind 1 1;
+      bind 2 2;
+    }
+  }
+
+  board {
+    rectangle at (0 mm, 0 mm) size (10 mm, 10 mm);
+    place R1 at (5 mm, 5 mm) rotation 0 deg layer front;
+  }
+}
+"#;
+
+        let compiled = crate::frontend::compile_source("physical_only.circuitc", PHYSICAL_ONLY)
+            .expect("a ground-less physical-only design must compile");
+        assert!(
+            compiled
+                .elaborated
+                .design
+                .nets
+                .iter()
+                .all(|net| !net.is_ground)
+        );
+        assert!(!compiled.artifacts.spice.contains("@circuitc-device"));
+
+        let simulated = PHYSICAL_ONLY.replacen(
+            "    schematic at",
+            "    model \"spice:R\";\n    terminals 1 2;\n    schematic at",
+            1,
+        );
+        let diagnostics = crate::frontend::compile_source("simulated.circuitc", simulated)
+            .expect_err("adding simulation restores the single-ground requirement");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CC-LANG-GROUND-001"),
+            "missing ground diagnostic: {diagnostics:#?}"
+        );
     }
 
     #[test]

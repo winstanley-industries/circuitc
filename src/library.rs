@@ -1,3 +1,4 @@
+use crate::KicadLibraryFileKind;
 use crate::design::{ElectricalPinType, Footprint, Pad, PadShape, PartIdentity, PointNm, SizeNm};
 
 pub(crate) const SYMBOL_LIBRARY: &str = include_str!("../libraries/CircuitC.kicad_sym");
@@ -6,7 +7,10 @@ pub(crate) const RESISTOR_FOOTPRINT_LIBRARY: &str =
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct LibraryFileDefinition {
+    pub kind: KicadLibraryFileKind,
+    pub nickname: &'static str,
     pub relative_path: &'static str,
+    pub table_relative_path: &'static str,
     pub contents: &'static str,
 }
 
@@ -114,7 +118,10 @@ pub(crate) fn symbol(library_id: &str) -> Option<SymbolDefinition> {
 
 pub(crate) fn symbol_library_file(library_id: &str) -> Option<LibraryFileDefinition> {
     symbol(library_id).map(|_| LibraryFileDefinition {
+        kind: KicadLibraryFileKind::Symbol,
+        nickname: "CircuitC",
         relative_path: "CircuitC.kicad_sym",
+        table_relative_path: "CircuitC.kicad_sym",
         contents: SYMBOL_LIBRARY,
     })
 }
@@ -173,7 +180,10 @@ fn footprint_catalog(library_id: &str) -> Option<FootprintCatalogDefinition> {
                 courtyard_width_nm: 50_000,
             },
             library_file: LibraryFileDefinition {
+                kind: KicadLibraryFileKind::Footprint,
+                nickname: "CircuitC",
                 relative_path: "CircuitC.pretty/R_0603_1608Metric.kicad_mod",
+                table_relative_path: "CircuitC.pretty",
                 contents: RESISTOR_FOOTPRINT_LIBRARY,
             },
         }),
@@ -262,20 +272,48 @@ mod tests {
 
     #[test]
     fn every_catalog_entry_has_a_publishable_library_file_and_footprint_graphics() {
+        let mut library_bindings = std::collections::BTreeMap::new();
         for library_id in ["CircuitC:R", "CircuitC:VDC"] {
             assert!(symbol(library_id).is_some());
             let file = symbol_library_file(library_id)
                 .expect("every catalog symbol must have a publishable library file");
+            assert_eq!(file.kind, crate::KicadLibraryFileKind::Symbol);
+            assert_eq!(file.nickname, "CircuitC");
             assert_eq!(file.relative_path, "CircuitC.kicad_sym");
+            assert_eq!(file.table_relative_path, file.relative_path);
             assert!(!file.contents.is_empty());
+            if let Some(first_path) =
+                library_bindings.insert((file.kind, file.nickname), file.table_relative_path)
+            {
+                assert_eq!(
+                    first_path, file.table_relative_path,
+                    "each symbol-library nickname must identify exactly one table path"
+                );
+            }
         }
         for library_id in ["CircuitC:R_0603_1608Metric"] {
             assert!(footprint(library_id).is_some());
             assert!(footprint_graphics(library_id).is_some());
             let file = footprint_library_file(library_id)
                 .expect("every catalog footprint must have a publishable library file");
+            assert_eq!(file.kind, crate::KicadLibraryFileKind::Footprint);
+            assert_eq!(file.nickname, "CircuitC");
             assert!(file.relative_path.ends_with(".kicad_mod"));
+            assert_eq!(file.table_relative_path, "CircuitC.pretty");
+            assert!(
+                file.relative_path
+                    .strip_prefix(file.table_relative_path)
+                    .is_some_and(|suffix| suffix.starts_with('/') && suffix.ends_with(".kicad_mod"))
+            );
             assert!(!file.contents.is_empty());
+            if let Some(first_path) =
+                library_bindings.insert((file.kind, file.nickname), file.table_relative_path)
+            {
+                assert_eq!(
+                    first_path, file.table_relative_path,
+                    "each footprint-library nickname must identify exactly one table path"
+                );
+            }
         }
     }
 
