@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "source": "voltage_divider.circuitc",
+  "identities": [
+    {
+      "uuid": "33333333-3333-8333-8333-333333333333",
+      "semantic_path": "board.routes.vout_bridge",
+      "location": {"start": 10, "end": 20, "line": 2, "column": 3}
+    }
+  ]
+}

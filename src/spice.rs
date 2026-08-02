@@ -74,28 +74,19 @@ pub(crate) fn lower_netlist(design: &Design) -> LoweredSpice {
             .simulation
             .as_ref()
             .expect("filtered simulation component must have a model");
-        let (positive_pin, negative_pin, value, kind) = match model {
+        let (positive_pin, negative_pin, kind) = match model {
             SimulationModel::Resistor {
-                resistance,
                 positive_pin,
                 negative_pin,
-            } => (
-                positive_pin.as_str(),
-                negative_pin.as_str(),
-                resistance.spice_literal(),
-                "",
-            ),
+                ..
+            } => (positive_pin.as_str(), negative_pin.as_str(), ""),
             SimulationModel::DcVoltageSource {
-                voltage,
                 positive_pin,
                 negative_pin,
-            } => (
-                positive_pin.as_str(),
-                negative_pin.as_str(),
-                voltage.spice_literal(),
-                " DC",
-            ),
+                ..
+            } => (positive_pin.as_str(), negative_pin.as_str(), " DC"),
         };
+        let value = component.value.quantity().spice_literal();
         let positive_net = component
             .net_for_pin(positive_pin)
             .expect("validated simulation pin must resolve");
@@ -258,6 +249,8 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use crate::demo::voltage_divider;
+    use crate::design::ComponentValue;
+    use crate::quantity::{Quantity, Unit};
 
     use super::lower_netlist;
 
@@ -266,6 +259,18 @@ mod tests {
         let lowered = lower_netlist(&voltage_divider());
         assert!(lowered.netlist.contains("R1 VIN VOUT 10e3"));
         assert!(lowered.netlist.contains("V1 VIN 0 DC 10"));
+    }
+
+    #[test]
+    fn simulator_lowering_reads_the_component_value() {
+        let mut design = voltage_divider();
+        design.components[0].value = ComponentValue::Resistance(Quantity::new(22, 3, Unit::Ohm));
+        design
+            .validate()
+            .expect("updated exact component value must remain valid");
+
+        let lowered = lower_netlist(&design);
+        assert!(lowered.netlist.contains("R1 VIN VOUT 22e3"));
     }
 
     #[test]
@@ -394,8 +399,21 @@ mod tests {
             .iter_mut()
             .flat_map(|component| &mut component.connections)
         {
-            if connection.net == old {
-                connection.net = new.to_owned();
+            if let crate::design::ConnectionState::Connected(net) = &mut connection.state
+                && net == old
+            {
+                *net = new.to_owned();
+            }
+        }
+        for port in design
+            .modules
+            .iter_mut()
+            .flat_map(|module| &mut module.ports)
+        {
+            if let crate::design::ConnectionState::Connected(net) = &mut port.state
+                && net == old
+            {
+                *net = new.to_owned();
             }
         }
         for route in &mut design.board.routes {

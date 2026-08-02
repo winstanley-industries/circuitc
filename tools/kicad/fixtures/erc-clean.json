@@ -1,0 +1,18 @@
+{
+  "$schema": "https://schemas.kicad.org/erc.v1.json",
+  "coordinate_units": "mm",
+  "date": "2026-08-01T01:02:03",
+  "ignored_checks": [
+    {"description": "SPICE model issue", "key": "simulation_model_issue"}
+  ],
+  "included_severities": ["warning", "error", "exclusion"],
+  "kicad_version": "10.0.5",
+  "sheets": [
+    {
+      "path": "/",
+      "uuid_path": "/aaaaaaaa-aaaa-8aaa-8aaa-aaaaaaaaaaaa",
+      "violations": []
+    }
+  ],
+  "source": "/tmp/first/voltage_divider.kicad_sch"
+}

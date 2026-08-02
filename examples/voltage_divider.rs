@@ -31,11 +31,36 @@ fn main() -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
-    for (filename, contents) in [
-        ("voltage_divider.kicad_pcb", artifacts.kicad_pcb),
-        ("voltage_divider.spice", artifacts.spice),
-    ] {
+    let mut outputs = vec![
+        (
+            "voltage_divider.kicad_sch".to_owned(),
+            artifacts.kicad_schematic,
+        ),
+        ("voltage_divider.kicad_pcb".to_owned(), artifacts.kicad_pcb),
+        (
+            "voltage_divider.kicad_pro".to_owned(),
+            artifacts.kicad_project,
+        ),
+    ];
+    outputs.extend(
+        artifacts
+            .kicad_library_files
+            .into_iter()
+            .map(|file| (file.relative_path.into_string(), file.contents)),
+    );
+    outputs.extend([
+        ("sym-lib-table".to_owned(), artifacts.kicad_symbol_table),
+        ("fp-lib-table".to_owned(), artifacts.kicad_footprint_table),
+        ("voltage_divider.spice".to_owned(), artifacts.spice),
+    ]);
+    for (filename, contents) in outputs {
         let path = output_directory.join(filename);
+        if let Some(parent) = path.parent()
+            && let Err(error) = fs::create_dir_all(parent)
+        {
+            eprintln!("failed to create {}: {error}", parent.display());
+            return ExitCode::FAILURE;
+        }
         if let Err(error) = fs::write(&path, contents) {
             eprintln!("failed to write {}: {error}", path.display());
             return ExitCode::FAILURE;
