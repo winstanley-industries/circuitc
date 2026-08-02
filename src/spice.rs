@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use crate::design::{Component, Design, SimulationModel};
+use crate::design::{
+    Component, Design, SimulationAnalysis, SimulationAnalysisKind, SimulationModel,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SpiceNetNameMapping {
@@ -23,11 +25,25 @@ pub struct SpiceNameMap {
 }
 
 pub(crate) struct LoweredSpice {
-    pub netlist: String,
-    pub name_map: SpiceNameMap,
+    pub(crate) netlist: String,
+    pub(crate) name_map: SpiceNameMap,
 }
 
 pub(crate) fn lower_netlist(design: &Design) -> LoweredSpice {
+    lower_netlist_with_analysis(design, None)
+}
+
+pub(crate) fn lower_analysis_netlist(
+    design: &Design,
+    analysis: &SimulationAnalysis,
+) -> LoweredSpice {
+    lower_netlist_with_analysis(design, Some(analysis))
+}
+
+fn lower_netlist_with_analysis(
+    design: &Design,
+    analysis: Option<&SimulationAnalysis>,
+) -> LoweredSpice {
     let name_map = lower_names(design);
     let nodes: BTreeMap<&str, &str> = name_map
         .nets
@@ -93,16 +109,69 @@ pub(crate) fn lower_netlist(design: &Design) -> LoweredSpice {
         let negative_net = component
             .net_for_pin(negative_pin)
             .expect("validated simulation pin must resolve");
+        let ac_excitation = match (analysis.map(|analysis| &analysis.kind), model) {
+            (
+                Some(SimulationAnalysisKind::AcLinearSweep {
+                    source,
+                    magnitude,
+                    phase,
+                    ..
+                }),
+                SimulationModel::DcVoltageSource { .. },
+            ) if source == &component.path => format!(
+                " AC {} {}",
+                magnitude.spice_literal(),
+                phase.spice_literal()
+            ),
+            _ => String::new(),
+        };
         writeln!(
             output,
-            "{} {} {}{} {}",
+            "{} {} {}{} {}{}",
             devices[component.path.as_str()],
             nodes[positive_net],
             nodes[negative_net],
             kind,
-            value
+            value,
+            ac_excitation,
         )
         .unwrap();
+    }
+    if let Some(analysis) = analysis {
+        match &analysis.kind {
+            SimulationAnalysisKind::DcOperatingPoint => output.push_str(".OP\n"),
+            SimulationAnalysisKind::AcLinearSweep {
+                points,
+                start_frequency,
+                stop_frequency,
+                ..
+            } => writeln!(
+                output,
+                ".AC LIN {points} {} {}",
+                start_frequency.spice_literal(),
+                stop_frequency.spice_literal()
+            )
+            .unwrap(),
+            SimulationAnalysisKind::Transient {
+                step,
+                stop,
+                start,
+                uic,
+            } => {
+                write!(
+                    output,
+                    ".TRAN {} {} {}",
+                    step.spice_literal(),
+                    stop.spice_literal(),
+                    start.spice_literal()
+                )
+                .unwrap();
+                if *uic {
+                    output.push_str(" UIC");
+                }
+                output.push('\n');
+            }
+        }
     }
     output.push_str(".END\n");
     LoweredSpice {
@@ -112,7 +181,39 @@ pub(crate) fn lower_netlist(design: &Design) -> LoweredSpice {
 }
 
 fn lower_names(design: &Design) -> SpiceNameMap {
-    let mut nets: Vec<_> = design.nets.iter().collect();
+    let mut emitted_net_names = BTreeSet::new();
+    for component in design
+        .components
+        .iter()
+        .filter(|component| component.simulation.is_some())
+    {
+        let model = component
+            .simulation
+            .as_ref()
+            .expect("filtered simulation component must have a model");
+        let (positive_pin, negative_pin) = match model {
+            SimulationModel::Resistor {
+                positive_pin,
+                negative_pin,
+                ..
+            }
+            | SimulationModel::DcVoltageSource {
+                positive_pin,
+                negative_pin,
+                ..
+            } => (positive_pin, negative_pin),
+        };
+        for pin in [positive_pin, negative_pin] {
+            if let Some(net) = component.net_for_pin(pin) {
+                emitted_net_names.insert(net);
+            }
+        }
+    }
+    let mut nets: Vec<_> = design
+        .nets
+        .iter()
+        .filter(|net| net.is_ground || emitted_net_names.contains(net.name.as_str()))
+        .collect();
     nets.sort_by(|left, right| left.name.cmp(&right.name));
     let net_case_counts = case_counts(
         nets.iter()
@@ -165,15 +266,13 @@ fn lower_names(design: &Design) -> SpiceNameMap {
     let mut used_devices = BTreeSet::new();
     for component in &components {
         let key = spice_case_key(&component.reference);
-        if spice_identifier_is_supported(&component.reference) && reference_case_counts[&key] == 1 {
+        if component_reference_is_preservable(component, &reference_case_counts) {
             used_devices.insert(key);
         }
     }
     let mut component_mappings = Vec::new();
     for component in components {
-        let case_key = spice_case_key(&component.reference);
-        let can_preserve = spice_identifier_is_supported(&component.reference)
-            && reference_case_counts[&case_key] == 1;
+        let can_preserve = component_reference_is_preservable(component, &reference_case_counts);
         let device = if can_preserve {
             component.reference.clone()
         } else {
@@ -202,6 +301,31 @@ fn lower_names(design: &Design) -> SpiceNameMap {
         nets: net_mappings,
         components: component_mappings,
     }
+}
+
+fn component_reference_is_preservable(
+    component: &Component,
+    reference_case_counts: &BTreeMap<String, usize>,
+) -> bool {
+    let compatible_prefix = match component
+        .simulation
+        .as_ref()
+        .expect("filtered simulation component must have a model")
+    {
+        SimulationModel::Resistor { .. } => component
+            .reference
+            .bytes()
+            .next()
+            .is_some_and(|byte| matches!(byte, b'R' | b'r')),
+        SimulationModel::DcVoltageSource { .. } => component
+            .reference
+            .bytes()
+            .next()
+            .is_some_and(|byte| matches!(byte, b'V' | b'v')),
+    };
+    compatible_prefix
+        && spice_identifier_is_supported(&component.reference)
+        && reference_case_counts[&spice_case_key(&component.reference)] == 1
 }
 
 fn case_counts<'a>(values: impl Iterator<Item = &'a str>) -> BTreeMap<String, usize> {
@@ -248,21 +372,152 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use crate::demo::voltage_divider;
-    use crate::design::ComponentValue;
+    use crate::design::{
+        Component, ComponentValue, Design, Net, SimulationAnalysis, SimulationAnalysisKind,
+    };
     use crate::quantity::{Quantity, Unit};
 
-    use super::lower_netlist;
+    use super::{
+        LoweredSpice, SpiceComponentNameMapping, SpiceNameMap, SpiceNetNameMapping,
+        lower_analysis_netlist, lower_netlist,
+    };
 
     #[test]
-    fn preserves_safe_reference_fixture_names() {
+    fn legacy_lowering_has_exact_output_and_no_implicit_analysis() {
         let lowered = lower_netlist(&voltage_divider());
-        assert!(lowered.netlist.contains("R1 VIN VOUT 10e3"));
-        assert!(lowered.netlist.contains("V1 VIN 0 DC 10"));
-        assert!(lowered.netlist.ends_with(".END\n"));
-        assert!(
-            !lowered.netlist.contains(".OP\n"),
-            "an analysis directive must never be synthesized without canonical intent"
+        assert_exact_lowering(
+            lowered,
+            &[
+                (
+                    "divider.analysis.input",
+                    "646976696465722E616E616C797369732E696E707574",
+                    "V1",
+                    "5631",
+                    "V1",
+                    "V1 VIN 0 DC 10",
+                ),
+                (
+                    "divider.r_bottom",
+                    "646976696465722E725F626F74746F6D",
+                    "R2",
+                    "5232",
+                    "R2",
+                    "R2 VOUT 0 10e3",
+                ),
+                (
+                    "divider.r_top",
+                    "646976696465722E725F746F70",
+                    "R1",
+                    "5231",
+                    "R1",
+                    "R1 VIN VOUT 10e3",
+                ),
+            ],
+            None,
+        );
+    }
+
+    #[test]
+    fn lowers_dc_analysis_to_exactly_one_operating_point_directive() {
+        let design = voltage_divider();
+        let analysis = SimulationAnalysis {
+            path: "sim.dc".to_owned(),
+            kind: SimulationAnalysisKind::DcOperatingPoint,
+        };
+        assert_exact_lowering(
+            lower_analysis_netlist(&design, &analysis),
+            &standard_rows("V1 VIN 0 DC 10"),
+            Some(".OP"),
+        );
+    }
+
+    #[test]
+    fn lowers_ac_analysis_and_selected_source_excitation_exactly() {
+        let mut design = voltage_divider();
+        let mut bias = design
+            .components
+            .iter()
+            .find(|component| component.path == "divider.analysis.input")
+            .expect("fixture source must exist")
+            .clone();
+        bias.path = "divider.analysis.bias".to_owned();
+        bias.reference = "V2".to_owned();
+        design.components.push(bias);
+        let analysis = SimulationAnalysis {
+            path: "sim.ac".to_owned(),
+            kind: SimulationAnalysisKind::AcLinearSweep {
+                source: "divider.analysis.input".to_owned(),
+                points: 11,
+                start_frequency: Quantity::new(10, 0, Unit::Hertz),
+                stop_frequency: Quantity::new(25, 2, Unit::Hertz),
+                magnitude: Quantity::new(1, 0, Unit::Volt),
+                phase: Quantity::new(-90, 0, Unit::Degree),
+            },
+        };
+        assert_exact_lowering(
+            lower_analysis_netlist(&design, &analysis),
+            &[
+                (
+                    "divider.analysis.bias",
+                    "646976696465722E616E616C797369732E62696173",
+                    "V2",
+                    "5632",
+                    "V2",
+                    "V2 VIN 0 DC 10",
+                ),
+                (
+                    "divider.analysis.input",
+                    "646976696465722E616E616C797369732E696E707574",
+                    "V1",
+                    "5631",
+                    "V1",
+                    "V1 VIN 0 DC 10 AC 1 -90",
+                ),
+                (
+                    "divider.r_bottom",
+                    "646976696465722E725F626F74746F6D",
+                    "R2",
+                    "5232",
+                    "R2",
+                    "R2 VOUT 0 10e3",
+                ),
+                (
+                    "divider.r_top",
+                    "646976696465722E725F746F70",
+                    "R1",
+                    "5231",
+                    "R1",
+                    "R1 VIN VOUT 10e3",
+                ),
+            ],
+            Some(".AC LIN 11 10 2500"),
+        );
+    }
+
+    #[test]
+    fn lowers_transient_analysis_with_uic_if_and_only_if_requested() {
+        let design = voltage_divider();
+        let transient = |uic| SimulationAnalysis {
+            path: "sim.tran".to_owned(),
+            kind: SimulationAnalysisKind::Transient {
+                step: Quantity::new(2, -6, Unit::Second),
+                stop: Quantity::new(10, -3, Unit::Second),
+                start: Quantity::new(0, 0, Unit::Second),
+                uic,
+            },
+        };
+        assert_exact_lowering(
+            lower_analysis_netlist(&design, &transient(true)),
+            &standard_rows("V1 VIN 0 DC 10"),
+            Some(".TRAN 2e-6 10e-3 0 UIC"),
+        );
+        assert_exact_lowering(
+            lower_analysis_netlist(&design, &transient(false)),
+            &standard_rows("V1 VIN 0 DC 10"),
+            Some(".TRAN 2e-6 10e-3 0"),
         );
     }
 
@@ -339,32 +594,219 @@ mod tests {
     }
 
     #[test]
-    fn case_colliding_component_references_are_lowered_injectively() {
+    fn standalone_name_map_excludes_declared_nets_absent_from_device_lines() {
         let mut design = voltage_divider();
-        design.components[0].reference = "Rfoo".to_owned();
-        design.components[1].reference = "RFOO".to_owned();
+        design.nets.push(Net {
+            name: "UNUSED".to_owned(),
+            is_ground: false,
+        });
         design
             .validate()
-            .expect("case-distinct canonical references remain valid");
+            .expect("an unused net remains valid intent");
+
         let lowered = lower_netlist(&design);
-        let first = lowered
-            .name_map
-            .components
-            .iter()
-            .find(|mapping| mapping.reference == "Rfoo")
-            .expect("first device mapping must exist");
-        let second = lowered
-            .name_map
-            .components
-            .iter()
-            .find(|mapping| mapping.reference == "RFOO")
-            .expect("second device mapping must exist");
-        assert_ne!(
-            first.device.to_ascii_uppercase(),
-            second.device.to_ascii_uppercase()
+        assert!(
+            lowered
+                .name_map
+                .nets
+                .iter()
+                .all(|mapping| mapping.net != "UNUSED")
         );
-        assert!(first.device.starts_with('R'));
-        assert!(second.device.starts_with('R'));
+        assert!(!lowered.netlist.contains("554E55534544"));
+    }
+
+    #[test]
+    fn arbitrary_and_wrong_prefix_references_use_model_owned_names() {
+        let mut design = voltage_divider();
+        component_mut(&mut design, "divider.analysis.input").reference =
+            "arbitrary-name".to_owned();
+        component_mut(&mut design, "divider.r_bottom").reference = "XSAFE".to_owned();
+        component_mut(&mut design, "divider.r_top").reference = "1bad".to_owned();
+
+        assert_exact_lowering(
+            lower_netlist(&design),
+            &[
+                (
+                    "divider.analysis.input",
+                    "646976696465722E616E616C797369732E696E707574",
+                    "arbitrary-name",
+                    "6172626974726172792D6E616D65",
+                    "VCC_6172626974726172792D6E616D6500646976696465722E616E616C797369732E696E707574",
+                    "VCC_6172626974726172792D6E616D6500646976696465722E616E616C797369732E696E707574 VIN 0 DC 10",
+                ),
+                (
+                    "divider.r_bottom",
+                    "646976696465722E725F626F74746F6D",
+                    "XSAFE",
+                    "5853414645",
+                    "RCC_585341464500646976696465722E725F626F74746F6D",
+                    "RCC_585341464500646976696465722E725F626F74746F6D VOUT 0 10e3",
+                ),
+                (
+                    "divider.r_top",
+                    "646976696465722E725F746F70",
+                    "1bad",
+                    "31626164",
+                    "RCC_3162616400646976696465722E725F746F70",
+                    "RCC_3162616400646976696465722E725F746F70 VIN VOUT 10e3",
+                ),
+            ],
+            None,
+        );
+    }
+
+    #[test]
+    fn cross_kind_references_cannot_change_the_spice_device_model() {
+        let mut design = voltage_divider();
+        component_mut(&mut design, "divider.r_top").reference = "V1".to_owned();
+
+        assert_exact_lowering(
+            lower_netlist(&design),
+            &[
+                (
+                    "divider.analysis.input",
+                    "646976696465722E616E616C797369732E696E707574",
+                    "V1",
+                    "5631",
+                    "VCC_563100646976696465722E616E616C797369732E696E707574",
+                    "VCC_563100646976696465722E616E616C797369732E696E707574 VIN 0 DC 10",
+                ),
+                (
+                    "divider.r_bottom",
+                    "646976696465722E725F626F74746F6D",
+                    "R2",
+                    "5232",
+                    "R2",
+                    "R2 VOUT 0 10e3",
+                ),
+                (
+                    "divider.r_top",
+                    "646976696465722E725F746F70",
+                    "V1",
+                    "5631",
+                    "RCC_563100646976696465722E725F746F70",
+                    "RCC_563100646976696465722E725F746F70 VIN VOUT 10e3",
+                ),
+            ],
+            None,
+        );
+    }
+
+    #[test]
+    fn lowercase_model_compatible_references_are_preserved_exactly() {
+        let mut design = voltage_divider();
+        component_mut(&mut design, "divider.analysis.input").reference = "v1".to_owned();
+        component_mut(&mut design, "divider.r_bottom").reference = "r2".to_owned();
+        component_mut(&mut design, "divider.r_top").reference = "r1".to_owned();
+
+        assert_exact_lowering(
+            lower_netlist(&design),
+            &[
+                (
+                    "divider.analysis.input",
+                    "646976696465722E616E616C797369732E696E707574",
+                    "v1",
+                    "7631",
+                    "v1",
+                    "v1 VIN 0 DC 10",
+                ),
+                (
+                    "divider.r_bottom",
+                    "646976696465722E725F626F74746F6D",
+                    "r2",
+                    "7232",
+                    "r2",
+                    "r2 VOUT 0 10e3",
+                ),
+                (
+                    "divider.r_top",
+                    "646976696465722E725F746F70",
+                    "r1",
+                    "7231",
+                    "r1",
+                    "r1 VIN VOUT 10e3",
+                ),
+            ],
+            None,
+        );
+    }
+
+    #[test]
+    fn case_colliding_component_references_are_lowered_exactly_and_injectively() {
+        let mut design = voltage_divider();
+        component_mut(&mut design, "divider.r_bottom").reference = "Rfoo".to_owned();
+        component_mut(&mut design, "divider.r_top").reference = "RFOO".to_owned();
+
+        assert_exact_lowering(
+            lower_netlist(&design),
+            &[
+                (
+                    "divider.analysis.input",
+                    "646976696465722E616E616C797369732E696E707574",
+                    "V1",
+                    "5631",
+                    "V1",
+                    "V1 VIN 0 DC 10",
+                ),
+                (
+                    "divider.r_bottom",
+                    "646976696465722E725F626F74746F6D",
+                    "Rfoo",
+                    "52666F6F",
+                    "RCC_52666F6F00646976696465722E725F626F74746F6D",
+                    "RCC_52666F6F00646976696465722E725F626F74746F6D VOUT 0 10e3",
+                ),
+                (
+                    "divider.r_top",
+                    "646976696465722E725F746F70",
+                    "RFOO",
+                    "52464F4F",
+                    "RCC_52464F4F00646976696465722E725F746F70",
+                    "RCC_52464F4F00646976696465722E725F746F70 VIN VOUT 10e3",
+                ),
+            ],
+            None,
+        );
+    }
+
+    #[test]
+    fn preserved_component_name_is_reserved_before_mangling() {
+        let mut design = voltage_divider();
+        let top = component_mut(&mut design, "divider.r_top");
+        top.path = "a".to_owned();
+        top.reference = "X".to_owned();
+        component_mut(&mut design, "divider.r_bottom").reference = "RCC_580061".to_owned();
+
+        assert_exact_lowering(
+            lower_netlist(&design),
+            &[
+                (
+                    "a",
+                    "61",
+                    "X",
+                    "58",
+                    "RCC_580061_1",
+                    "RCC_580061_1 VIN VOUT 10e3",
+                ),
+                (
+                    "divider.analysis.input",
+                    "646976696465722E616E616C797369732E696E707574",
+                    "V1",
+                    "5631",
+                    "V1",
+                    "V1 VIN 0 DC 10",
+                ),
+                (
+                    "divider.r_bottom",
+                    "646976696465722E725F626F74746F6D",
+                    "RCC_580061",
+                    "5243435F353830303631",
+                    "RCC_580061",
+                    "RCC_580061 VOUT 0 10e3",
+                ),
+            ],
+            None,
+        );
     }
 
     #[test]
@@ -426,5 +868,100 @@ mod tests {
                 route.net = new.to_owned();
             }
         }
+    }
+
+    type ExpectedRow<'a> = (&'a str, &'a str, &'a str, &'a str, &'a str, &'a str);
+
+    fn standard_rows(voltage_line: &str) -> [ExpectedRow<'_>; 3] {
+        [
+            (
+                "divider.analysis.input",
+                "646976696465722E616E616C797369732E696E707574",
+                "V1",
+                "5631",
+                "V1",
+                voltage_line,
+            ),
+            (
+                "divider.r_bottom",
+                "646976696465722E725F626F74746F6D",
+                "R2",
+                "5232",
+                "R2",
+                "R2 VOUT 0 10e3",
+            ),
+            (
+                "divider.r_top",
+                "646976696465722E725F746F70",
+                "R1",
+                "5231",
+                "R1",
+                "R1 VIN VOUT 10e3",
+            ),
+        ]
+    }
+
+    fn assert_exact_lowering(
+        lowered: LoweredSpice,
+        expected_rows: &[ExpectedRow<'_>],
+        directive: Option<&str>,
+    ) {
+        let expected_name_map = SpiceNameMap {
+            nets: vec![
+                SpiceNetNameMapping {
+                    net: "GND".to_owned(),
+                    node: "0".to_owned(),
+                },
+                SpiceNetNameMapping {
+                    net: "VIN".to_owned(),
+                    node: "VIN".to_owned(),
+                },
+                SpiceNetNameMapping {
+                    net: "VOUT".to_owned(),
+                    node: "VOUT".to_owned(),
+                },
+            ],
+            components: expected_rows
+                .iter()
+                .map(
+                    |(path, _, reference, _, device, _)| SpiceComponentNameMapping {
+                        path: (*path).to_owned(),
+                        reference: (*reference).to_owned(),
+                        device: (*device).to_owned(),
+                    },
+                )
+                .collect(),
+        };
+        assert_eq!(lowered.name_map, expected_name_map);
+
+        let mut expected_netlist = String::from(
+            "* Generated by CircuitC from voltage_divider\n\
+             * @circuitc-net 474E44 0\n\
+             * @circuitc-net 56494E VIN\n\
+             * @circuitc-net 564F5554 VOUT\n",
+        );
+        for (_, path_hex, _, reference_hex, device, _) in expected_rows {
+            writeln!(
+                expected_netlist,
+                "* @circuitc-device {path_hex} {reference_hex} {device}"
+            )
+            .unwrap();
+        }
+        for (_, _, _, _, _, component_line) in expected_rows {
+            writeln!(expected_netlist, "{component_line}").unwrap();
+        }
+        if let Some(directive) = directive {
+            writeln!(expected_netlist, "{directive}").unwrap();
+        }
+        expected_netlist.push_str(".END\n");
+        assert_eq!(lowered.netlist, expected_netlist);
+    }
+
+    fn component_mut<'a>(design: &'a mut Design, path: &str) -> &'a mut Component {
+        design
+            .components
+            .iter_mut()
+            .find(|component| component.path == path)
+            .expect("fixture component must exist")
     }
 }

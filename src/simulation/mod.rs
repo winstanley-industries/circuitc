@@ -1,6 +1,7 @@
 //! Versioned simulation process contracts.
 
 pub mod contract;
+pub(crate) mod lower;
 
 pub use contract::{
     AnalysisKind, AssertionOutcome, AssertionStatus, AxisKind, BackendIdentity,

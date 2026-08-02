@@ -127,10 +127,28 @@ nonpositive frequencies, transient steps, or transient stops; negative
 transient starts, AC magnitudes, or tolerances; incompatible sample kinds; and
 ranges ordered backwards. Negative expected voltages and AC phase values are
 valid. A design may declare at most 256 analyses and 10,000 assertions. No
-analysis may exceed 10,000 samples or transient compute steps, and the
-aggregate workload across all analyses may not exceed 10,000. Transient work
-is budgeted from time zero as `ceil(stop / step) + 1`; `start` filters output
-but does not reduce solver work.
+analysis may exceed 10,000 nominal samples, and the aggregate declared grid
+across all analyses may not exceed 10,000. A transient's nominal grid is
+budgeted from time zero as `ceil(stop / step) + 1`; `start` filters output but
+does not reduce that declaration bound. Ohmnivore's transient solver is
+adaptive, so actual accepted and rejected solver steps are instead bounded by
+the checked process adapter and are never inferred from this nominal count.
+
+Each declared analysis deterministically lowers to its own SPICE netlist,
+versioned request, and standalone reversible identity map. Component references
+remain canonical CircuitC identities and need not use a SPICE device prefix;
+the backend preserves only safe model-compatible names and otherwise owns an
+injective derived name. Exact quantities cross to the pinned backend's `f64`
+parser only in this lowering step. CircuitC rejects collapsed or non-increasing
+AC axes, distinct transient controls that collapse to one backend value, and
+distinct exact transient assertion samples that would alias. The request
+authenticates authored transient samples without predicting the adaptive
+solver's output rows; checked execution must reject a missing assertion row or
+declared stop. Lowering also applies a conservative 64 MiB aggregate budget to
+all retained per-analysis input artifacts before constructing them. These
+failures use `CC-SIM-LOWER-*` diagnostics. Until checked process execution is
+added, a successfully lowered analysis still fails closed with
+`CC-SIM-PHASE-001` and no static artifact bundle is published.
 
 Each component has exactly one part, symbol, schematic position, and
 kind-appropriate value, plus at most one footprint. `model` and `terminals` are

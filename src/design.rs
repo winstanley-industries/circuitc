@@ -6,14 +6,14 @@ use crate::quantity::{Quantity, Unit};
 
 pub const DESIGN_SCHEMA_VERSION: u32 = 1;
 pub const MAX_ABS_COORDINATE_NM: i64 = 1_000_000_000_000;
-/// Design-level bound aligned with the versioned simulation wire contracts.
+/// CircuitC resource ceiling for declared simulation analyses.
 pub const MAX_SIMULATION_ANALYSES: usize = 256;
 /// Design-level bound aligned with the versioned simulation wire contracts.
 pub const MAX_SIMULATION_ASSERTIONS: usize = 10_000;
 /// Maximum number of samples requested by one analysis, including both
 /// endpoints of a transient time grid.
 pub const MAX_SIMULATION_SAMPLES: u32 = 10_000;
-/// Maximum aggregate solver samples or compute steps across all analyses.
+/// Maximum aggregate declared nominal samples across all analyses.
 pub const MAX_SIMULATION_TOTAL_SAMPLES: u32 = 10_000;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -933,7 +933,7 @@ fn validate_simulation_intent(
             SimulationAnalysisKind::DcOperatingPoint => 1,
             SimulationAnalysisKind::AcLinearSweep { points, .. } => (*points).min(saturation),
             SimulationAnalysisKind::Transient { step, stop, .. } => {
-                transient_compute_samples_saturating(*step, *stop, saturation)
+                transient_nominal_samples_saturating(*step, *stop, saturation)
             }
         };
         total
@@ -947,7 +947,7 @@ fn validate_simulation_intent(
             "CC-SIM-ANALYSIS-012",
             "design.analyses",
             format!(
-                "aggregate simulation workload exceeds {MAX_SIMULATION_TOTAL_SAMPLES} samples or compute steps"
+                "aggregate declared simulation grid exceeds {MAX_SIMULATION_TOTAL_SAMPLES} nominal samples"
             ),
         );
     }
@@ -1186,7 +1186,7 @@ fn validate_simulation_intent(
                     );
                 }
                 if interval_valid
-                    && !transient_grid_is_bounded(*step, *stop, MAX_SIMULATION_SAMPLES)
+                    && !transient_nominal_grid_is_bounded(*step, *stop, MAX_SIMULATION_SAMPLES)
                 {
                     push(
                         diagnostics,
@@ -1344,11 +1344,12 @@ fn validate_assertion_sample(
             } else if sample_valid
                 && in_range
                 && *points >= 2
+                && *points <= MAX_SIMULATION_SAMPLES
                 && exact_quantity_is(*start_frequency, Unit::Hertz)
                 && exact_quantity_is(*stop_frequency, Unit::Hertz)
                 && start_frequency.coefficient > 0
                 && start_frequency.exact_cmp(*stop_frequency) == Some(Ordering::Less)
-                && !ac_grid_contains(*sample, *start_frequency, *stop_frequency, *points)
+                && ac_grid_index(*sample, *start_frequency, *stop_frequency, *points).is_none()
             {
                 push_related(
                     diagnostics,
@@ -1391,7 +1392,7 @@ fn validate_assertion_sample(
                 && step.coefficient > 0
                 && start.coefficient >= 0
                 && start.exact_cmp(*stop) != Some(Ordering::Greater)
-                && !transient_grid_contains(*sample, *step, *stop)
+                && transient_grid_location(*sample, *step, *stop).is_none()
             {
                 push_related(
                     diagnostics,
@@ -1444,33 +1445,48 @@ fn simulation_intent_path(collection: &str, path: &str) -> String {
     format!("design.{collection}.{path}")
 }
 
-fn ac_grid_contains(sample: Quantity, start: Quantity, stop: Quantity, points: u32) -> bool {
-    let Some(intervals) = points.checked_sub(1) else {
-        return false;
-    };
+pub(crate) fn ac_grid_index(
+    sample: Quantity,
+    start: Quantity,
+    stop: Quantity,
+    points: u32,
+) -> Option<u32> {
+    if sample.unit != start.unit || start.unit != stop.unit {
+        return None;
+    }
+    let intervals = points.checked_sub(1).filter(|intervals| *intervals != 0)?;
     let common_exponent = sample.exponent.min(start.exponent).min(stop.exponent);
-    let Some(offset) = decimal_quantity_difference(sample, start, common_exponent) else {
-        return false;
-    };
-    let Some(span) = decimal_quantity_difference(stop, start, common_exponent) else {
-        return false;
-    };
+    let offset = decimal_quantity_difference(sample, start, common_exponent)?;
+    let span = decimal_quantity_difference(stop, start, common_exponent)?;
     let numerator = multiply_decimal_digits(&offset, intervals);
-    decimal_digits_are_divisible(&numerator, &span)
+    let index = exact_decimal_digits_quotient_u32(&numerator, &span)?;
+    (index < points).then_some(index)
 }
 
-fn transient_grid_contains(sample: Quantity, step: Quantity, stop: Quantity) -> bool {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TransientGridLocation {
+    Step(u32),
+    StopEndpoint,
+}
+
+pub(crate) fn transient_grid_location(
+    sample: Quantity,
+    step: Quantity,
+    stop: Quantity,
+) -> Option<TransientGridLocation> {
+    if sample.unit != step.unit || step.unit != stop.unit {
+        return None;
+    }
     if sample.exact_cmp(stop) == Some(Ordering::Equal) {
-        return true;
+        return Some(TransientGridLocation::StopEndpoint);
+    }
+    if sample.exact_cmp(stop) != Some(Ordering::Less) {
+        return None;
     }
     let common_exponent = sample.exponent.min(step.exponent);
-    let Some(sample) = scaled_nonnegative_digits(sample, common_exponent, 1) else {
-        return false;
-    };
-    let Some(step) = scaled_nonnegative_digits(step, common_exponent, 1) else {
-        return false;
-    };
-    decimal_digits_are_divisible(&sample, &step)
+    let sample = scaled_nonnegative_digits(sample, common_exponent, 1)?;
+    let step = scaled_nonnegative_digits(step, common_exponent, 1)?;
+    exact_decimal_digits_quotient_u32(&sample, &step).map(TransientGridLocation::Step)
 }
 
 fn decimal_quantity_difference(
@@ -1487,14 +1503,20 @@ fn decimal_quantity_difference(
 /// lowering exact decimals to floating point or scaling them into a fixed-width
 /// integer. The pinned backend integrates from zero even when output filtering
 /// starts later. The caller supplies validated, non-negative quantities.
-fn transient_grid_is_bounded(step: Quantity, stop: Quantity, cap: u32) -> bool {
-    transient_compute_samples_saturating(step, stop, cap.saturating_add(1)) <= cap
+fn transient_nominal_grid_is_bounded(step: Quantity, stop: Quantity, cap: u32) -> bool {
+    transient_nominal_samples_saturating(step, stop, cap.saturating_add(1)) <= cap
 }
 
-/// Return `ceil(stop / step) + 1`, saturating at `saturation`, using exact
-/// decimal-string scaling. Binary search bounds work to the public workload
-/// envelope instead of iterating over requested solver steps.
-fn transient_compute_samples_saturating(step: Quantity, stop: Quantity, saturation: u32) -> u32 {
+/// Return the declared nominal-grid cardinality `ceil(stop / step) + 1`,
+/// saturating at `saturation`, using exact decimal-string scaling. Binary
+/// search bounds work to the public declaration envelope instead of iterating
+/// over requested samples. The adaptive backend's actual step count is not
+/// predicted here.
+pub(crate) fn transient_nominal_samples_saturating(
+    step: Quantity,
+    stop: Quantity,
+    saturation: u32,
+) -> u32 {
     if saturation <= 1 || step.coefficient <= 0 || stop.coefficient < 0 {
         return saturation;
     }
@@ -1595,26 +1617,27 @@ fn subtract_decimal_digits(left: &str, right: &str) -> Option<String> {
     Some(decimal_digits_without_leading_zeroes(&result).to_owned())
 }
 
-fn decimal_digits_are_divisible(dividend: &str, divisor: &str) -> bool {
+fn exact_decimal_digits_quotient_u32(dividend: &str, divisor: &str) -> Option<u32> {
     let divisor = decimal_digits_without_leading_zeroes(divisor);
     if divisor == "0" {
-        return false;
+        return None;
     }
     let mut remainder = "0".to_owned();
+    let mut quotient = 0_u32;
     for digit in decimal_digits_without_leading_zeroes(dividend).bytes() {
         if remainder == "0" {
             remainder.clear();
         }
         remainder.push(char::from(digit));
         remainder = decimal_digits_without_leading_zeroes(&remainder).to_owned();
+        let mut quotient_digit = 0_u32;
         while compare_decimal_digits(&remainder, divisor) != Ordering::Less {
-            let Some(next) = subtract_decimal_digits(&remainder, divisor) else {
-                return false;
-            };
-            remainder = next;
+            remainder = subtract_decimal_digits(&remainder, divisor)?;
+            quotient_digit += 1;
         }
+        quotient = quotient.checked_mul(10)?.checked_add(quotient_digit)?;
     }
-    decimal_digits_without_leading_zeroes(&remainder) == "0"
+    (decimal_digits_without_leading_zeroes(&remainder) == "0").then_some(quotient)
 }
 
 fn decimal_digits_without_leading_zeroes(value: &str) -> &str {
@@ -2233,14 +2256,6 @@ fn validate_simulation(
                     format!("unsupported resistor model identifier {model_id}"),
                 );
             }
-            if !component.reference.starts_with('R') {
-                push(
-                    diagnostics,
-                    "CC-SIM-005",
-                    path,
-                    "SPICE resistor reference must begin with R",
-                );
-            }
         }
         SimulationModel::DcVoltageSource { model_id, .. } => {
             if component.part.logical_device != "dc_voltage_source" {
@@ -2257,14 +2272,6 @@ fn validate_simulation(
                     "CC-SIM-010",
                     path,
                     format!("unsupported voltage-source model identifier {model_id}"),
-                );
-            }
-            if !component.reference.starts_with('V') {
-                push(
-                    diagnostics,
-                    "CC-SIM-007",
-                    path,
-                    "SPICE voltage-source reference must begin with V",
                 );
             }
         }
@@ -2335,7 +2342,8 @@ mod tests {
         ComponentValue, ConnectionState, CopperLayer, MAX_ABS_COORDINATE_NM,
         MAX_SIMULATION_ANALYSES, MAX_SIMULATION_ASSERTIONS, MAX_SIMULATION_SAMPLES,
         MAX_SIMULATION_TOTAL_SAMPLES, PinPadBinding, Placement, PointNm, SimulationAnalysis,
-        SimulationAnalysisKind, SimulationAssertion, SimulationSample,
+        SimulationAnalysisKind, SimulationAssertion, SimulationSample, TransientGridLocation,
+        ac_grid_index, transient_grid_location,
     };
 
     fn has_code(diagnostics: &[super::Diagnostic], code: &str) -> bool {
@@ -2609,6 +2617,8 @@ mod tests {
         } else {
             unreachable!();
         }
+        assertion_mut(&mut design, "divider.assertions.ac_vout").sample =
+            SimulationSample::Frequency(Quantity::new(56, 0, Unit::Hertz));
         let diagnostics = design
             .validate()
             .expect_err("oversized AC sweep must be rejected");
@@ -2617,6 +2627,10 @@ mod tests {
             .find(|diagnostic| diagnostic.code == "CC-SIM-ANALYSIS-003")
             .expect("AC points diagnostic must exist");
         assert_eq!(points.path, "design.analyses.divider.simulation.ac.points");
+        assert!(
+            !has_code(&diagnostics, "CC-SIM-ASSERTION-007"),
+            "an invalid AC point count must not cascade into a grid-membership diagnostic"
+        );
 
         let mut design = design_with_simulation_intent();
         if let SimulationAnalysisKind::AcLinearSweep { source, .. } =
@@ -2876,6 +2890,101 @@ mod tests {
     }
 
     #[test]
+    fn exact_simulation_grid_ordinals_cover_boundaries_and_large_decimals() {
+        let hz = |coefficient, exponent| Quantity::new(coefficient, exponent, Unit::Hertz);
+        assert_eq!(ac_grid_index(hz(10, 0), hz(10, 0), hz(100, 0), 11), Some(0));
+        assert_eq!(ac_grid_index(hz(55, 0), hz(10, 0), hz(100, 0), 11), Some(5));
+        assert_eq!(
+            ac_grid_index(hz(100, 0), hz(10, 0), hz(100, 0), 11),
+            Some(10)
+        );
+        assert_eq!(ac_grid_index(hz(56, 0), hz(10, 0), hz(100, 0), 11), None);
+        assert_eq!(ac_grid_index(hz(145, 0), hz(10, 0), hz(100, 0), 11), None);
+        assert_eq!(ac_grid_index(hz(10, 0), hz(10, 0), hz(100, 0), 1), None);
+
+        assert_eq!(
+            ac_grid_index(hz(18, -2), hz(1, -1), hz(2, -1), 6),
+            Some(4),
+            "finite-decimal interior point must return its exact ordinal"
+        );
+        assert_eq!(ac_grid_index(hz(19, -2), hz(1, -1), hz(2, -1), 6), None);
+
+        let huge_start = hz(1, -18);
+        let huge_stop = hz(i64::MAX, 18);
+        assert_eq!(
+            ac_grid_index(huge_stop, huge_start, huge_stop, MAX_SIMULATION_SAMPLES),
+            Some(MAX_SIMULATION_SAMPLES - 1),
+            "endpoint division must remain exact across the full decimal exponent envelope"
+        );
+        assert_eq!(
+            ac_grid_index(
+                hz(u32::MAX.into(), 0),
+                hz(0, 0),
+                hz(u32::MAX.into(), 0),
+                u32::MAX
+            ),
+            Some(u32::MAX - 1),
+            "the largest representable AC ordinal must not overflow"
+        );
+        assert_eq!(
+            ac_grid_index(hz(i64::MAX, 18), hz(0, 0), hz(1, 0), 2),
+            None,
+            "an exact quotient outside u32 and the declared point range must be rejected"
+        );
+
+        let seconds = |coefficient, exponent| Quantity::new(coefficient, exponent, Unit::Second);
+        let step = seconds(3, -1);
+        let stop = seconds(1, 0);
+        assert_eq!(
+            transient_grid_location(seconds(0, 0), step, stop),
+            Some(TransientGridLocation::Step(0))
+        );
+        assert_eq!(
+            transient_grid_location(seconds(3, -1), step, stop),
+            Some(TransientGridLocation::Step(1))
+        );
+        assert_eq!(
+            transient_grid_location(seconds(9, -1), step, stop),
+            Some(TransientGridLocation::Step(3))
+        );
+        assert_eq!(
+            transient_grid_location(stop, seconds(0, 0), stop),
+            Some(TransientGridLocation::StopEndpoint),
+            "the forced stop endpoint is classified before step division"
+        );
+        assert_eq!(transient_grid_location(seconds(4, -1), step, stop), None);
+        assert_eq!(transient_grid_location(seconds(12, -1), step, stop), None);
+        assert_eq!(transient_grid_location(seconds(-3, -1), step, stop), None);
+
+        assert_eq!(
+            transient_grid_location(
+                seconds(9, 18),
+                seconds(3, 18),
+                seconds(9_000_000_000_000_000_001, 0),
+            ),
+            Some(TransientGridLocation::Step(3)),
+            "large exact decimal coefficients must divide without fixed-width scaling"
+        );
+        assert_eq!(
+            transient_grid_location(
+                seconds(i64::from(u32::MAX), -18),
+                seconds(1, -18),
+                seconds(i64::from(u32::MAX) + 2, -18),
+            ),
+            Some(TransientGridLocation::Step(u32::MAX))
+        );
+        assert_eq!(
+            transient_grid_location(
+                seconds(i64::from(u32::MAX) + 1, -18),
+                seconds(1, -18),
+                seconds(i64::from(u32::MAX) + 2, -18),
+            ),
+            None,
+            "a transient step quotient above u32 must be rejected"
+        );
+    }
+
+    #[test]
     fn assertion_samples_must_be_members_of_exact_backend_grids() {
         let ac_path = "divider.assertions.ac_vout";
         for frequency in [10, 55, 100] {
@@ -3006,7 +3115,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregates_exact_transient_compute_steps_across_analyses() {
+    fn aggregates_exact_transient_nominal_samples_across_analyses() {
         let transient_analysis = |path: &str, stop_seconds: i64| SimulationAnalysis {
             path: path.to_owned(),
             kind: SimulationAnalysisKind::Transient {
@@ -3287,10 +3396,7 @@ mod tests {
         assert_rejected(design, "CC-SIM-010");
 
         let mut design = voltage_divider();
-        design.components[0].reference = "X1".to_owned();
-        assert_rejected(design, "CC-SIM-005");
-
-        let mut design = voltage_divider();
+        design.components[0].reference = "V_load".to_owned();
         design
             .components
             .iter_mut()
@@ -3301,8 +3407,12 @@ mod tests {
                 )
             })
             .expect("reference voltage source is simulated")
-            .reference = "X1".to_owned();
-        assert_rejected(design, "CC-SIM-007");
+            .reference = "R_supply".to_owned();
+        assert_eq!(
+            design.validate(),
+            Ok(()),
+            "canonical references must not inherit backend R/V prefix requirements"
+        );
     }
 
     #[test]

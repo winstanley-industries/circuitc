@@ -3442,7 +3442,7 @@ mod tests {
             ),
             r###"i10-main.circuitc:5:3: CC-SIM-CAPABILITY-001 [root.r]: electrically participating component has no supported explicit simulation model (bytes 60..401)
   related i10-main.circuitc:44:3: related entity `design.analyses.sim.ac_grid` is here (bytes 1776..1906)
-i10-main.circuitc:37:3: CC-SIM-ANALYSIS-012 [design.analyses]: aggregate simulation workload exceeds 10000 samples or compute steps (bytes 813..942)
+i10-main.circuitc:37:3: CC-SIM-ANALYSIS-012 [design.analyses]: aggregate declared simulation grid exceeds 10000 nominal samples (bytes 813..942)
 i10-main.circuitc:37:60: CC-SIM-ANALYSIS-003 [design.analyses.sim.points.points]: AC sweep points must be in 2..=10000; found 1 (bytes 870..871)
 i10-main.circuitc:38:54: CC-SIM-ANALYSIS-004 [design.analyses.sim.unknown_source.source]: AC source references unknown component root.missing (bytes 996..1008)
 i10-main.circuitc:39:51: CC-SIM-ANALYSIS-004 [design.analyses.sim.non_voltage.source]: AC source root.r must select a component with a DC voltage-source simulation model (bytes 1139..1145)
@@ -3507,7 +3507,7 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
     "line": 37,
     "column": 3,
     "semantic_path": "design.analyses",
-    "message": "aggregate simulation workload exceeds 10000 samples or compute steps",
+    "message": "aggregate declared simulation grid exceeds 10000 nominal samples",
     "related": []
   },
   {
@@ -3898,9 +3898,232 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
         );
         assert_eq!(
             diagnostic.message,
-            "declared simulation intent cannot be compiled until deterministic per-analysis lowering and checked execution are available"
+            "lowered simulation inputs cannot be compiled until checked execution is available"
         );
         assert_eq!(&source[diagnostic.start..diagnostic.end], declaration);
+    }
+
+    #[test]
+    fn backend_schedule_diagnostics_map_to_exact_authored_fields() {
+        for (declaration, semantic_path, primary, related, expected_human, expected_json) in [
+            (
+                "analysis ac_linear_sweep sim.ac source divider.analysis.input points 2 start_frequency 9007199254740992 Hz stop_frequency 9007199254740993 Hz magnitude 1 V phase 0 deg;",
+                "design.analyses.sim.ac.stop_frequency",
+                "9007199254740993 Hz",
+                "9007199254740992 Hz",
+                r###"schedule.circuitc:73:125: CC-SIM-LOWER-002 [design.analyses.sim.ac.stop_frequency]: distinct exact AC sweep endpoints collapse or reverse at the backend f64 boundary (bytes 1909..1928)
+  related schedule.circuitc:73:90: related entity `design.analyses.sim.ac.start_frequency` is here (bytes 1874..1893)"###,
+                r###"[
+  {
+    "code": "CC-SIM-LOWER-002",
+    "filename": "schedule.circuitc",
+    "start": 1909,
+    "end": 1928,
+    "line": 73,
+    "column": 125,
+    "semantic_path": "design.analyses.sim.ac.stop_frequency",
+    "message": "distinct exact AC sweep endpoints collapse or reverse at the backend f64 boundary",
+    "related": [
+      {
+        "filename": "schedule.circuitc",
+        "start": 1874,
+        "end": 1893,
+        "line": 73,
+        "column": 90,
+        "message": "related entity `design.analyses.sim.ac.start_frequency` is here"
+      }
+    ]
+  }
+]
+"###,
+            ),
+            (
+                "analysis transient sim.tran step 9007199254740992 s stop 9007199254740993 s start 0 s uic false;",
+                "design.analyses.sim.tran.stop",
+                "9007199254740993 s",
+                "9007199254740992 s",
+                r###"schedule.circuitc:73:60: CC-SIM-LOWER-002 [design.analyses.sim.tran.stop]: distinct exact transient controls collapse to one value at the backend f64 boundary (bytes 1844..1862)
+  related schedule.circuitc:73:36: related entity `design.analyses.sim.tran.step` is here (bytes 1820..1838)"###,
+                r###"[
+  {
+    "code": "CC-SIM-LOWER-002",
+    "filename": "schedule.circuitc",
+    "start": 1844,
+    "end": 1862,
+    "line": 73,
+    "column": 60,
+    "semantic_path": "design.analyses.sim.tran.stop",
+    "message": "distinct exact transient controls collapse to one value at the backend f64 boundary",
+    "related": [
+      {
+        "filename": "schedule.circuitc",
+        "start": 1820,
+        "end": 1838,
+        "line": 73,
+        "column": 36,
+        "message": "related entity `design.analyses.sim.tran.step` is here"
+      }
+    ]
+  }
+]
+"###,
+            ),
+            (
+                "analysis ac_linear_sweep sim.ac source divider.analysis.input points 3 start_frequency 9007199254740992 Hz stop_frequency 9007199254740994 Hz magnitude 1 V phase 0 deg;",
+                "design.analyses.sim.ac.points",
+                "3",
+                "9007199254740992 Hz",
+                r###"schedule.circuitc:73:72: CC-SIM-LOWER-002 [design.analyses.sim.ac.points]: the pinned backend AC schedule is non-finite, duplicate, or non-increasing (bytes 1856..1857)
+  related schedule.circuitc:73:90: related entity `design.analyses.sim.ac.start_frequency` is here (bytes 1874..1893)"###,
+                r###"[
+  {
+    "code": "CC-SIM-LOWER-002",
+    "filename": "schedule.circuitc",
+    "start": 1856,
+    "end": 1857,
+    "line": 73,
+    "column": 72,
+    "semantic_path": "design.analyses.sim.ac.points",
+    "message": "the pinned backend AC schedule is non-finite, duplicate, or non-increasing",
+    "related": [
+      {
+        "filename": "schedule.circuitc",
+        "start": 1874,
+        "end": 1893,
+        "line": 73,
+        "column": 90,
+        "message": "related entity `design.analyses.sim.ac.start_frequency` is here"
+      }
+    ]
+  }
+]
+"###,
+            ),
+        ] {
+            let source = with_intent(REFERENCE, &format!("\n  {declaration}\n"));
+            let diagnostics = crate::frontend::compile_source("schedule.circuitc", &source)
+                .expect_err("a backend-unrepresentable schedule must fail before execution");
+            assert_eq!(diagnostics.len(), 1);
+            let diagnostic = &diagnostics[0];
+            assert_eq!(diagnostic.code, "CC-SIM-LOWER-002");
+            assert_eq!(diagnostic.semantic_path.as_deref(), Some(semantic_path));
+            assert_eq!(&source[diagnostic.start..diagnostic.end], primary);
+            assert_eq!(diagnostic.related.len(), 1);
+            let related_span = &diagnostic.related[0];
+            assert_eq!(&source[related_span.start..related_span.end], related);
+            assert_eq!(
+                crate::frontend::render_diagnostics(
+                    &diagnostics,
+                    crate::frontend::DiagnosticFormat::Human,
+                ),
+                expected_human
+            );
+            assert_eq!(
+                crate::frontend::render_diagnostics(
+                    &diagnostics,
+                    crate::frontend::DiagnosticFormat::Json,
+                ),
+                expected_json
+            );
+        }
+    }
+
+    #[test]
+    fn collapsed_transient_assertion_diagnostic_has_an_exact_golden() {
+        let source = with_intent(
+            REFERENCE,
+            r#"
+  analysis transient sim.tran step 4503599627370496 s stop 9007199254740993 s start 0 s uic false;
+  assert net_voltage checks.multiple analysis sim.tran net VOUT sample time 9007199254740992 s expected 5 V absolute_tolerance 0.01 V relative_tolerance 0 ratio;
+"#,
+        );
+        let diagnostics = crate::frontend::compile_source("sample-collapse.circuitc", &source)
+            .expect_err("distinct authored times may not alias at the backend boundary");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "CC-SIM-LOWER-003");
+        assert_eq!(
+            crate::frontend::render_diagnostics(
+                &diagnostics,
+                crate::frontend::DiagnosticFormat::Human,
+            ),
+            r###"sample-collapse.circuitc:74:72: CC-SIM-LOWER-003 [design.assertions.checks.multiple.sample]: distinct exact transient assertion or control times collapse to one value at the backend f64 boundary (bytes 1955..1978)
+  related sample-collapse.circuitc:73:60: related entity `design.analyses.sim.tran.stop` is here (bytes 1844..1862)"###
+        );
+        assert_eq!(
+            crate::frontend::render_diagnostics(
+                &diagnostics,
+                crate::frontend::DiagnosticFormat::Json,
+            ),
+            r###"[
+  {
+    "code": "CC-SIM-LOWER-003",
+    "filename": "sample-collapse.circuitc",
+    "start": 1955,
+    "end": 1978,
+    "line": 74,
+    "column": 72,
+    "semantic_path": "design.assertions.checks.multiple.sample",
+    "message": "distinct exact transient assertion or control times collapse to one value at the backend f64 boundary",
+    "related": [
+      {
+        "filename": "sample-collapse.circuitc",
+        "start": 1844,
+        "end": 1862,
+        "line": 73,
+        "column": 60,
+        "message": "related entity `design.analyses.sim.tran.stop` is here"
+      }
+    ]
+  }
+]
+"###
+        );
+    }
+
+    #[test]
+    fn aggregate_simulation_resource_diagnostic_has_exact_source_goldens() {
+        let source = with_intent(
+            REFERENCE,
+            r#"
+  analysis dc_operating_point sim.dc;
+"#,
+        );
+        let tree = parse(SourceFile::new("resource.circuitc", &source))
+            .expect("resource fixture must parse");
+        let elaborated = elaborate(&tree).expect("resource fixture must elaborate");
+        let diagnostics = crate::simulation::lower::lower_inputs_with_limit(&elaborated.design, 0)
+            .expect_err("a zero generated-artifact limit must reject the simulation bundle");
+        let diagnostics =
+            super::map_ir_diagnostics(&tree.source, &elaborated.provenance, diagnostics);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "CC-SIM-LOWER-005");
+        assert_eq!(
+            crate::frontend::render_diagnostics(
+                &diagnostics,
+                crate::frontend::DiagnosticFormat::Human,
+            ),
+            r###"resource.circuitc:73:3: CC-SIM-LOWER-005 [design.analyses]: deterministic simulation inputs exceed the 0-byte aggregate generated-artifact budget (bytes 1787..1822)"###
+        );
+        assert_eq!(
+            crate::frontend::render_diagnostics(
+                &diagnostics,
+                crate::frontend::DiagnosticFormat::Json,
+            ),
+            r###"[
+  {
+    "code": "CC-SIM-LOWER-005",
+    "filename": "resource.circuitc",
+    "start": 1787,
+    "end": 1822,
+    "line": 73,
+    "column": 3,
+    "semantic_path": "design.analyses",
+    "message": "deterministic simulation inputs exceed the 0-byte aggregate generated-artifact budget",
+    "related": []
+  }
+]
+"###
+        );
     }
 
     #[test]
