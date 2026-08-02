@@ -12,6 +12,7 @@ invalid_version_project="$8"
 invalid_version_type_project="$9"
 invalid_libraries_shape_project="${10}"
 invalid_libraries_content_project="${11}"
+invalid_list_content_project="${12}"
 
 expect_fixture_failure() {
   local label="$1"
@@ -75,6 +76,9 @@ expect_fixture_failure invalid-libraries-shape \
 expect_fixture_failure invalid-libraries-content \
   "KiCad project library field 'pinned_symbol_libs' must be an empty list" \
   "${invalid_libraries_content_project}"
+expect_fixture_failure invalid-list-content \
+  "KiCad project field 'sheets' must be an empty list" \
+  "${invalid_list_content_project}"
 
 if python3 "${validator}" \
   --project "${TEST_TMPDIR}/invalid-structure/voltage_divider.kicad_pro" \
