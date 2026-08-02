@@ -251,7 +251,6 @@ impl SimulationModel {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Component {
     pub path: String,
-    pub module_path: String,
     pub reference: String,
     pub part: PartIdentity,
     pub symbol: SymbolBinding,
@@ -263,6 +262,10 @@ pub struct Component {
 }
 
 impl Component {
+    pub fn module_path(&self) -> Option<&str> {
+        self.path.rsplit_once('.').map(|(parent, _)| parent)
+    }
+
     pub fn net_for_pin(&self, pin: &str) -> Option<&str> {
         self.connections
             .iter()
@@ -800,24 +803,16 @@ fn validate_component<'a>(
             "duplicate component semantic path",
         );
     }
-    let derived_module = component.path.rsplit_once('.').map(|(parent, _)| parent);
-    if derived_module != Some(component.module_path.as_str()) {
-        push(
-            diagnostics,
-            "CC-COMP-006",
-            path,
-            "component module path must equal the parent of its semantic path",
-        );
-    }
-    if !module_paths.contains(component.module_path.as_str()) {
+    let module_path = component.module_path();
+    if module_path.is_none_or(|module_path| !module_paths.contains(module_path)) {
         push(
             diagnostics,
             "CC-COMP-007",
             path,
-            format!(
-                "component references unknown module {}",
-                component.module_path
-            ),
+            match module_path {
+                Some(module_path) => format!("component references unknown module {module_path}"),
+                None => "component semantic path has no parent module".to_owned(),
+            },
         );
     }
     if !token_is_valid(&component.reference) {
@@ -1514,12 +1509,11 @@ mod tests {
     #[test]
     fn validates_component_part_and_symbol_contracts_for_public_ir_consumers() {
         let mut design = voltage_divider();
-        design.components[0].module_path = "divider.analysis".to_owned();
-        assert_rejected(design, "CC-COMP-006");
+        design.components[0].path = "missing.r_top".to_owned();
+        assert_rejected(design, "CC-COMP-007");
 
         let mut design = voltage_divider();
-        design.components[0].path = "missing.r_top".to_owned();
-        design.components[0].module_path = "missing".to_owned();
+        design.components[0].path = "orphan".to_owned();
         assert_rejected(design, "CC-COMP-007");
 
         let mut design = voltage_divider();

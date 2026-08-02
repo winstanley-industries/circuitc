@@ -717,8 +717,8 @@ impl Parser<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse;
-    use crate::frontend::syntax::SourceFile;
+    use super::{Parser, lex, parse};
+    use crate::frontend::syntax::{DeclarationSyntax, SourceFile};
 
     #[test]
     fn parses_minimal_design() {
@@ -771,5 +771,81 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn module_recovery_reports_the_unsupported_span_and_preserves_following_ports() {
+        let text = "design d { module m { widget x; port input A passive connect N; } }";
+        let source = SourceFile::new("module-recovery.circuitc", text);
+        let (tokens, mut diagnostics) = lex(&source);
+        let mut parser = Parser {
+            source: &source,
+            tokens,
+            cursor: 0,
+            diagnostics: Vec::new(),
+        };
+        let design = parser
+            .parse_design()
+            .expect("parser recovery must preserve the enclosing design");
+        diagnostics.extend(parser.diagnostics);
+
+        let unsupported = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "CC-LANG-PARSE-002")
+            .expect("unsupported module declaration must be diagnosed");
+        let widget = text.find("widget").expect("fixture contains widget");
+        assert_eq!((unsupported.start, unsupported.end), (widget, widget + 6));
+
+        let module = design
+            .declarations
+            .iter()
+            .find_map(|declaration| match declaration {
+                DeclarationSyntax::Module(module) => Some(module),
+                _ => None,
+            })
+            .expect("module syntax must survive recovery");
+        assert_eq!(module.ports.len(), 1);
+        assert_eq!(module.ports[0].name.value, "A");
+    }
+
+    #[test]
+    fn new_declarations_report_expected_token_spans() {
+        for (name, text, expected_message) in [
+            (
+                "missing-port-state.circuitc",
+                "design d { module m { port input A passive; } }",
+                "`connect NET` or `no_connect`",
+            ),
+            (
+                "missing-part-number.circuitc",
+                "design d { resistor m.r R1 { part \"resistor\" manufacturer \"Yageo\"; } }",
+                "keyword `number`",
+            ),
+            (
+                "missing-schematic-rotation.circuitc",
+                "design d { resistor m.r R1 { schematic at (1 mm, 1 mm); } }",
+                "keyword `rotation`",
+            ),
+        ] {
+            let source = SourceFile::new(name, text);
+            let diagnostics = parse(source).expect_err("incomplete declaration must fail");
+            let diagnostic = diagnostics
+                .iter()
+                .find(|diagnostic| {
+                    diagnostic.code == "CC-LANG-PARSE-001"
+                        && diagnostic.message.contains(expected_message)
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing expected parser diagnostic {expected_message}: {diagnostics:#?}"
+                    )
+                });
+            let semicolon = text.rfind(';').expect("fixture contains a semicolon");
+            assert_eq!(
+                (diagnostic.start, diagnostic.end),
+                (semicolon, semicolon + 1),
+                "unexpected diagnostic span for {name}"
+            );
+        }
     }
 }

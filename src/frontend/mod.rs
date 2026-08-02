@@ -249,6 +249,69 @@ mod tests {
     }
 
     #[test]
+    fn synthesized_footprint_graphic_collision_reports_both_component_origins() {
+        let source = MINIMAL_VIRTUAL_SOURCE
+            .replace(
+                "  module root {}",
+                concat!(
+                    "  module root {}\n",
+                    "  module root.r {}\n",
+                    "  module root.r.footprint {}\n",
+                    "  module root.r.footprint.graphic {}",
+                ),
+            )
+            .replace(
+                "dc_source root.input V1",
+                "dc_source root.r.footprint.graphic.courtyard V1",
+            )
+            .replace(
+                "  board {",
+                concat!(
+                    "  resistor root.r R1 {\n",
+                    "    part \"resistor\" manufacturer \"Yageo\" number \"RC0603FR-0710KL\";\n",
+                    "    symbol \"CircuitC:R\" {\n",
+                    "      bind 1 1 passive;\n",
+                    "      bind 2 2 passive;\n",
+                    "    }\n",
+                    "    schematic at (81.28 mm, 81.28 mm) rotation 0 deg;\n",
+                    "    resistance 1 kohm;\n",
+                    "    connect 1 GND;\n",
+                    "    connect 2 GND;\n",
+                    "    footprint \"CircuitC:R_0603_1608Metric\" {\n",
+                    "      bind 1 1;\n",
+                    "      bind 2 2;\n",
+                    "    }\n",
+                    "  }\n",
+                    "  board {",
+                ),
+            )
+            .replace(
+                "    rectangle at (0 mm, 0 mm) size (1 mm, 1 mm);",
+                concat!(
+                    "    rectangle at (0 mm, 0 mm) size (1 mm, 1 mm);\n",
+                    "    place R1 at (0.5 mm, 0.5 mm) rotation 0 deg layer front;",
+                ),
+            );
+
+        let diagnostics = compile_source("graphic-collision.circuitc", &source)
+            .expect_err("component path colliding with a graphic identity must fail");
+        let collision = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "CC-KICAD-ID-002")
+            .expect("graphic collision diagnostic must exist");
+        assert_eq!(collision.related.len(), 1);
+        let primary = &source[collision.start..];
+        let related = &source[collision.related[0].start..];
+        assert!(
+            (primary.starts_with("dc_source root.r.footprint.graphic.courtyard")
+                && related.starts_with("footprint \"CircuitC:R"))
+                || (related.starts_with("dc_source root.r.footprint.graphic.courtyard")
+                    && primary.starts_with("footprint \"CircuitC:R")),
+            "graphic collision must retain both authored locations: {collision:#?}"
+        );
+    }
+
+    #[test]
     fn json_diagnostics_are_stable_and_escape_content() {
         let source =
             "design d { net VIN; net VIN; board { rectangle at (0 mm, 0 mm) size (1 mm, 1 mm); } }";
@@ -273,6 +336,12 @@ mod tests {
         assert_eq!(first.elaborated, second.elaborated);
         assert_eq!(first.artifacts, second.artifacts);
         assert_eq!(first.kicad_identity_map, second.kicad_identity_map);
+        assert!(
+            first
+                .artifacts
+                .kicad_project
+                .contains("\"filename\": \"d.kicad_pro\"")
+        );
         assert!(
             first
                 .kicad_identity_map

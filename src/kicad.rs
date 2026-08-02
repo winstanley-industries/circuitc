@@ -295,11 +295,9 @@ fn validate_catalog_bindings(design: &Design, diagnostics: &mut Vec<Diagnostic>)
 
         match (&component.physical, part.footprint_library_id) {
             (Some(physical), Some(expected)) if physical.footprint.library_id == expected => {
-                let mut actual_footprint = physical.footprint.clone();
-                actual_footprint
-                    .pads
-                    .sort_by(|left, right| left.number.cmp(&right.number));
-                let Some(mut expected_footprint) = crate::library::footprint(expected) else {
+                let Some(geometry_matches) =
+                    crate::library::footprint_geometry_matches_catalog(&physical.footprint)
+                else {
                     diagnostics.push(Diagnostic {
                         code: "CC-KICAD-FOOTPRINT-005",
                         path: path.to_owned(),
@@ -325,10 +323,7 @@ fn validate_catalog_bindings(design: &Design, diagnostics: &mut Vec<Diagnostic>)
                         ),
                     });
                 }
-                expected_footprint
-                    .pads
-                    .sort_by(|left, right| left.number.cmp(&right.number));
-                if actual_footprint != expected_footprint {
+                if !geometry_matches {
                     diagnostics.push(Diagnostic {
                         code: "CC-KICAD-FOOTPRINT-001",
                         path: path.to_owned(),

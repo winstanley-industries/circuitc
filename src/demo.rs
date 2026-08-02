@@ -63,7 +63,6 @@ pub fn voltage_divider() -> Design {
             ),
             Component {
                 path: "divider.analysis.input".to_owned(),
-                module_path: "divider.analysis".to_owned(),
                 reference: "V1".to_owned(),
                 part: PartIdentity {
                     logical_device: "dc_voltage_source".to_owned(),
@@ -150,7 +149,6 @@ fn resistor(
 ) -> Component {
     Component {
         path: path.to_owned(),
-        module_path: "divider".to_owned(),
         reference: reference.to_owned(),
         part: PartIdentity {
             logical_device: "resistor".to_owned(),

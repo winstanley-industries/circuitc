@@ -398,6 +398,25 @@ fn validate_kicad_semantic_paths(
                     pad_span,
                 );
             }
+            if let Some(graphics) =
+                crate::library::footprint_graphics(&physical.footprint.library_id)
+            {
+                for line in graphics.silkscreen_lines {
+                    register(
+                        format!(
+                            "{}.footprint.graphic.silkscreen.{}",
+                            component.path, line.semantic_name
+                        ),
+                        "PCB footprint silkscreen graphic",
+                        footprint_span,
+                    );
+                }
+                register(
+                    format!("{}.footprint.graphic.courtyard", component.path),
+                    "PCB footprint courtyard graphic",
+                    footprint_span,
+                );
+            }
         }
     }
     for route in &board.routes {
@@ -1318,7 +1337,6 @@ fn elaborate_component(
     }
     Some(Component {
         path: path.to_owned(),
-        module_path: module_path.expect("checked above"),
         reference: syntax.reference.value.clone(),
         part: lowered_part.expect("checked above"),
         value: lowered_value.expect("checked above"),

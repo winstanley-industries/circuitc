@@ -110,12 +110,13 @@ fn kicad_library_files(design: &Design) -> Vec<KicadLibraryFile> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::panic::catch_unwind;
 
     use crate::demo::voltage_divider;
     use crate::design::{ConnectionState, ModuleInstance};
 
-    use super::compile;
+    use super::{CompiledArtifacts, compile};
 
     #[test]
     fn compiles_reference_design_deterministically() {
@@ -140,6 +141,18 @@ mod tests {
                 "CircuitC.pretty/R_0603_1608Metric.kicad_mod"
             ]
         );
+    }
+
+    #[test]
+    fn every_emitted_kicad_uuid_has_exactly_one_identity() {
+        let reference = compile(&voltage_divider()).expect("reference design must compile");
+        assert_identity_map_is_total(&reference);
+
+        let source = include_str!("../examples/physical_no_connect.circuitc");
+        let physical_no_connect =
+            crate::frontend::compile_source("physical_no_connect.circuitc", source)
+                .expect("physical no-connect fixture must compile");
+        assert_identity_map_is_total(&physical_no_connect.artifacts);
     }
 
     #[test]
@@ -734,9 +747,7 @@ mod tests {
             },
         ]);
         design.components[0].path = "root.x".to_owned();
-        design.components[0].module_path = "root".to_owned();
         design.components[1].path = "root.x.footprint.pad.1".to_owned();
-        design.components[1].module_path = "root.x.footprint.pad".to_owned();
 
         let diagnostics = compile(&design)
             .expect_err("rendered KiCad semantic paths must be globally unique")
@@ -771,15 +782,54 @@ mod tests {
         assert_eq!(first_uuid, segment_uuid(&second.kicad_pcb));
     }
 
-    fn board_uuids(board: &str) -> Vec<&str> {
-        board
-            .lines()
-            .filter_map(|line| {
-                line.trim()
-                    .strip_prefix("(uuid \"")
-                    .and_then(|value| value.strip_suffix("\")"))
-            })
-            .collect()
+    fn assert_identity_map_is_total(artifacts: &CompiledArtifacts) {
+        let emitted: Vec<_> = [&artifacts.kicad_schematic, &artifacts.kicad_pcb]
+            .into_iter()
+            .flat_map(|artifact| emitted_kicad_uuids(artifact))
+            .collect();
+        let emitted_set: BTreeSet<_> = emitted.iter().copied().collect();
+        assert_eq!(
+            emitted.len(),
+            emitted_set.len(),
+            "every emitted KiCad UUID must be globally unique"
+        );
+
+        let identity_uuids: BTreeSet<_> = artifacts
+            .kicad_identities
+            .iter()
+            .map(|identity| identity.uuid.as_str())
+            .collect();
+        let identity_paths: BTreeSet<_> = artifacts
+            .kicad_identities
+            .iter()
+            .map(|identity| identity.semantic_path.as_str())
+            .collect();
+        assert_eq!(
+            identity_uuids.len(),
+            artifacts.kicad_identities.len(),
+            "identity-map UUIDs must be unique"
+        );
+        assert_eq!(
+            identity_paths.len(),
+            artifacts.kicad_identities.len(),
+            "identity-map semantic paths must be unique"
+        );
+        assert_eq!(
+            emitted_set, identity_uuids,
+            "emitted KiCad UUIDs and identity-map UUIDs must have exact set equality"
+        );
+    }
+
+    fn emitted_kicad_uuids(mut artifact: &str) -> Vec<&str> {
+        let mut uuids = Vec::new();
+        while let Some((_, after_marker)) = artifact.split_once("(uuid \"") {
+            let Some((uuid, remainder)) = after_marker.split_once("\")") else {
+                break;
+            };
+            uuids.push(uuid);
+            artifact = remainder;
+        }
+        uuids
     }
 
     fn pad_stanza<'a>(footprint: &'a str, pad: &str) -> &'a str {
@@ -796,7 +846,7 @@ mod tests {
         board
             .split("  (segment\n")
             .nth(1)
-            .and_then(|segment| board_uuids(segment).into_iter().next())
+            .and_then(|segment| emitted_kicad_uuids(segment).into_iter().next())
             .expect("board must contain a routed segment UUID")
     }
 
