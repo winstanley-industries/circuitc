@@ -284,6 +284,85 @@ mod tests {
     }
 
     #[test]
+    fn schematic_symbol_pins_use_catalog_symbol_pin_numbers() {
+        let artifacts = compile(&voltage_divider()).expect("reference design must compile");
+        let virtual_uuid = artifacts
+            .kicad_identities
+            .iter()
+            .find(|identity| identity.semantic_path == "divider.analysis.input")
+            .expect("virtual symbol identity must exist")
+            .uuid
+            .as_str();
+        let virtual_symbol = balanced_block_containing(
+            &artifacts.kicad_schematic,
+            "  (symbol\n",
+            &format!("    (uuid \"{virtual_uuid}\")"),
+        );
+
+        for pin in ["1", "2"] {
+            assert!(
+                virtual_symbol.contains(&format!("    (pin \"{pin}\"")),
+                "virtual source symbol is missing catalog pin {pin}"
+            );
+        }
+        for logical_pin in ["p", "n"] {
+            assert!(
+                !virtual_symbol.contains(&format!("    (pin \"{logical_pin}\"")),
+                "virtual source symbol leaked logical pin {logical_pin} into KiCad"
+            );
+        }
+    }
+
+    #[test]
+    fn schematic_instances_pin_the_project_root_and_references() {
+        let artifacts = compile(&voltage_divider()).expect("reference design must compile");
+        let root_uuid = artifacts
+            .kicad_identities
+            .iter()
+            .find(|identity| identity.semantic_path == "design.schematic")
+            .expect("schematic root identity must exist")
+            .uuid
+            .as_str();
+
+        for (semantic_path, reference) in
+            [("divider.r_top", "R1"), ("divider.analysis.input", "V1")]
+        {
+            let symbol_uuid = artifacts
+                .kicad_identities
+                .iter()
+                .find(|identity| identity.semantic_path == semantic_path)
+                .unwrap_or_else(|| panic!("symbol identity must exist for {semantic_path}"))
+                .uuid
+                .as_str();
+            let symbol = balanced_block_containing(
+                &artifacts.kicad_schematic,
+                "  (symbol\n",
+                &format!("    (uuid \"{symbol_uuid}\")"),
+            );
+            let expected = format!(
+                concat!(
+                    "    (instances\n",
+                    "      (project \"voltage_divider\"\n",
+                    "        (path \"/{}\"\n",
+                    "          (reference \"{}\")\n",
+                    "          (unit 1)\n"
+                ),
+                root_uuid, reference
+            );
+            assert!(
+                symbol.contains(&expected),
+                "{reference} is missing its project/root/reference instance stanza"
+            );
+        }
+
+        assert!(
+            artifacts
+                .kicad_schematic
+                .contains("  (sheet_instances\n    (path \"/\" (page \"1\"))\n  )")
+        );
+    }
+
+    #[test]
     fn part_identity_values_round_trip_into_schematic_and_board_properties() {
         let artifacts = compile(&voltage_divider()).expect("reference design must compile");
         let physical_identity = artifacts
@@ -777,6 +856,18 @@ mod tests {
                 .any(|connection| connection.state == ConnectionState::NoConnect)
         );
         assert!(!compiled.artifacts.spice.contains("R1 "));
+        assert!(compiled.artifacts.spice.contains("V1 TEST 0 DC 1"));
+        assert!(compiled.artifacts.spice.contains("R2 TEST 0 1e3"));
+        assert_eq!(
+            compiled
+                .artifacts
+                .spice
+                .lines()
+                .filter(|line| line.starts_with('V'))
+                .count(),
+            1,
+            "fixture SPICE netlist must contain one ideal voltage source"
+        );
         assert_component_value(&compiled.artifacts, "board_only.unused", "R1", "10kΩ");
         assert!(global_label_at(
             &compiled.artifacts.kicad_schematic,
