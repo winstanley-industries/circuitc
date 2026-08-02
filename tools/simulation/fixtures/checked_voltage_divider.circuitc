@@ -1,0 +1,80 @@
+design checked_voltage_divider {
+  net VIN;
+  net VOUT;
+  ground GND;
+
+  module divider {
+    port input VIN passive connect VIN;
+    port output VOUT passive connect VOUT;
+    port input GND passive connect GND;
+  }
+
+  module divider.analysis {
+    port output VIN power_output connect VIN;
+    port input GND passive connect GND;
+  }
+
+  resistor divider.r_top R1 {
+    part "resistor" manufacturer "Yageo" number "RC0603FR-0710KL";
+    symbol "CircuitC:R" {
+      bind 1 1 passive;
+      bind 2 2 passive;
+    }
+    model "spice:R";
+    schematic at (81.28 mm, 81.28 mm) rotation 0 deg;
+    resistance 10 kohm;
+    terminals 1 2;
+    connect 1 VIN;
+    connect 2 VOUT;
+    footprint "CircuitC:R_0603_1608Metric" {
+      bind 1 1;
+      bind 2 2;
+    }
+  }
+
+  resistor divider.r_bottom R2 {
+    part "resistor" manufacturer "Yageo" number "RC0603FR-0710KL";
+    symbol "CircuitC:R" {
+      bind 1 1 passive;
+      bind 2 2 passive;
+    }
+    model "spice:R";
+    schematic at (101.6 mm, 81.28 mm) rotation 0 deg;
+    resistance 10 kohm;
+    terminals 1 2;
+    connect 1 VOUT;
+    connect 2 GND;
+    footprint "CircuitC:R_0603_1608Metric" {
+      bind 1 1;
+      bind 2 2;
+    }
+  }
+
+  dc_source divider.analysis.input V1 {
+    part "dc_voltage_source" virtual;
+    symbol "CircuitC:VDC" {
+      bind p 1 passive;
+      bind n 2 passive;
+    }
+    model "spice:Vdc";
+    schematic at (60.96 mm, 81.28 mm) rotation 0 deg;
+    voltage 10 V;
+    terminals p n;
+    connect p VIN;
+    connect n GND;
+  }
+
+  analysis dc_operating_point simulation.dc;
+  assert net_voltage checks.vout analysis simulation.dc net VOUT sample scalar expected 5 V absolute_tolerance 0.000001 V relative_tolerance 0 ratio;
+  analysis ac_linear_sweep simulation.ac source divider.analysis.input points 4 start_frequency 1 Hz stop_frequency 4 Hz magnitude 1 V phase 0 deg;
+  assert net_voltage checks.ac analysis simulation.ac net VOUT sample frequency 3 Hz expected 0.5 V absolute_tolerance 0.000001 V relative_tolerance 0 ratio;
+  analysis transient simulation.transient step 125 ms stop 500 ms start 0 s uic false;
+  assert net_voltage checks.transient analysis simulation.transient net VOUT sample time 500 ms expected 5 V absolute_tolerance 0.000001 V relative_tolerance 0 ratio;
+
+  board {
+    rectangle at (0 mm, 0 mm) size (40 mm, 20 mm);
+    place R1 at (15 mm, 10 mm) rotation 0 deg layer front;
+    place R2 at (25 mm, 10 mm) rotation 0 deg layer front;
+    route board.routes.vout_bridge net VOUT from (16 mm, 10 mm) to (24 mm, 10 mm) width 0.25 mm layer front;
+  }
+}

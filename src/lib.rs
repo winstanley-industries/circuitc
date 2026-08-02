@@ -17,7 +17,8 @@ pub mod simulation;
 mod spice;
 
 pub use compile::{
-    CompileError, CompiledArtifacts, InvalidRelativeArtifactPath, KicadIdentity, KicadLibraryFile,
-    KicadLibraryFileKind, RelativeArtifactPath, compile,
+    CheckedCompileError, CheckedCompiledArtifacts, CompileError, CompiledArtifacts,
+    CompiledSimulation, InvalidRelativeArtifactPath, KicadIdentity, KicadLibraryFile,
+    KicadLibraryFileKind, RelativeArtifactPath, compile, compile_checked,
 };
 pub use spice::{SpiceComponentNameMapping, SpiceNameMap, SpiceNetNameMapping};

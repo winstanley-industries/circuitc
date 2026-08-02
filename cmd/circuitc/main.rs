@@ -5,7 +5,77 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
-use circuitc::frontend::{DiagnosticFormat, compile_source, render_diagnostics};
+#[cfg(target_os = "macos")]
+fn reject_darwin_extended_acl(file: &fs::File, display_path: &Path) -> io::Result<()> {
+    use std::ffi::c_void;
+    use std::os::fd::AsRawFd as _;
+    use std::os::raw::c_int;
+
+    const ACL_TYPE_EXTENDED: c_int = 0x0000_0100;
+    const ACL_FIRST_ENTRY: c_int = 0;
+
+    unsafe extern "C" {
+        fn acl_get_fd_np(descriptor: c_int, acl_type: c_int) -> *mut c_void;
+        fn acl_get_entry(acl: *mut c_void, entry_id: c_int, entry: *mut *mut c_void) -> c_int;
+        fn acl_free(object: *mut c_void) -> c_int;
+    }
+
+    // SAFETY: the descriptor is live and ACL_TYPE_EXTENDED is the Darwin ACL
+    // type for the object referenced by that descriptor.
+    let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        return Err(io::Error::new(
+            error.kind(),
+            format!(
+                "failed to inspect extended ACL on {}: {error}",
+                display_path.display()
+            ),
+        ));
+    }
+    let mut entry = std::ptr::null_mut();
+    // SAFETY: `acl` is live and `entry` points to writable storage for the
+    // borrowed entry pointer.
+    let entry_status = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) };
+    let entry_error = (entry_status < 0).then(io::Error::last_os_error);
+    // SAFETY: `acl` was returned by `acl_get_fd_np` and is released once.
+    let free_status = unsafe { acl_free(acl) };
+    if let Some(error) = entry_error {
+        return Err(io::Error::new(
+            error.kind(),
+            format!(
+                "failed to inspect extended ACL on {}: {error}",
+                display_path.display()
+            ),
+        ));
+    }
+    if free_status != 0 {
+        let error = io::Error::last_os_error();
+        return Err(io::Error::new(
+            error.kind(),
+            format!(
+                "failed to release extended ACL for {}: {error}",
+                display_path.display()
+            ),
+        ));
+    }
+    if entry_status == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} has an extended ACL and cannot provide private compiler storage",
+                display_path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+use circuitc::CompiledArtifacts;
+use circuitc::frontend::{DiagnosticFormat, compile_source_checked, render_diagnostics};
 
 const EXIT_SOURCE: u8 = 1;
 const EXIT_INVOCATION: u8 = 2;
@@ -38,33 +108,129 @@ fn run(arguments: Vec<OsString>) -> Result<(), u8> {
         );
         EXIT_IO
     })?;
-    let compiled = compile_source(filename, source).map_err(|diagnostics| {
-        eprint!(
-            "{}",
-            render_diagnostics(&diagnostics, options.diagnostic_format)
-        );
-        if options.diagnostic_format == DiagnosticFormat::Human {
-            eprintln!();
-        }
-        EXIT_SOURCE
+    let work_root = CompileWorkRoot::create(&output_directory).map_err(|error| {
+        eprintln!("CC-CLI-IO-005: failed to create a private compiler work root: {error}");
+        EXIT_IO
+    })?;
+    let checked = compile_source_checked(filename, source, work_root.path());
+    work_root.cleanup().map_err(|error| {
+        eprintln!("CC-CLI-IO-005: failed to clean the private compiler work root: {error}");
+        EXIT_IO
     })?;
 
-    let stem = &compiled.elaborated.design.name;
-    let mut outputs = vec![
+    match checked {
+        Ok(compiled) => {
+            let mut outputs = Vec::new();
+            append_static_outputs(
+                &mut outputs,
+                &compiled.elaborated.design.name,
+                &compiled.artifacts.static_artifacts,
+                &compiled.kicad_identity_map,
+            );
+            for simulation in &compiled.artifacts.simulations {
+                append_simulation_output_chain(
+                    &mut outputs,
+                    [
+                        (
+                            simulation.netlist_path.as_str(),
+                            simulation.netlist.as_bytes(),
+                        ),
+                        (
+                            simulation.request_path.as_str(),
+                            simulation.request_json.as_bytes(),
+                        ),
+                        (
+                            simulation.map_path.as_str(),
+                            simulation.spice_identity_map_json.as_bytes(),
+                        ),
+                        (
+                            simulation.result_path.as_str(),
+                            simulation.result_json.as_bytes(),
+                        ),
+                        (
+                            simulation.report_path.as_str(),
+                            simulation.report_json.as_bytes(),
+                        ),
+                    ],
+                );
+            }
+            publish_outputs(&output_directory, &mut outputs)
+        }
+        Err(error) => {
+            report_source_diagnostics(&error.diagnostics, options.diagnostic_format);
+            if error.simulations.is_empty() {
+                return Err(EXIT_SOURCE);
+            }
+
+            let failure_directory = failure_output_directory(&output_directory).map_err(|error| {
+                eprintln!(
+                    "CC-CLI-IO-002: failed to derive checked-failure output directory from {}: {error}",
+                    output_directory.display()
+                );
+                EXIT_IO
+            })?;
+            let mut outputs = Vec::new();
+            for simulation in &error.simulations {
+                append_simulation_output_chain(
+                    &mut outputs,
+                    [
+                        (
+                            simulation.netlist_path.as_str(),
+                            simulation.netlist.as_bytes(),
+                        ),
+                        (
+                            simulation.request_path.as_str(),
+                            simulation.request_json.as_bytes(),
+                        ),
+                        (
+                            simulation.map_path.as_str(),
+                            simulation.spice_identity_map_json.as_bytes(),
+                        ),
+                        (
+                            simulation.result_path.as_str(),
+                            simulation.result_json.as_bytes(),
+                        ),
+                        (
+                            simulation.report_path.as_str(),
+                            simulation.report_json.as_bytes(),
+                        ),
+                    ],
+                );
+            }
+            publish_outputs(&failure_directory, &mut outputs)?;
+            Err(EXIT_SOURCE)
+        }
+    }
+}
+
+fn report_source_diagnostics(
+    diagnostics: &[circuitc::frontend::SourceDiagnostic],
+    format: DiagnosticFormat,
+) {
+    eprint!("{}", render_diagnostics(diagnostics, format));
+    if format == DiagnosticFormat::Human {
+        eprintln!();
+    }
+}
+
+fn append_static_outputs<'a>(
+    outputs: &mut Vec<(String, &'a [u8])>,
+    stem: &str,
+    artifacts: &'a CompiledArtifacts,
+    kicad_identity_map: &'a str,
+) {
+    outputs.extend([
         (
             format!("{stem}.kicad_sch"),
-            compiled.artifacts.kicad_schematic.as_bytes(),
+            artifacts.kicad_schematic.as_bytes(),
         ),
-        (
-            format!("{stem}.kicad_pcb"),
-            compiled.artifacts.kicad_pcb.as_bytes(),
-        ),
+        (format!("{stem}.kicad_pcb"), artifacts.kicad_pcb.as_bytes()),
         (
             format!("{stem}.kicad_pro"),
-            compiled.artifacts.kicad_project.as_bytes(),
+            artifacts.kicad_project.as_bytes(),
         ),
-    ];
-    outputs.extend(compiled.artifacts.kicad_library_files.iter().map(|file| {
+    ]);
+    outputs.extend(artifacts.kicad_library_files.iter().map(|file| {
         (
             file.relative_path.as_str().to_owned(),
             file.contents.as_bytes(),
@@ -73,19 +239,40 @@ fn run(arguments: Vec<OsString>) -> Result<(), u8> {
     outputs.extend([
         (
             "sym-lib-table".to_owned(),
-            compiled.artifacts.kicad_symbol_table.as_bytes(),
+            artifacts.kicad_symbol_table.as_bytes(),
         ),
         (
             "fp-lib-table".to_owned(),
-            compiled.artifacts.kicad_footprint_table.as_bytes(),
+            artifacts.kicad_footprint_table.as_bytes(),
         ),
         (
             format!("{stem}.kicad-map.json"),
-            compiled.kicad_identity_map.as_bytes(),
+            kicad_identity_map.as_bytes(),
         ),
-        (format!("{stem}.spice"), compiled.artifacts.spice.as_bytes()),
+        (format!("{stem}.spice"), artifacts.spice.as_bytes()),
     ]);
-    let write_outcome = write_outputs(&output_directory, &outputs).map_err(|error| {
+}
+
+fn append_simulation_output_chain<'a>(
+    outputs: &mut Vec<(String, &'a [u8])>,
+    chain: [(&str, &'a [u8]); 5],
+) {
+    outputs.extend(
+        chain
+            .into_iter()
+            .map(|(path, contents)| (path.to_owned(), contents)),
+    );
+}
+
+fn publish_outputs(output_directory: &Path, outputs: &mut Vec<(String, &[u8])>) -> Result<(), u8> {
+    if let Err(error) = sort_outputs(outputs) {
+        eprintln!(
+            "CC-CLI-IO-002: failed to write output directory {}: {error}",
+            output_directory.display(),
+        );
+        return Err(EXIT_IO);
+    }
+    let write_outcome = write_outputs(output_directory, outputs).map_err(|error| {
         eprintln!(
             "CC-CLI-IO-002: failed to write output directory {}: {error}",
             output_directory.display()
@@ -95,12 +282,210 @@ fn run(arguments: Vec<OsString>) -> Result<(), u8> {
     let mut stdout = io::stdout().lock();
     let mut stderr = io::stderr().lock();
     report_successful_publication(
-        &output_directory,
-        &outputs,
+        output_directory,
+        outputs,
         &write_outcome,
         &mut stdout,
         &mut stderr,
     )
+}
+
+fn sort_outputs(outputs: &mut Vec<(String, &[u8])>) -> io::Result<()> {
+    outputs.sort_by(|left, right| left.0.cmp(&right.0));
+    if outputs.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "duplicate generated output path",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn failure_output_directory(output_directory: &Path) -> io::Result<PathBuf> {
+    let normalized = absolute_lexical_path(output_directory)?;
+    let file_name = normalized.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "checked output directory must have a terminal path component",
+        )
+    })?;
+    let mut failed = file_name.to_os_string();
+    failed.push(".failed");
+    Ok(normalized.with_file_name(failed))
+}
+
+struct CompileWorkRoot(Option<PathBuf>);
+
+impl CompileWorkRoot {
+    fn create(output_directory: &Path) -> io::Result<Self> {
+        #[cfg(not(unix))]
+        {
+            let _ = output_directory;
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "private compiler work roots are unavailable on this platform",
+            ));
+        }
+
+        #[cfg(unix)]
+        {
+            Self::create_in_parent(output_directory, &env::temp_dir())
+        }
+    }
+
+    #[cfg(unix)]
+    fn create_in_parent(output_directory: &Path, temporary_parent: &Path) -> io::Result<Self> {
+        use std::io::Read as _;
+        use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
+
+        let temporary_parent = fs::canonicalize(temporary_parent)?;
+        let parent_metadata = fs::metadata(&temporary_parent)?;
+        // SAFETY: `geteuid` has no preconditions and does not dereference pointers.
+        let effective_uid = unsafe { libc::geteuid() };
+        let parent_mode = parent_metadata.mode();
+        if !parent_metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the canonical OS temporary path is not a directory",
+            ));
+        }
+        if parent_metadata.uid() != effective_uid && parent_metadata.uid() != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the canonical OS temporary directory is not caller- or root-owned",
+            ));
+        }
+        if parent_mode & 0o022 != 0 && parent_mode & 0o1000 == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the canonical OS temporary directory is writable by other users without the sticky bit",
+            ));
+        }
+        #[cfg(target_os = "macos")]
+        reject_darwin_extended_acl(&fs::File::open(&temporary_parent)?, &temporary_parent)?;
+
+        let output_boundary = canonical_output_boundary(output_directory)?;
+        for _ in 0..16 {
+            let mut nonce = [0_u8; 16];
+            fs::File::open("/dev/urandom")?.read_exact(&mut nonce)?;
+            let nonce = nonce
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let candidate =
+                temporary_parent.join(format!("circuitc-compile-{}-{nonce}", std::process::id()));
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(&candidate) {
+                Ok(()) => {
+                    // Acquire cleanup ownership before any fallible validation.
+                    let work_root = Self(Some(candidate.clone()));
+                    #[cfg(target_os = "macos")]
+                    reject_darwin_extended_acl(
+                        &fs::File::open(work_root.path())?,
+                        work_root.path(),
+                    )?;
+                    let before = fs::symlink_metadata(work_root.path())?;
+                    let canonical = fs::canonicalize(work_root.path())?;
+                    let after = fs::symlink_metadata(work_root.path())?;
+                    if canonical != candidate
+                        || !before.is_dir()
+                        || !after.is_dir()
+                        || before.uid() != effective_uid
+                        || after.uid() != effective_uid
+                        || before.mode() & 0o777 != 0o700
+                        || after.mode() & 0o777 != 0o700
+                        || before.dev() != after.dev()
+                        || before.ino() != after.ino()
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "compiler work root is not a stable caller-owned 0700 directory",
+                        ));
+                    }
+                    if canonical.starts_with(&output_boundary)
+                        || output_boundary.starts_with(&canonical)
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "compiler work root must be outside the output directory",
+                        ));
+                    }
+                    return Ok(work_root);
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate a unique compiler work root",
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        self.0.as_deref().expect("compiler work root is live")
+    }
+
+    fn cleanup(mut self) -> io::Result<()> {
+        let path = self.0.as_deref().expect("compiler work root is live");
+        fs::remove_dir_all(path)?;
+        self.0.take();
+        Ok(())
+    }
+}
+
+impl Drop for CompileWorkRoot {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+}
+
+fn absolute_lexical_path(path: &Path) -> io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        env::current_dir()?.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(Path::new("/")),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(segment) => normalized.push(segment),
+        }
+    }
+    Ok(normalized)
+}
+
+fn canonical_output_boundary(path: &Path) -> io::Result<PathBuf> {
+    let absolute = absolute_lexical_path(path)?;
+    let mut existing = absolute.as_path();
+    let mut missing = Vec::new();
+    while !existing.exists() {
+        let Some(segment) = existing.file_name() else {
+            break;
+        };
+        missing.push(segment.to_owned());
+        existing = existing.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "output directory has no existing canonical ancestor",
+            )
+        })?;
+    }
+    let mut canonical = fs::canonicalize(existing)?;
+    for segment in missing.iter().rev() {
+        canonical.push(segment);
+    }
+    Ok(canonical)
 }
 
 fn report_successful_publication(
@@ -291,10 +676,12 @@ fn validate_relative_output_path(filename: &str) -> io::Result<&Path> {
 ))]
 mod anchored_output {
     use std::collections::BTreeSet;
+    #[cfg(target_os = "macos")]
+    use std::ffi::c_void;
     use std::ffi::{CStr, CString, OsStr, OsString};
     use std::fmt;
     use std::fs::File;
-    use std::io::{self, Write as _};
+    use std::io::{self, Read as _, Write as _};
     use std::os::fd::{AsRawFd as _, FromRawFd as _, RawFd};
     use std::os::raw::{c_char, c_int, c_uint};
     use std::os::unix::ffi::OsStrExt as _;
@@ -353,6 +740,10 @@ mod anchored_output {
     #[cfg(target_os = "macos")]
     const ENOTSUP_OR_EOPNOTSUPP: c_int = 45;
     #[cfg(target_os = "macos")]
+    const ACL_TYPE_EXTENDED: c_int = 0x0000_0100;
+    #[cfg(target_os = "macos")]
+    const ACL_FIRST_ENTRY: c_int = 0;
+    #[cfg(target_os = "macos")]
     type Mode = u16;
 
     #[derive(Debug)]
@@ -380,6 +771,7 @@ mod anchored_output {
 
     const O_RDONLY: c_int = 0;
     const O_WRONLY: c_int = 1;
+    const ENOENT: c_int = 2;
     const EACCES: c_int = 13;
     const EISDIR: c_int = 21;
     const EINVAL: c_int = 22;
@@ -416,6 +808,9 @@ mod anchored_output {
             new_path: *const c_char,
             flags: c_uint,
         ) -> c_int;
+        fn acl_get_fd_np(descriptor: c_int, acl_type: c_int) -> *mut c_void;
+        fn acl_get_entry(acl: *mut c_void, entry_id: c_int, entry: *mut *mut c_void) -> c_int;
+        fn acl_free(object: *mut c_void) -> c_int;
     }
 
     struct Directory(File);
@@ -511,8 +906,12 @@ mod anchored_output {
         }
 
         fn create_child(&self, name: &CStr) -> io::Result<bool> {
+            self.create_child_with_mode(name, 0o700)
+        }
+
+        fn create_child_with_mode(&self, name: &CStr, mode: Mode) -> io::Result<bool> {
             // SAFETY: `name` is NUL-terminated and remains live for this call.
-            let status = unsafe { mkdirat(self.0.as_raw_fd(), name.as_ptr(), 0o777 as Mode) };
+            let status = unsafe { mkdirat(self.0.as_raw_fd(), name.as_ptr(), mode) };
             if status == 0 {
                 Ok(true)
             } else {
@@ -543,6 +942,15 @@ mod anchored_output {
     struct CreatedDirectory {
         parent: Directory,
         name: CString,
+        cleanup: CString,
+        identity: Option<(u64, u64)>,
+    }
+
+    struct PrivateQuarantine {
+        parent: Directory,
+        name: CString,
+        directory: Directory,
+        identity: (u64, u64),
     }
 
     struct OutputEntry<'a> {
@@ -550,9 +958,195 @@ mod anchored_output {
         target: CString,
         temporary: CString,
         backup: CString,
+        rename_probe: CString,
+        published_claim: CString,
+        temporary_claim: CString,
+        backup_claim: CString,
+        rename_probe_claim: CString,
         display_path: String,
         contents: &'a [u8],
         had_existing_target: bool,
+    }
+
+    struct WriteHooks<F, P, S, G, H, D> {
+        pre_anchor: F,
+        before_rename_probe: P,
+        sync_staging: S,
+        before_publish: G,
+        after_publication: H,
+        sync_directory: D,
+    }
+
+    fn validate_transaction_parent(directory: &Directory, display_path: &str) -> io::Result<()> {
+        let metadata = directory.0.metadata().map_err(|error| {
+            operation_error("inspect mutable output directory", display_path, error)
+        })?;
+        // SAFETY: `geteuid` has no preconditions and does not dereference pointers.
+        let effective_uid = unsafe { libc::geteuid() };
+        if metadata.uid() != effective_uid && metadata.uid() != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("mutable output directory {display_path} is not caller- or root-owned"),
+            ));
+        }
+        let mode = metadata.mode();
+        if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "mutable output directory {display_path} is writable by other users without the sticky bit"
+                ),
+            ));
+        }
+        reject_extended_acl(directory, display_path)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reject_extended_acl(_directory: &Directory, _display_path: &str) -> io::Result<()> {
+        // Linux POSIX ACL grants are bounded by the group class mode bits,
+        // which `validate_transaction_parent` checks above. Darwin NFSv4 ACLs
+        // are independent of those bits and require the explicit check below.
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn reject_extended_acl(directory: &Directory, display_path: &str) -> io::Result<()> {
+        // SAFETY: the descriptor is live and ACL_TYPE_EXTENDED is the Darwin
+        // ACL type for the object referenced by that descriptor.
+        let acl = unsafe { acl_get_fd_np(directory.0.as_raw_fd(), ACL_TYPE_EXTENDED) };
+        if acl.is_null() {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(ENOENT) {
+                return Ok(());
+            }
+            return Err(operation_error(
+                "inspect extended ACL on mutable output directory",
+                display_path,
+                error,
+            ));
+        }
+        let mut entry = std::ptr::null_mut();
+        // SAFETY: `acl` is live and `entry` points to writable storage for the
+        // borrowed entry pointer.
+        let entry_status = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) };
+        let entry_error = (entry_status < 0).then(io::Error::last_os_error);
+        // SAFETY: `acl` was returned by `acl_get_fd_np` and is released once.
+        let free_status = unsafe { acl_free(acl) };
+        if let Some(error) = entry_error {
+            return Err(operation_error(
+                "inspect extended ACL on mutable output directory",
+                display_path,
+                error,
+            ));
+        }
+        if free_status != 0 {
+            return Err(operation_error(
+                "release extended ACL for mutable output directory",
+                display_path,
+                io::Error::last_os_error(),
+            ));
+        }
+        if entry_status == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "mutable output directory {display_path} has an extended ACL and cannot provide isolated transaction cleanup"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn random_nonce() -> io::Result<String> {
+        let mut nonce = [0_u8; 16];
+        File::open("/dev/urandom")?.read_exact(&mut nonce)?;
+        Ok(nonce.iter().map(|byte| format!("{byte:02x}")).collect())
+    }
+
+    fn create_private_quarantine(root: &Directory) -> io::Result<PrivateQuarantine> {
+        validate_transaction_parent(root, "transaction output root")?;
+        for _ in 0..16 {
+            let name = c_name(OsStr::new(&format!(
+                ".circuitc-transaction-{}-{}",
+                process::id(),
+                random_nonce()?
+            )))?;
+            let cleanup = created_directory_cleanup_name(OsStr::from_bytes(name.to_bytes()))?;
+            let cleanup_parent = root.try_clone()?;
+            match root.create_child_with_mode(&name, 0o700 as Mode) {
+                Ok(true) => {
+                    // Acquire cleanup ownership immediately after mkdir. The
+                    // validated parent prevents a different security principal
+                    // from replacing this caller-owned name during inspection.
+                    let provisional = CreatedDirectory {
+                        parent: cleanup_parent,
+                        name: name.clone(),
+                        cleanup,
+                        identity: None,
+                    };
+                    let directory = match root.open_child(&name) {
+                        Ok(directory) => directory,
+                        Err(error) => {
+                            return Err(with_cleanup_error(
+                                operation_error(
+                                    "open private transaction quarantine",
+                                    &name.to_string_lossy(),
+                                    error,
+                                ),
+                                remove_owned_directory(&provisional),
+                            ));
+                        }
+                    };
+                    let metadata = match directory.0.metadata() {
+                        Ok(metadata) => metadata,
+                        Err(error) => {
+                            return Err(with_cleanup_error(
+                                operation_error(
+                                    "inspect private transaction quarantine",
+                                    &name.to_string_lossy(),
+                                    error,
+                                ),
+                                remove_owned_directory(&provisional),
+                            ));
+                        }
+                    };
+                    // SAFETY: `geteuid` has no preconditions and does not dereference pointers.
+                    let effective_uid = unsafe { libc::geteuid() };
+                    let identity = (metadata.dev(), metadata.ino());
+                    if metadata.uid() != effective_uid || metadata.mode() & 0o777 != 0o700 {
+                        let error = io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "private transaction quarantine is not a caller-owned 0700 directory",
+                        );
+                        let owned = CreatedDirectory {
+                            identity: Some(identity),
+                            ..provisional
+                        };
+                        return Err(with_cleanup_error(error, remove_owned_directory(&owned)));
+                    }
+                    if let Err(error) = reject_extended_acl(&directory, &name.to_string_lossy()) {
+                        let owned = CreatedDirectory {
+                            identity: Some(identity),
+                            ..provisional
+                        };
+                        return Err(with_cleanup_error(error, remove_owned_directory(&owned)));
+                    }
+                    return Ok(PrivateQuarantine {
+                        parent: provisional.parent,
+                        name,
+                        directory,
+                        identity,
+                    });
+                }
+                Ok(false) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate a unique private transaction quarantine",
+        ))
     }
 
     pub(super) fn write_outputs(
@@ -562,30 +1156,38 @@ mod anchored_output {
         write_outputs_with_hooks(
             output_directory,
             outputs,
-            || Ok(()),
-            |_, file| file.sync_all(),
-            |_| Ok(()),
-            || Ok(()),
-            |directory| directory.0.sync_all(),
+            WriteHooks {
+                pre_anchor: || Ok(()),
+                before_rename_probe: || Ok(()),
+                sync_staging: |_, file: &File| file.sync_all(),
+                before_publish: |_| Ok(()),
+                after_publication: || Ok(()),
+                sync_directory: |directory: &Directory| directory.0.sync_all(),
+            },
         )
     }
 
-    fn write_outputs_with_hooks<F, S, G, H, D>(
+    fn write_outputs_with_hooks<F, P, S, G, H, D>(
         output_directory: &Path,
         outputs: &[(String, &[u8])],
-        pre_anchor_hook: F,
-        mut sync_staging: S,
-        mut before_publish_hook: G,
-        after_publication_hook: H,
-        mut sync_directory: D,
+        hooks: WriteHooks<F, P, S, G, H, D>,
     ) -> io::Result<super::WriteOutcome>
     where
         F: FnOnce() -> io::Result<()>,
+        P: FnOnce() -> io::Result<()>,
         S: FnMut(usize, &File) -> io::Result<()>,
         G: FnMut(usize) -> io::Result<()>,
         H: FnOnce() -> io::Result<()>,
         D: FnMut(&Directory) -> io::Result<()>,
     {
+        let WriteHooks {
+            pre_anchor: pre_anchor_hook,
+            before_rename_probe: before_rename_probe_hook,
+            mut sync_staging,
+            before_publish: mut before_publish_hook,
+            after_publication: after_publication_hook,
+            mut sync_directory,
+        } = hooks;
         let relative_paths: Vec<_> = outputs
             .iter()
             .map(|(filename, _)| super::validate_relative_output_path(filename))
@@ -628,10 +1230,21 @@ mod anchored_output {
             ));
         }
 
+        let quarantine = match create_private_quarantine(&root) {
+            Ok(quarantine) => quarantine,
+            Err(error) => {
+                return Err(with_cleanup_error(
+                    error,
+                    remove_created_directories(&created_directories),
+                ));
+            }
+        };
+
         let entries_result = relative_paths
             .iter()
             .zip(outputs)
-            .map(|(relative, (_, contents))| {
+            .enumerate()
+            .map(|(index, (relative, (_, contents)))| {
                 let parent = create_relative_parent(
                     &root,
                     relative.parent().unwrap_or_else(|| Path::new("")),
@@ -654,6 +1267,14 @@ mod anchored_output {
                     target,
                     temporary: c_name(OsStr::new(&format!(".{basename}.tmp-{}", process::id())))?,
                     backup: c_name(OsStr::new(&format!(".{basename}.backup-{}", process::id())))?,
+                    rename_probe: c_name(OsStr::new(&format!(
+                        ".{basename}.rename-probe-{}",
+                        process::id()
+                    )))?,
+                    published_claim: c_name(OsStr::new(&format!("{index}-published")))?,
+                    temporary_claim: c_name(OsStr::new(&format!("{index}-temporary")))?,
+                    backup_claim: c_name(OsStr::new(&format!("{index}-backup")))?,
+                    rename_probe_claim: c_name(OsStr::new(&format!("{index}-rename-probe")))?,
                     display_path: relative.display().to_string(),
                     contents,
                     had_existing_target: false,
@@ -665,12 +1286,22 @@ mod anchored_output {
             Err(error) => {
                 return Err(with_cleanup_error(
                     error,
-                    remove_created_directories(&created_directories),
+                    rollback(&[], &[], &[], &[], &quarantine, &created_directories),
                 ));
             }
         };
 
         let pinned_preflight = entries.iter_mut().try_for_each(|entry| {
+            let parent_device = entry.parent.identity()?.0;
+            if parent_device != quarantine.identity.0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::CrossesDevices,
+                    format!(
+                        "output parent for {} is on a different filesystem than the transaction quarantine",
+                        entry.display_path
+                    ),
+                ));
+            }
             entry.had_existing_target =
                 inspect_target(&entry.parent, &entry.target, Path::new(&entry.display_path))?;
             ensure_absent(
@@ -684,37 +1315,112 @@ mod anchored_output {
                 &entry.backup,
                 "backup staging",
                 &entry.display_path,
-            )
+            )?;
+            ensure_absent(
+                &entry.parent,
+                &entry.rename_probe,
+                "transaction rename probe",
+                &entry.display_path,
+            )?;
+            for (name, label) in [
+                (&entry.published_claim, "published-output quarantine"),
+                (&entry.temporary_claim, "temporary-output quarantine"),
+                (&entry.backup_claim, "backup quarantine"),
+                (&entry.rename_probe_claim, "rename-probe quarantine"),
+            ] {
+                ensure_absent(&quarantine.directory, name, label, &entry.display_path)?;
+            }
+            Ok(())
         });
         if let Err(error) = pinned_preflight {
             return Err(with_cleanup_error(
                 error,
-                remove_created_directories(&created_directories),
+                rollback(&entries, &[], &[], &[], &quarantine, &created_directories),
             ));
+        }
+
+        if let Err(error) = before_rename_probe_hook() {
+            return Err(with_cleanup_error(
+                error,
+                rollback(&entries, &[], &[], &[], &quarantine, &created_directories),
+            ));
+        }
+
+        for entry in &entries {
+            // Probe every pinned descriptor. Two bind-mount instances of the
+            // same underlying directory can share device and inode identities
+            // while still rejecting a rename across their mount boundary.
+            if let Err(error) = verify_quarantine_rename_pair(entry, &quarantine) {
+                return Err(with_cleanup_error(
+                    error,
+                    rollback(&entries, &[], &[], &[], &quarantine, &created_directories),
+                ));
+            }
         }
 
         let mut temporary_files = Vec::new();
         for (index, entry) in entries.iter().enumerate() {
             let mut file = match entry.parent.create_file(&entry.temporary) {
-                Ok(file) => file,
+                Ok(file) => {
+                    // Register cleanup ownership before any later fallible inspection.
+                    temporary_files.push((index, None));
+                    file
+                }
                 Err(error) => {
                     return Err(with_cleanup_error(
                         operation_error("create temporary output for", &entry.display_path, error),
-                        rollback(&entries, &temporary_files, &[], &[], &created_directories),
+                        rollback(
+                            &entries,
+                            &temporary_files,
+                            &[],
+                            &[],
+                            &quarantine,
+                            &created_directories,
+                        ),
                     ));
                 }
             };
-            temporary_files.push(index);
+            let metadata = match file.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    return Err(with_cleanup_error(
+                        operation_error("inspect temporary output for", &entry.display_path, error),
+                        rollback(
+                            &entries,
+                            &temporary_files,
+                            &[],
+                            &[],
+                            &quarantine,
+                            &created_directories,
+                        ),
+                    ));
+                }
+            };
+            temporary_files[index].1 = Some((metadata.dev(), metadata.ino()));
             if let Err(error) = file.write_all(entry.contents) {
                 return Err(with_cleanup_error(
                     operation_error("write temporary output for", &entry.display_path, error),
-                    rollback(&entries, &temporary_files, &[], &[], &created_directories),
+                    rollback(
+                        &entries,
+                        &temporary_files,
+                        &[],
+                        &[],
+                        &quarantine,
+                        &created_directories,
+                    ),
                 ));
             }
             if let Err(error) = sync_staging(index, &file) {
                 return Err(with_cleanup_error(
                     operation_error("sync temporary output for", &entry.display_path, error),
-                    rollback(&entries, &temporary_files, &[], &[], &created_directories),
+                    rollback(
+                        &entries,
+                        &temporary_files,
+                        &[],
+                        &[],
+                        &quarantine,
+                        &created_directories,
+                    ),
                 ));
             }
         }
@@ -722,6 +1428,26 @@ mod anchored_output {
         let mut backed_up = Vec::new();
         for (index, entry) in entries.iter().enumerate() {
             if entry.had_existing_target {
+                let expected_identity = match required_regular_file_identity(
+                    &entry.parent,
+                    &entry.target,
+                    &entry.display_path,
+                ) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        return Err(with_cleanup_error(
+                            error,
+                            rollback(
+                                &entries,
+                                &temporary_files,
+                                &backed_up,
+                                &[],
+                                &quarantine,
+                                &created_directories,
+                            ),
+                        ));
+                    }
+                };
                 if let Err(error) = rename_noreplace_with_context(
                     &entry.parent,
                     &entry.target,
@@ -737,28 +1463,21 @@ mod anchored_output {
                             &temporary_files,
                             &backed_up,
                             &[],
+                            &quarantine,
                             &created_directories,
                         ),
                     ));
                 }
-                backed_up.push(index);
-                match inspect_target(&entry.parent, &entry.backup, Path::new(&entry.display_path)) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        return Err(with_cleanup_error(
-                            io::Error::other(format!(
-                                "output target {} disappeared during publication",
-                                entry.display_path
-                            )),
-                            rollback(
-                                &entries,
-                                &temporary_files,
-                                &backed_up,
-                                &[],
-                                &created_directories,
-                            ),
-                        ));
-                    }
+                // The expected identity was captured through the target's open
+                // descriptor. Register the moved backup before inspecting its
+                // new pathname so every post-rename failure can roll it back.
+                backed_up.push((index, expected_identity));
+                let actual_identity = match required_regular_file_identity(
+                    &entry.parent,
+                    &entry.backup,
+                    &entry.display_path,
+                ) {
+                    Ok(identity) => identity,
                     Err(error) => {
                         return Err(with_cleanup_error(
                             error,
@@ -767,10 +1486,28 @@ mod anchored_output {
                                 &temporary_files,
                                 &backed_up,
                                 &[],
+                                &quarantine,
                                 &created_directories,
                             ),
                         ));
                     }
+                };
+                if actual_identity != expected_identity {
+                    let error = io::Error::other(format!(
+                        "output target {} changed while staging its backup",
+                        entry.display_path
+                    ));
+                    return Err(with_cleanup_error(
+                        error,
+                        rollback(
+                            &entries,
+                            &temporary_files,
+                            &backed_up,
+                            &[],
+                            &quarantine,
+                            &created_directories,
+                        ),
+                    ));
                 }
             }
         }
@@ -785,6 +1522,7 @@ mod anchored_output {
                         &temporary_files,
                         &backed_up,
                         &published,
+                        &quarantine,
                         &created_directories,
                     ),
                 ));
@@ -804,19 +1542,31 @@ mod anchored_output {
                         &temporary_files,
                         &backed_up,
                         &published,
+                        &quarantine,
                         &created_directories,
                     ),
                 ));
             }
-            published.push(index);
+            published.push((
+                index,
+                temporary_files[index]
+                    .1
+                    .expect("published temporary output has a recorded identity"),
+            ));
         }
         let hook_result = after_publication_hook();
-        let cleanup_result = cleanup_backups(&entries, &backed_up);
-        let directory_sync_result =
-            sync_published_directories(&entries, &created_directories, &mut sync_directory);
+        let cleanup_result = cleanup_backups(&entries, &backed_up, &quarantine);
+        let quarantine_cleanup_result = remove_private_quarantine(&quarantine);
+        let directory_sync_result = sync_published_directories(
+            &entries,
+            &created_directories,
+            &quarantine.parent,
+            &mut sync_directory,
+        );
         let mut cleanup_warning = None;
         merge_post_publication_result(&mut cleanup_warning, hook_result);
         merge_post_publication_result(&mut cleanup_warning, cleanup_result);
+        merge_post_publication_result(&mut cleanup_warning, quarantine_cleanup_result);
         merge_post_publication_result(&mut cleanup_warning, directory_sync_result);
         Ok(super::WriteOutcome { cleanup_warning })
     }
@@ -856,6 +1606,35 @@ mod anchored_output {
                     if error.kind() == io::ErrorKind::NotFound
                         && !matches!(component, Component::ParentDir) =>
                 {
+                    if let Err(error) = validate_transaction_parent(
+                        &current,
+                        &format!("parent of {}", segment.to_string_lossy()),
+                    ) {
+                        return Err(with_cleanup_error(
+                            error,
+                            remove_created_directories(&created),
+                        ));
+                    }
+                    let cleanup = match created_directory_cleanup_name(segment) {
+                        Ok(cleanup) => cleanup,
+                        Err(error) => {
+                            return Err(with_cleanup_error(
+                                error,
+                                remove_created_directories(&created),
+                            ));
+                        }
+                    };
+                    if let Err(error) = ensure_absent(
+                        &current,
+                        &cleanup,
+                        "created-directory cleanup",
+                        &segment.to_string_lossy(),
+                    ) {
+                        return Err(with_cleanup_error(
+                            error,
+                            remove_created_directories(&created),
+                        ));
+                    }
                     let cleanup_parent = match current.try_clone() {
                         Ok(parent) => parent,
                         Err(error) => {
@@ -874,14 +1653,43 @@ mod anchored_output {
                             ));
                         }
                     };
-                    if child_created {
+                    let owned_index = if child_created {
+                        // Register ownership before opening or inspecting the
+                        // new directory so every subsequent failure preserves it.
                         created.push(CreatedDirectory {
                             parent: cleanup_parent,
                             name: name.clone(),
+                            cleanup,
+                            identity: None,
                         });
-                    }
+                        Some(created.len() - 1)
+                    } else {
+                        None
+                    };
                     match current.open_child(&name) {
-                        Ok(child) => current = child,
+                        Ok(child) => {
+                            if let Some(index) = owned_index {
+                                let identity = match child.identity() {
+                                    Ok(identity) => identity,
+                                    Err(error) => {
+                                        return Err(with_cleanup_error(
+                                            error,
+                                            remove_created_directories(&created),
+                                        ));
+                                    }
+                                };
+                                created[index].identity = Some(identity);
+                            }
+                            if let Err(error) =
+                                validate_transaction_parent(&child, &segment.to_string_lossy())
+                            {
+                                return Err(with_cleanup_error(
+                                    error,
+                                    remove_created_directories(&created),
+                                ));
+                            }
+                            current = child;
+                        }
                         Err(error) => {
                             return Err(with_cleanup_error(
                                 output_directory_component_error(segment, error),
@@ -897,6 +1705,14 @@ mod anchored_output {
                     ));
                 }
             }
+        }
+        if let Err(error) =
+            validate_transaction_parent(&current, &output_directory.display().to_string())
+        {
+            return Err(with_cleanup_error(
+                error,
+                remove_created_directories(&created),
+            ));
         }
         Ok((current, created))
     }
@@ -954,18 +1770,41 @@ mod anchored_output {
             match current.open_child(&name) {
                 Ok(child) => current = child,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    validate_transaction_parent(
+                        &current,
+                        &format!("parent of {}", segment.to_string_lossy()),
+                    )?;
+                    let cleanup = created_directory_cleanup_name(segment)?;
+                    ensure_absent(
+                        &current,
+                        &cleanup,
+                        "created-directory cleanup",
+                        &segment.to_string_lossy(),
+                    )?;
                     let cleanup_parent = current.try_clone()?;
-                    if current.create_child(&name)? {
+                    let child_created = current.create_child(&name)?;
+                    let owned_index = if child_created {
                         created.push(CreatedDirectory {
                             parent: cleanup_parent,
                             name: name.clone(),
+                            cleanup,
+                            identity: None,
                         });
+                        Some(created.len() - 1)
+                    } else {
+                        None
+                    };
+                    let child = current.open_child(&name)?;
+                    if let Some(index) = owned_index {
+                        created[index].identity = Some(child.identity()?);
                     }
-                    current = current.open_child(&name)?;
+                    validate_transaction_parent(&child, &segment.to_string_lossy())?;
+                    current = child;
                 }
                 Err(error) => return Err(error),
             }
         }
+        validate_transaction_parent(&current, &relative.display().to_string())?;
         Ok(current)
     }
 
@@ -1039,48 +1878,466 @@ mod anchored_output {
         }
     }
 
+    fn required_regular_file_identity(
+        parent: &Directory,
+        name: &CStr,
+        display_path: &str,
+    ) -> io::Result<(u64, u64)> {
+        let opened = match parent.open_entry(name) {
+            Err(error) if error.raw_os_error() == Some(EACCES) => {
+                parent.open_entry_write_only(name)
+            }
+            result => result,
+        };
+        let file = opened.map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("failed to identify regular file for {display_path}: {error}"),
+            )
+        })?;
+        let metadata = file.metadata().map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("failed to identify regular file for {display_path}: {error}"),
+            )
+        })?;
+        if !metadata.is_file() {
+            return Err(io::Error::other(format!(
+                "transaction-owned path for {display_path} is not a regular file"
+            )));
+        }
+        Ok((metadata.dev(), metadata.ino()))
+    }
+
+    fn remove_verified_probe(
+        parent: &Directory,
+        name: &CStr,
+        expected_identity: (u64, u64),
+        display_path: &str,
+    ) -> io::Result<()> {
+        let actual_identity = required_regular_file_identity(parent, name, display_path)?;
+        if actual_identity != expected_identity {
+            return Err(io::Error::other(format!(
+                "transaction rename probe for {display_path} changed; preserving it"
+            )));
+        }
+        // The parent has already passed the ownership, mode, sticky-bit, and
+        // Darwin ACL checks. A different effective UID cannot replace this
+        // caller-owned probe between identity validation and removal.
+        parent.remove_file(name)
+    }
+
+    fn verify_quarantine_rename_pair(
+        entry: &OutputEntry<'_>,
+        quarantine: &PrivateQuarantine,
+    ) -> io::Result<()> {
+        let file = quarantine
+            .directory
+            .create_file(&entry.rename_probe_claim)
+            .map_err(|error| {
+                operation_error(
+                    "create transaction rename probe for",
+                    &entry.display_path,
+                    error,
+                )
+            })?;
+        // Cleanup ownership is established by the exclusive create inside the
+        // private quarantine before this fallible descriptor inspection.
+        let metadata = match file.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                let cleanup = quarantine.directory.remove_file(&entry.rename_probe_claim);
+                return Err(with_cleanup_error(
+                    operation_error(
+                        "inspect transaction rename probe for",
+                        &entry.display_path,
+                        error,
+                    ),
+                    cleanup,
+                ));
+            }
+        };
+        let expected_identity = (metadata.dev(), metadata.ino());
+        drop(file);
+
+        if let Err(error) = rename_noreplace_with_context(
+            &quarantine.directory,
+            &entry.rename_probe_claim,
+            &entry.parent,
+            &entry.rename_probe,
+            "probe transaction restore path for",
+            &entry.display_path,
+        ) {
+            let cleanup = remove_verified_probe(
+                &quarantine.directory,
+                &entry.rename_probe_claim,
+                expected_identity,
+                &entry.display_path,
+            );
+            return Err(with_cleanup_error(error, cleanup));
+        }
+
+        if let Err(error) = rename_noreplace_with_context(
+            &entry.parent,
+            &entry.rename_probe,
+            &quarantine.directory,
+            &entry.rename_probe_claim,
+            "probe transaction cleanup path for",
+            &entry.display_path,
+        ) {
+            let cleanup = remove_verified_probe(
+                &entry.parent,
+                &entry.rename_probe,
+                expected_identity,
+                &entry.display_path,
+            );
+            return Err(with_cleanup_error(error, cleanup));
+        }
+
+        remove_verified_probe(
+            &quarantine.directory,
+            &entry.rename_probe_claim,
+            expected_identity,
+            &entry.display_path,
+        )
+        .map_err(|error| {
+            operation_error(
+                "finish transaction rename probe for",
+                &entry.display_path,
+                error,
+            )
+        })
+    }
+
+    fn claim_owned_file(
+        source_parent: &Directory,
+        source: &CStr,
+        quarantine: &PrivateQuarantine,
+        claim: &CStr,
+        expected_identity: (u64, u64),
+        display_path: &str,
+        missing_is_clean: bool,
+    ) -> io::Result<bool> {
+        match rename_noreplace_with_context(
+            source_parent,
+            source,
+            &quarantine.directory,
+            claim,
+            "claim transaction-owned path for cleanup of",
+            display_path,
+        ) {
+            Ok(()) => {}
+            Err(error) if missing_is_clean && error.kind() == io::ErrorKind::NotFound => {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        }
+
+        // The claim now lives below a random caller-owned 0700 directory held
+        // open by descriptor. A different security principal cannot replace it
+        // between this identity check and the final disposition.
+        let actual_identity =
+            match required_regular_file_identity(&quarantine.directory, claim, display_path) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    let restore = rename_noreplace_with_context(
+                        &quarantine.directory,
+                        claim,
+                        source_parent,
+                        source,
+                        "restore unverified cleanup claim for",
+                        display_path,
+                    );
+                    return Err(with_cleanup_error(error, restore));
+                }
+            };
+        if actual_identity != expected_identity {
+            let error = io::Error::other(format!(
+                "transaction-owned path for {display_path} changed before cleanup; refusing to remove it"
+            ));
+            let restore = rename_noreplace_with_context(
+                &quarantine.directory,
+                claim,
+                source_parent,
+                source,
+                "restore changed cleanup claim for",
+                display_path,
+            );
+            return Err(with_cleanup_error(error, restore));
+        }
+        Ok(true)
+    }
+
+    fn remove_owned_file(
+        source_parent: &Directory,
+        source: &CStr,
+        quarantine: &PrivateQuarantine,
+        claim: &CStr,
+        expected_identity: (u64, u64),
+        display_path: &str,
+        missing_is_clean: bool,
+    ) -> io::Result<()> {
+        if claim_owned_file(
+            source_parent,
+            source,
+            quarantine,
+            claim,
+            expected_identity,
+            display_path,
+            missing_is_clean,
+        )? {
+            quarantine.directory.remove_file(claim)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn restore_owned_file(
+        source_parent: &Directory,
+        source: &CStr,
+        quarantine: &PrivateQuarantine,
+        claim: &CStr,
+        target: &CStr,
+        expected_identity: (u64, u64),
+        display_path: &str,
+    ) -> io::Result<()> {
+        claim_owned_file(
+            source_parent,
+            source,
+            quarantine,
+            claim,
+            expected_identity,
+            display_path,
+            false,
+        )?;
+        match rename_noreplace_with_context(
+            &quarantine.directory,
+            claim,
+            source_parent,
+            target,
+            "restore backup for",
+            display_path,
+        ) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let preserve = rename_noreplace_with_context(
+                    &quarantine.directory,
+                    claim,
+                    source_parent,
+                    source,
+                    "preserve unrestored backup for",
+                    display_path,
+                );
+                Err(with_cleanup_error(error, preserve))
+            }
+        }
+    }
+
+    fn remove_owned_directory(directory: &CreatedDirectory) -> io::Result<()> {
+        match rename_noreplace_with_context(
+            &directory.parent,
+            &directory.name,
+            &directory.parent,
+            &directory.cleanup,
+            "claim transaction-created directory for cleanup of",
+            &directory.name.to_string_lossy(),
+        ) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        let Some(expected_identity) = directory.identity else {
+            let error = io::Error::other(format!(
+                "transaction-created directory {} could not be identified; preserving it",
+                directory.name.to_string_lossy()
+            ));
+            let restore = rename_noreplace_with_context(
+                &directory.parent,
+                &directory.cleanup,
+                &directory.parent,
+                &directory.name,
+                "restore unidentified created-directory cleanup claim for",
+                &directory.name.to_string_lossy(),
+            );
+            return Err(with_cleanup_error(error, restore));
+        };
+        let actual_identity = match directory.parent.open_child(&directory.cleanup) {
+            Ok(child) => child.identity(),
+            Err(error) => Err(error),
+        };
+        match actual_identity {
+            Ok(identity) if identity == expected_identity => {
+                match directory.parent.remove_directory(&directory.cleanup) {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        match rename_noreplace_with_context(
+                            &directory.parent,
+                            &directory.cleanup,
+                            &directory.parent,
+                            &directory.name,
+                            "restore nonempty transaction-created directory after failed cleanup of",
+                            &directory.name.to_string_lossy(),
+                        ) {
+                            Ok(()) => Err(io::Error::new(
+                                error.kind(),
+                                format!(
+                                    "failed to remove transaction-created directory {}: {error}; restored it at its original name",
+                                    directory.name.to_string_lossy()
+                                ),
+                            )),
+                            Err(restore_error) => Err(io::Error::new(
+                                error.kind(),
+                                format!(
+                                    "failed to remove transaction-created directory {}: {error}; recovery directory remains at {} because its original name could not be restored: {restore_error}",
+                                    directory.name.to_string_lossy(),
+                                    directory.cleanup.to_string_lossy()
+                                ),
+                            )),
+                        }
+                    }
+                }
+            }
+            Ok(_) => {
+                let error = io::Error::other(format!(
+                    "transaction-created directory {} changed before cleanup; refusing to remove it",
+                    directory.name.to_string_lossy()
+                ));
+                let restore = rename_noreplace_with_context(
+                    &directory.parent,
+                    &directory.cleanup,
+                    &directory.parent,
+                    &directory.name,
+                    "restore changed created-directory cleanup claim for",
+                    &directory.name.to_string_lossy(),
+                );
+                Err(with_cleanup_error(error, restore))
+            }
+            Err(error) => {
+                let restore = rename_noreplace_with_context(
+                    &directory.parent,
+                    &directory.cleanup,
+                    &directory.parent,
+                    &directory.name,
+                    "restore unverified created-directory cleanup claim for",
+                    &directory.name.to_string_lossy(),
+                );
+                Err(with_cleanup_error(error, restore))
+            }
+        }
+    }
+
+    fn remove_private_quarantine(quarantine: &PrivateQuarantine) -> io::Result<()> {
+        let cleanup = CreatedDirectory {
+            parent: quarantine.parent.try_clone()?,
+            name: quarantine.name.clone(),
+            cleanup: created_directory_cleanup_name(OsStr::from_bytes(quarantine.name.to_bytes()))?,
+            identity: Some(quarantine.identity),
+        };
+        remove_owned_directory(&cleanup)
+    }
+
+    fn preserve_unidentified_file(
+        source_parent: &Directory,
+        source: &CStr,
+        quarantine: &PrivateQuarantine,
+        claim: &CStr,
+        display_path: &str,
+    ) -> io::Result<()> {
+        match rename_noreplace_with_context(
+            source_parent,
+            source,
+            &quarantine.directory,
+            claim,
+            "preserve unidentified transaction-owned path for",
+            display_path,
+        ) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+            Ok(()) => Err(io::Error::other(format!(
+                "transaction-owned path for {display_path} could not be identified and was preserved in the private transaction quarantine as {}",
+                claim.to_string_lossy()
+            ))),
+        }
+    }
+
     fn rollback(
         entries: &[OutputEntry<'_>],
-        temporary_files: &[usize],
-        backed_up: &[usize],
-        published: &[usize],
+        temporary_files: &[(usize, Option<(u64, u64)>)],
+        backed_up: &[(usize, (u64, u64))],
+        published: &[(usize, (u64, u64))],
+        quarantine: &PrivateQuarantine,
         created_directories: &[CreatedDirectory],
     ) -> io::Result<()> {
         let mut errors = Vec::new();
-        for index in published.iter().rev() {
+        for (index, expected_identity) in published.iter().rev() {
             let entry = &entries[*index];
             record_cleanup_error(
                 &mut errors,
                 &format!("remove published output {}", entry.display_path),
-                entry.parent.remove_file(&entry.target),
+                remove_owned_file(
+                    &entry.parent,
+                    &entry.target,
+                    quarantine,
+                    &entry.published_claim,
+                    *expected_identity,
+                    &entry.display_path,
+                    true,
+                ),
             );
         }
-        for index in backed_up.iter().rev() {
+        for (index, expected_identity) in backed_up.iter().rev() {
             let entry = &entries[*index];
             record_cleanup_error(
                 &mut errors,
                 &format!("restore original output {}", entry.display_path),
-                rename_noreplace_with_context(
+                restore_owned_file(
                     &entry.parent,
                     &entry.backup,
-                    &entry.parent,
+                    quarantine,
+                    &entry.backup_claim,
                     &entry.target,
-                    "restore backup for",
+                    *expected_identity,
                     &entry.display_path,
                 ),
             );
         }
-        for index in temporary_files {
-            if published.contains(index) {
+        for (index, expected_identity) in temporary_files {
+            if published
+                .iter()
+                .any(|(published_index, _)| published_index == index)
+            {
                 continue;
             }
             let entry = &entries[*index];
+            let cleanup = match expected_identity {
+                Some(expected_identity) => remove_owned_file(
+                    &entry.parent,
+                    &entry.temporary,
+                    quarantine,
+                    &entry.temporary_claim,
+                    *expected_identity,
+                    &entry.display_path,
+                    true,
+                ),
+                None => preserve_unidentified_file(
+                    &entry.parent,
+                    &entry.temporary,
+                    quarantine,
+                    &entry.temporary_claim,
+                    &entry.display_path,
+                ),
+            };
             record_cleanup_error(
                 &mut errors,
                 &format!("remove temporary output {}", entry.display_path),
-                entry.parent.remove_file(&entry.temporary),
+                cleanup,
             );
         }
+        record_cleanup_error(
+            &mut errors,
+            "remove private transaction quarantine",
+            remove_private_quarantine(quarantine),
+        );
         record_cleanup_error(
             &mut errors,
             "remove transaction-created directories",
@@ -1089,14 +2346,26 @@ mod anchored_output {
         cleanup_result("output rollback", errors)
     }
 
-    fn cleanup_backups(entries: &[OutputEntry<'_>], backed_up: &[usize]) -> io::Result<()> {
+    fn cleanup_backups(
+        entries: &[OutputEntry<'_>],
+        backed_up: &[(usize, (u64, u64))],
+        quarantine: &PrivateQuarantine,
+    ) -> io::Result<()> {
         let mut errors = Vec::new();
-        for index in backed_up {
+        for (index, expected_identity) in backed_up {
             let entry = &entries[*index];
             record_cleanup_error(
                 &mut errors,
                 &format!("remove backup for {}", entry.display_path),
-                entry.parent.remove_file(&entry.backup),
+                remove_owned_file(
+                    &entry.parent,
+                    &entry.backup,
+                    quarantine,
+                    &entry.backup_claim,
+                    *expected_identity,
+                    &entry.display_path,
+                    false,
+                ),
             );
         }
         cleanup_result("published-output backup cleanup", errors)
@@ -1105,6 +2374,7 @@ mod anchored_output {
     fn sync_published_directories<D>(
         entries: &[OutputEntry<'_>],
         created_directories: &[CreatedDirectory],
+        quarantine_parent: &Directory,
         sync_directory: &mut D,
     ) -> io::Result<()>
     where
@@ -1112,6 +2382,13 @@ mod anchored_output {
     {
         let mut synced = BTreeSet::new();
         let mut errors = Vec::new();
+        sync_directory_once(
+            quarantine_parent,
+            "sync private transaction quarantine parent",
+            &mut synced,
+            &mut errors,
+            sync_directory,
+        );
         for entry in entries {
             sync_directory_once(
                 &entry.parent,
@@ -1173,7 +2450,7 @@ mod anchored_output {
                     "remove created directory {}",
                     directory.name.to_string_lossy()
                 ),
-                directory.parent.remove_directory(&directory.name),
+                remove_owned_directory(directory),
             );
         }
         cleanup_result("created-directory cleanup", errors)
@@ -1284,6 +2561,13 @@ mod anchored_output {
         })
     }
 
+    fn created_directory_cleanup_name(name: &OsStr) -> io::Result<CString> {
+        let mut cleanup = OsString::from(".");
+        cleanup.push(name);
+        cleanup.push(format!(".directory-cleanup-{}", process::id()));
+        c_name(&cleanup)
+    }
+
     fn file_from_descriptor(descriptor: RawFd) -> io::Result<File> {
         if descriptor < 0 {
             Err(io::Error::last_os_error())
@@ -1313,11 +2597,14 @@ mod anchored_output {
         write_outputs_with_hooks(
             output_directory,
             outputs,
-            hook,
-            |_, file| file.sync_all(),
-            |_| Ok(()),
-            || Ok(()),
-            |directory| directory.0.sync_all(),
+            WriteHooks {
+                pre_anchor: hook,
+                before_rename_probe: || Ok(()),
+                sync_staging: |_, file: &File| file.sync_all(),
+                before_publish: |_| Ok(()),
+                after_publication: || Ok(()),
+                sync_directory: |directory: &Directory| directory.0.sync_all(),
+            },
         )
     }
 
@@ -1333,11 +2620,14 @@ mod anchored_output {
         write_outputs_with_hooks(
             output_directory,
             outputs,
-            || Ok(()),
-            |index, _| hook(index),
-            |_| Ok(()),
-            || Ok(()),
-            |directory| directory.0.sync_all(),
+            WriteHooks {
+                pre_anchor: || Ok(()),
+                before_rename_probe: || Ok(()),
+                sync_staging: |index, _: &File| hook(index),
+                before_publish: |_| Ok(()),
+                after_publication: || Ok(()),
+                sync_directory: |directory: &Directory| directory.0.sync_all(),
+            },
         )
     }
 
@@ -1353,11 +2643,14 @@ mod anchored_output {
         write_outputs_with_hooks(
             output_directory,
             outputs,
-            || Ok(()),
-            |_, file| file.sync_all(),
-            hook,
-            || Ok(()),
-            |directory| directory.0.sync_all(),
+            WriteHooks {
+                pre_anchor: || Ok(()),
+                before_rename_probe: || Ok(()),
+                sync_staging: |_, file: &File| file.sync_all(),
+                before_publish: hook,
+                after_publication: || Ok(()),
+                sync_directory: |directory: &Directory| directory.0.sync_all(),
+            },
         )
     }
 
@@ -1373,11 +2666,14 @@ mod anchored_output {
         write_outputs_with_hooks(
             output_directory,
             outputs,
-            || Ok(()),
-            |_, file| file.sync_all(),
-            |_| Ok(()),
-            hook,
-            |directory| directory.0.sync_all(),
+            WriteHooks {
+                pre_anchor: || Ok(()),
+                before_rename_probe: || Ok(()),
+                sync_staging: |_, file: &File| file.sync_all(),
+                before_publish: |_| Ok(()),
+                after_publication: hook,
+                sync_directory: |directory: &Directory| directory.0.sync_all(),
+            },
         )
     }
 
@@ -1394,14 +2690,40 @@ mod anchored_output {
         write_outputs_with_hooks(
             output_directory,
             outputs,
-            || Ok(()),
-            |_, file| file.sync_all(),
-            |_| Ok(()),
-            || Ok(()),
-            |_| {
-                let result = hook(index);
-                index += 1;
-                result
+            WriteHooks {
+                pre_anchor: || Ok(()),
+                before_rename_probe: || Ok(()),
+                sync_staging: |_, file: &File| file.sync_all(),
+                before_publish: |_| Ok(()),
+                after_publication: || Ok(()),
+                sync_directory: |_: &Directory| {
+                    let result = hook(index);
+                    index += 1;
+                    result
+                },
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn write_outputs_before_rename_probe_hook<F>(
+        output_directory: &Path,
+        outputs: &[(String, &[u8])],
+        hook: F,
+    ) -> io::Result<super::WriteOutcome>
+    where
+        F: FnOnce() -> io::Result<()>,
+    {
+        write_outputs_with_hooks(
+            output_directory,
+            outputs,
+            WriteHooks {
+                pre_anchor: || Ok(()),
+                before_rename_probe: hook,
+                sync_staging: |_, file: &File| file.sync_all(),
+                before_publish: |_| Ok(()),
+                after_publication: || Ok(()),
+                sync_directory: |directory: &Directory| directory.0.sync_all(),
             },
         )
     }
@@ -1505,6 +2827,267 @@ mod tests {
             ),
             std::path::Path::new("/workspace/out")
         );
+    }
+
+    #[test]
+    fn checked_failure_directory_appends_suffix_to_the_complete_output_path() {
+        assert_eq!(
+            super::failure_output_directory(std::path::Path::new("/workspace/build/out")).unwrap(),
+            std::path::Path::new("/workspace/build/out.failed")
+        );
+        let relative = std::env::current_dir().unwrap().join("relative/out.failed");
+        assert_eq!(
+            super::failure_output_directory(std::path::Path::new("relative/out")).unwrap(),
+            relative
+        );
+        assert_eq!(
+            super::failure_output_directory(std::path::Path::new("relative/out/")).unwrap(),
+            relative
+        );
+        assert_eq!(
+            super::failure_output_directory(std::path::Path::new("relative/out/.")).unwrap(),
+            relative
+        );
+        assert_eq!(
+            super::failure_output_directory(std::path::Path::new("relative/out/../final/."))
+                .unwrap(),
+            std::env::current_dir()
+                .unwrap()
+                .join("relative/final.failed")
+        );
+        assert!(super::failure_output_directory(std::path::Path::new("/")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checked_failure_directory_preserves_non_utf8_basename_bytes() {
+        use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+
+        let output =
+            std::path::PathBuf::from(std::ffi::OsString::from_vec(vec![b'o', b'u', b't', 0xff]));
+        let failure = super::failure_output_directory(&output).unwrap();
+        assert_eq!(
+            failure.file_name().unwrap().as_bytes(),
+            &[
+                b'o', b'u', b't', 0xff, b'.', b'f', b'a', b'i', b'l', b'e', b'd'
+            ]
+        );
+    }
+
+    #[test]
+    fn simulation_chain_is_sorted_and_duplicate_paths_fail_before_publication() {
+        let mut outputs = Vec::new();
+        super::append_simulation_output_chain(
+            &mut outputs,
+            [
+                ("simulation/id/result.json", b"result"),
+                ("simulation/id/analysis.spice", b"netlist"),
+                ("simulation/id/report.json", b"report"),
+                ("simulation/id/request.json", b"request"),
+                ("simulation/id/spice-map.json", b"map"),
+            ],
+        );
+        super::sort_outputs(&mut outputs).expect("distinct output paths must sort");
+        assert_eq!(
+            outputs
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "simulation/id/analysis.spice",
+                "simulation/id/report.json",
+                "simulation/id/request.json",
+                "simulation/id/result.json",
+                "simulation/id/spice-map.json",
+            ]
+        );
+
+        outputs.push(("simulation/id/result.json".to_owned(), b"duplicate"));
+        assert!(super::sort_outputs(&mut outputs).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compiler_work_root_is_private_external_and_explicitly_cleaned() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let scratch = scratch_directory("compiler-work-root");
+        let output = scratch.join("output");
+        let work_root =
+            super::CompileWorkRoot::create(&output).expect("allocate private compiler work root");
+        let path = work_root.path().to_owned();
+        let canonical_temporary = std::fs::canonicalize(std::env::temp_dir())
+            .expect("canonicalize OS temporary directory");
+        assert!(path.starts_with(canonical_temporary));
+        assert!(!path.starts_with(&output));
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("inspect compiler work root")
+                .mode()
+                & 0o777,
+            0o700
+        );
+        // SAFETY: `geteuid` has no preconditions and does not dereference pointers.
+        assert_eq!(std::fs::metadata(&path).unwrap().uid(), unsafe {
+            libc::geteuid()
+        });
+        let nonce = path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .rsplit('-')
+            .next()
+            .unwrap()
+            .to_owned();
+        assert_eq!(nonce.len(), 32);
+        assert!(nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+        work_root
+            .cleanup()
+            .expect("explicit compiler work-root cleanup must succeed");
+        assert!(!path.exists());
+
+        let dropped_path = {
+            let work_root = super::CompileWorkRoot::create(&output)
+                .expect("allocate compiler work root for drop cleanup");
+            work_root.path().to_owned()
+        };
+        assert!(
+            !dropped_path.exists(),
+            "RAII drop must remove an unconsumed compiler work root"
+        );
+        std::fs::remove_dir_all(scratch).expect("remove test scratch directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compiler_work_root_validates_injected_temporary_parent_and_uses_random_names() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let scratch = scratch_directory("compiler-work-parent");
+        let private_parent = scratch.join("private");
+        std::fs::create_dir(&private_parent).unwrap();
+        std::fs::set_permissions(&private_parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = scratch.join("output");
+
+        let first = super::CompileWorkRoot::create_in_parent(&output, &private_parent).unwrap();
+        let second = super::CompileWorkRoot::create_in_parent(&output, &private_parent).unwrap();
+        let first_path = first.path().to_owned();
+        let second_path = second.path().to_owned();
+        assert_ne!(first_path, second_path);
+        first.cleanup().unwrap();
+        second.cleanup().unwrap();
+
+        let sticky_parent = scratch.join("sticky");
+        std::fs::create_dir(&sticky_parent).unwrap();
+        std::fs::set_permissions(&sticky_parent, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        super::CompileWorkRoot::create_in_parent(&output, &sticky_parent)
+            .unwrap()
+            .cleanup()
+            .unwrap();
+
+        let insecure_parent = scratch.join("insecure");
+        std::fs::create_dir(&insecure_parent).unwrap();
+        std::fs::set_permissions(&insecure_parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let error = match super::CompileWorkRoot::create_in_parent(&output, &insecure_parent) {
+            Ok(root) => {
+                root.cleanup().unwrap();
+                panic!("non-sticky shared temporary parent must be rejected")
+            }
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn compiler_work_root_rejects_an_extended_acl_parent() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::process::Command;
+
+        let scratch = scratch_directory("compiler-work-acl-parent");
+        let temporary = scratch.join("temporary");
+        std::fs::create_dir(&temporary).unwrap();
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let status = Command::new("/bin/chmod")
+            .arg("+a")
+            .arg("everyone allow add_file,add_subdirectory,delete_child")
+            .arg(&temporary)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let error =
+            match super::CompileWorkRoot::create_in_parent(&scratch.join("output"), &temporary) {
+                Ok(root) => {
+                    root.cleanup().unwrap();
+                    panic!("an extended ACL temporary parent must be rejected")
+                }
+                Err(error) => error,
+            };
+        assert!(
+            error
+                .to_string()
+                .contains("has an extended ACL and cannot provide private compiler storage"),
+            "unexpected compiler ACL error: {error}"
+        );
+        let status = Command::new("/bin/chmod")
+            .arg("-N")
+            .arg(&temporary)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compiler_work_root_refuses_to_live_below_the_output_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let scratch = scratch_directory("compiler-work-boundary");
+        let temporary = scratch.join("temporary");
+        std::fs::create_dir(&temporary).unwrap();
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let before = std::fs::read_dir(&temporary)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("circuitc-compile-")
+            })
+            .count();
+        let error = match super::CompileWorkRoot::create_in_parent(&temporary, &temporary) {
+            Ok(root) => {
+                root.cleanup().expect("clean unexpected work root");
+                panic!("OS temporary output root must be rejected")
+            }
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("must be outside the output directory")
+        );
+        let after = std::fs::read_dir(&temporary)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("circuitc-compile-")
+            })
+            .count();
+        assert_eq!(
+            before, after,
+            "fallible validation must not leak work roots"
+        );
+        std::fs::remove_dir_all(scratch).unwrap();
     }
 
     #[test]
@@ -1833,6 +3416,114 @@ mod tests {
         ),
     ))]
     #[test]
+    fn publication_rejects_a_shared_writable_parent_without_the_sticky_bit() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = scratch_directory("unsafe-shared-parent");
+        let output = scratch.join("output");
+        fs::create_dir(&output).expect("create output directory");
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o777))
+            .expect("make output directory shared writable");
+        let outputs = [("result.txt".to_owned(), b"generated".as_slice())];
+
+        let error = super::write_outputs(&output, &outputs)
+            .expect_err("a non-sticky shared-writable output parent must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("writable by other users without the sticky bit"),
+            "unexpected unsafe-parent error: {error}"
+        );
+        assert!(!output.join("result.txt").exists());
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o700))
+            .expect("restore output permissions for cleanup");
+        fs::remove_dir_all(&scratch).expect("remove test scratch directory");
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+    ))]
+    #[test]
+    fn publication_allows_a_sticky_shared_writable_parent() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = scratch_directory("sticky-shared-parent");
+        let output = scratch.join("output");
+        fs::create_dir(&output).expect("create output directory");
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o1777))
+            .expect("make output directory sticky and shared writable");
+        let outputs = [("result.txt".to_owned(), b"generated".as_slice())];
+
+        super::write_outputs(&output, &outputs)
+            .expect("sticky namespace protection must permit publication");
+        assert_eq!(fs::read(output.join("result.txt")).unwrap(), b"generated");
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o700))
+            .expect("restore output permissions for cleanup");
+        fs::remove_dir_all(&scratch).expect("remove test scratch directory");
+    }
+
+    #[cfg(all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ))]
+    #[test]
+    fn publication_rejects_a_mode_private_parent_with_an_extended_acl() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let scratch = scratch_directory("extended-acl-parent");
+        let output = scratch.join("output");
+        fs::create_dir(&output).expect("create output directory");
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o700))
+            .expect("make output mode-private");
+        let status = Command::new("/bin/chmod")
+            .arg("+a")
+            .arg("everyone allow add_file,add_subdirectory,delete_child")
+            .arg(&output)
+            .status()
+            .expect("invoke Darwin ACL editor");
+        assert!(status.success(), "install inherited everyone ACL");
+        let outputs = [("result.txt".to_owned(), b"generated".as_slice())];
+
+        let error = super::write_outputs(&output, &outputs)
+            .expect_err("an extended ACL must fail the private namespace check");
+        assert!(
+            error
+                .to_string()
+                .contains("has an extended ACL and cannot provide isolated transaction cleanup"),
+            "unexpected ACL error: {error}"
+        );
+        assert!(!output.join("result.txt").exists());
+        let status = Command::new("/bin/chmod")
+            .arg("-N")
+            .arg(&output)
+            .status()
+            .expect("remove Darwin ACL");
+        assert!(status.success(), "remove inherited everyone ACL");
+        fs::remove_dir_all(&scratch).expect("remove test scratch directory");
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+    ))]
+    #[test]
     fn output_target_symlink_has_an_explicit_non_regular_diagnostic() {
         use std::fs;
         use std::os::unix::fs::symlink;
@@ -2063,6 +3754,49 @@ mod tests {
         ),
     ))]
     #[test]
+    fn transaction_rename_probe_fails_before_staging_and_preserves_a_racing_name() {
+        use std::fs;
+
+        let scratch = scratch_directory("transaction-rename-probe-race");
+        let output = scratch.join("output");
+        fs::create_dir(&output).expect("create output directory");
+        let outputs = [("result.txt".to_owned(), b"generated".as_slice())];
+        let racing_probe = output.join(format!(".result.txt.rename-probe-{}", std::process::id()));
+
+        let error = super::anchored_output::write_outputs_before_rename_probe_hook(
+            &output,
+            &outputs,
+            || fs::write(&racing_probe, b"racing probe writer"),
+        )
+        .expect_err("the reversible rename probe must reject a racing destination");
+
+        assert!(
+            error
+                .to_string()
+                .contains("probe transaction restore path for result.txt"),
+            "unexpected transaction-probe error: {error}"
+        );
+        assert_eq!(fs::read(&racing_probe).unwrap(), b"racing probe writer");
+        assert!(!output.join("result.txt").exists());
+        assert_eq!(
+            fs::read_dir(&output).unwrap().count(),
+            1,
+            "probe failure must occur before temporary output staging"
+        );
+        fs::remove_dir_all(&scratch).expect("remove test scratch directory");
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+    ))]
+    #[test]
     fn successful_publication_reports_backup_cleanup_failure_as_a_warning() {
         use std::fs;
 
@@ -2096,6 +3830,118 @@ mod tests {
             "injected staging residue must be observable"
         );
         fs::remove_dir(&backup).expect("remove injected backup directory");
+        fs::remove_dir_all(&scratch).expect("remove test scratch directory");
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+    ))]
+    #[test]
+    fn cleanup_quarantine_is_random_caller_owned_and_private() {
+        use std::fs;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let scratch = scratch_directory("private-cleanup-quarantine");
+        let output = scratch.join("output");
+        fs::create_dir(&output).expect("create output directory");
+        let outputs = [("result.txt".to_owned(), b"generated".as_slice())];
+
+        super::anchored_output::write_outputs_after_publication_hook(&output, &outputs, || {
+            let prefix = format!(".circuitc-transaction-{}-", std::process::id());
+            let quarantines: Vec<_> = fs::read_dir(&output)?
+                .filter_map(|entry| {
+                    let entry = entry.ok()?;
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(&prefix)
+                        .then_some(entry.path())
+                })
+                .collect();
+            assert_eq!(quarantines.len(), 1);
+            let name = quarantines[0].file_name().unwrap().to_string_lossy();
+            assert_eq!(name.len(), prefix.len() + 32, "nonce must be 128 bits");
+            let metadata = fs::metadata(&quarantines[0])?;
+            // SAFETY: `geteuid` has no preconditions and does not dereference pointers.
+            let effective_uid = unsafe { libc::geteuid() };
+            assert_eq!(metadata.uid(), effective_uid);
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+            Ok(())
+        })
+        .expect("publication with a private quarantine must succeed");
+
+        assert_eq!(
+            fs::read_dir(&output).unwrap().count(),
+            1,
+            "successful cleanup must remove the private quarantine"
+        );
+        fs::remove_dir_all(&scratch).expect("remove test scratch directory");
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+    ))]
+    #[test]
+    fn nonempty_cleanup_quarantine_is_restored_at_its_original_name() {
+        use std::cell::RefCell;
+        use std::fs;
+
+        let scratch = scratch_directory("nonempty-cleanup-quarantine");
+        let output = scratch.join("output");
+        fs::create_dir(&output).expect("create output directory");
+        let outputs = [("result.txt".to_owned(), b"generated".as_slice())];
+        let quarantine_path = RefCell::new(None);
+
+        let outcome =
+            super::anchored_output::write_outputs_after_publication_hook(&output, &outputs, || {
+                let prefix = format!(".circuitc-transaction-{}-", std::process::id());
+                let path = fs::read_dir(&output)?
+                    .filter_map(Result::ok)
+                    .find(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+                    .expect("private quarantine must exist during publication")
+                    .path();
+                fs::write(path.join("recovery-sentinel"), b"preserve me")?;
+                quarantine_path.replace(Some(path));
+                Ok(())
+            })
+            .expect("publication remains successful when quarantine cleanup warns");
+
+        let warning = outcome
+            .cleanup_warning
+            .expect("nonempty quarantine must warn");
+        assert!(
+            warning
+                .to_string()
+                .contains("restored it at its original name"),
+            "unexpected quarantine recovery warning: {warning}"
+        );
+        let quarantine = quarantine_path.into_inner().unwrap();
+        assert_eq!(
+            fs::read(quarantine.join("recovery-sentinel")).unwrap(),
+            b"preserve me"
+        );
+        assert!(
+            fs::read_dir(&output).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("directory-cleanup")),
+            "failed cleanup must not strand the quarantine under an unnamed alias"
+        );
         fs::remove_dir_all(&scratch).expect("remove test scratch directory");
     }
 
@@ -2221,6 +4067,256 @@ mod tests {
             ]
         );
         fs::remove_dir_all(&scratch).expect("remove test scratch directory");
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+    ))]
+    #[test]
+    fn rollback_preserves_racing_replacement_and_original_backup() {
+        use std::fs;
+        use std::io;
+
+        let scratch = scratch_directory("publication-rollback-race-existing");
+        let output = scratch.join("output");
+        fs::create_dir(&output).unwrap();
+        fs::write(output.join("first.txt"), b"old first").unwrap();
+        fs::write(output.join("second.txt"), b"old second").unwrap();
+        let outputs = [
+            ("first.txt".to_owned(), b"new first".as_slice()),
+            ("second.txt".to_owned(), b"new second".as_slice()),
+        ];
+
+        let error =
+            super::anchored_output::write_outputs_before_publish_hook(&output, &outputs, |index| {
+                if index == 1 {
+                    fs::remove_file(output.join("first.txt"))?;
+                    fs::write(output.join("first.txt"), b"racing writer")?;
+                    Err(io::Error::other(
+                        "injected failure after racing replacement",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+            .expect_err("rollback must report a changed published target");
+
+        assert!(
+            error
+                .to_string()
+                .contains("changed before cleanup; refusing to remove it")
+        );
+        assert_eq!(
+            fs::read(output.join("first.txt")).unwrap(),
+            b"racing writer"
+        );
+        assert_eq!(fs::read(output.join("second.txt")).unwrap(), b"old second");
+        let backup = output.join(format!(".first.txt.backup-{}", std::process::id()));
+        assert_eq!(
+            fs::read(&backup).expect("the displaced original remains recoverable"),
+            b"old first"
+        );
+
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+    ))]
+    #[test]
+    fn rollback_preserves_racing_replacement_without_an_original_target() {
+        use std::fs;
+        use std::io;
+
+        let scratch = scratch_directory("publication-rollback-race-new");
+        let output = scratch.join("output");
+        fs::create_dir(&output).unwrap();
+        let outputs = [
+            ("first.txt".to_owned(), b"new first".as_slice()),
+            ("second.txt".to_owned(), b"new second".as_slice()),
+        ];
+
+        let error =
+            super::anchored_output::write_outputs_before_publish_hook(&output, &outputs, |index| {
+                if index == 1 {
+                    fs::remove_file(output.join("first.txt"))?;
+                    fs::write(output.join("first.txt"), b"racing writer")?;
+                    Err(io::Error::other(
+                        "injected failure after racing replacement",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+            .expect_err("rollback must report a changed published target");
+
+        assert!(
+            error
+                .to_string()
+                .contains("changed before cleanup; refusing to remove it")
+        );
+        assert_eq!(
+            fs::read(output.join("first.txt")).unwrap(),
+            b"racing writer"
+        );
+        assert!(!output.join("second.txt").exists());
+
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+    ))]
+    #[test]
+    fn rollback_preserves_racing_temporary_replacement() {
+        use std::fs;
+        use std::io;
+
+        let scratch = scratch_directory("publication-rollback-race-temporary");
+        let output = scratch.join("output");
+        fs::create_dir(&output).unwrap();
+        let outputs = [
+            ("first.txt".to_owned(), b"new first".as_slice()),
+            ("second.txt".to_owned(), b"new second".as_slice()),
+        ];
+        let temporary = output.join(format!(".first.txt.tmp-{}", std::process::id()));
+
+        let error =
+            super::anchored_output::write_outputs_before_publish_hook(&output, &outputs, |index| {
+                if index == 0 {
+                    fs::remove_file(&temporary)?;
+                    fs::write(&temporary, b"racing temporary writer")?;
+                    Err(io::Error::other(
+                        "injected failure after temporary replacement",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+            .expect_err("rollback must report a changed temporary path");
+
+        assert!(
+            error
+                .to_string()
+                .contains("changed before cleanup; refusing to remove it")
+        );
+        assert_eq!(fs::read(&temporary).unwrap(), b"racing temporary writer");
+        assert!(!output.join("first.txt").exists());
+        assert!(!output.join("second.txt").exists());
+
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+    ))]
+    #[test]
+    fn successful_cleanup_preserves_racing_backup_replacement() {
+        use std::fs;
+
+        let scratch = scratch_directory("publication-cleanup-race-backup");
+        let output = scratch.join("output");
+        fs::create_dir(&output).unwrap();
+        fs::write(output.join("result.txt"), b"old result").unwrap();
+        let outputs = [("result.txt".to_owned(), b"new result".as_slice())];
+        let backup = output.join(format!(".result.txt.backup-{}", std::process::id()));
+
+        let outcome =
+            super::anchored_output::write_outputs_after_publication_hook(&output, &outputs, || {
+                fs::remove_file(&backup)?;
+                fs::write(&backup, b"racing backup writer")
+            })
+            .expect("published outputs remain successful when cleanup preserves a changed backup");
+
+        let warning = outcome.cleanup_warning.expect("changed backup must warn");
+        assert!(
+            warning
+                .to_string()
+                .contains("changed before cleanup; refusing to remove it")
+        );
+        assert_eq!(fs::read(output.join("result.txt")).unwrap(), b"new result");
+        assert_eq!(fs::read(&backup).unwrap(), b"racing backup writer");
+
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+    ))]
+    #[test]
+    fn rollback_preserves_racing_created_directory_replacement() {
+        use std::fs;
+        use std::io;
+
+        let scratch = scratch_directory("publication-rollback-race-directory");
+        let output = scratch.join("created/child");
+        let displaced = scratch.join("displaced-created");
+        let outputs = [("result.txt".to_owned(), b"generated".as_slice())];
+
+        let error =
+            super::anchored_output::write_outputs_after_pre_anchor_hook(&output, &outputs, || {
+                fs::rename(scratch.join("created"), &displaced)?;
+                fs::create_dir(scratch.join("created"))?;
+                fs::write(
+                    scratch.join("created/sentinel.txt"),
+                    b"racing directory writer",
+                )?;
+                Err(io::Error::other(
+                    "injected failure after directory replacement",
+                ))
+            })
+            .expect_err("rollback must report a changed created directory");
+
+        assert!(
+            error
+                .to_string()
+                .contains("changed before cleanup; refusing to remove it")
+        );
+        assert_eq!(
+            fs::read(scratch.join("created/sentinel.txt")).unwrap(),
+            b"racing directory writer"
+        );
+        assert!(
+            displaced.exists(),
+            "the displaced created inode remains recoverable"
+        );
+
+        fs::remove_dir_all(&scratch).unwrap();
     }
 
     #[cfg(any(

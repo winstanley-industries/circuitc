@@ -98,28 +98,37 @@ printf '  analysis dc_operating_point divider.simulation.dc;\n' \
 tail -n 1 "${source_fixture}" >>"${intent_dir}/intent.circuitc"
 printf 'existing board\n' >"${intent_dir}/output/voltage_divider.kicad_pcb"
 printf 'existing spice\n' >"${intent_dir}/output/voltage_divider.spice"
-printf 'existing board\n' >"${intent_dir}/expected.kicad_pcb"
-printf 'existing spice\n' >"${intent_dir}/expected.spice"
-set +e
 "${cli}" compile "${intent_dir}/intent.circuitc" \
   --output-dir "${intent_dir}/output" --diagnostic-format=json \
   >"${intent_dir}/diagnostic.stdout" 2>"${intent_dir}/diagnostic.json"
-intent_status=$?
-set -e
-if [[ ${intent_status} -ne 1 ]]; then
-  echo "expected declared-intent exit 1; found ${intent_status}" >&2
+if [[ -s "${intent_dir}/diagnostic.json" ]]; then
+  echo "checked simulation intent unexpectedly emitted diagnostics" >&2
+  cat "${intent_dir}/diagnostic.json" >&2
   exit 1
 fi
-grep -F '"code": "CC-SIM-PHASE-001"' "${intent_dir}/diagnostic.json"
 cmp "${intent_dir}/output/voltage_divider.kicad_pcb" \
-  "${intent_dir}/expected.kicad_pcb"
+  "${first_dir}/voltage_divider.kicad_pcb"
 cmp "${intent_dir}/output/voltage_divider.spice" \
-  "${intent_dir}/expected.spice"
-if [[ $(find "${intent_dir}/output" -type f | wc -l) -ne 2 ]]; then
-  echo "declared simulation intent published unexpected static artifacts" >&2
+  "${first_dir}/voltage_divider.spice"
+intent_chains=("${intent_dir}/output"/simulation/*)
+if [[ ${#intent_chains[@]} -ne 1 || ! -d "${intent_chains[0]}" ]]; then
+  echo "checked simulation intent did not publish exactly one analysis chain" >&2
   find "${intent_dir}/output" -print >&2
   exit 1
 fi
+for artifact in analysis.spice request.json spice-map.json result.json report.json; do
+  test -f "${intent_chains[0]}/${artifact}"
+done
+if [[ $(find "${intent_chains[0]}" -type f | wc -l) -ne 5 ]]; then
+  echo "checked simulation chain contains an unexpected artifact set" >&2
+  find "${intent_chains[0]}" -print >&2
+  exit 1
+fi
+grep -F '"status": "completed"' "${intent_chains[0]}/result.json"
+grep -F '"pass": 0' "${intent_chains[0]}/report.json"
+grep -F '"fail": 0' "${intent_chains[0]}/report.json"
+grep -F '"unsupported": 0' "${intent_chains[0]}/report.json"
+grep -F '"unevaluated": 0' "${intent_chains[0]}/report.json"
 
 atomic_dir="${TEST_TMPDIR}/atomic-output"
 mkdir -p "${atomic_dir}/voltage_divider.spice"

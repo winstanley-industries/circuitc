@@ -31,6 +31,8 @@ pub(crate) struct SimulationInputBundle {
     pub netlist_path: RelativeArtifactPath,
     pub request_path: RelativeArtifactPath,
     pub map_path: RelativeArtifactPath,
+    pub result_path: RelativeArtifactPath,
+    pub report_path: RelativeArtifactPath,
     pub netlist: String,
     pub request_json: String,
     pub spice_identity_map_json: String,
@@ -47,11 +49,15 @@ impl SimulationInputBundle {
         let expected_netlist = format!("simulation/{expected_stem}/analysis.spice");
         let expected_request = format!("simulation/{expected_stem}/request.json");
         let expected_map = format!("simulation/{expected_stem}/spice-map.json");
+        let expected_result = format!("simulation/{expected_stem}/result.json");
+        let expected_report = format!("simulation/{expected_stem}/report.json");
         if request.analysis.path != self.analysis_path
             || request.analysis.kind != self.analysis_kind
             || self.netlist_path.as_str() != expected_netlist
             || self.request_path.as_str() != expected_request
             || self.map_path.as_str() != expected_map
+            || self.result_path.as_str() != expected_result
+            || self.report_path.as_str() != expected_report
             || request.analysis.netlist_path != self.netlist_path.as_str()
             || request.analysis.map_path != self.map_path.as_str()
         {
@@ -135,6 +141,8 @@ pub(crate) fn lower_inputs_with_limit(
                     bundle.netlist_path.as_str(),
                     bundle.request_path.as_str(),
                     bundle.map_path.as_str(),
+                    bundle.result_path.as_str(),
+                    bundle.report_path.as_str(),
                 ] {
                     if !paths.insert(path.to_owned()) {
                         diagnostics.push(lower_diagnostic(
@@ -164,6 +172,8 @@ impl SimulationInputBundle {
             self.netlist_path.as_str().len(),
             self.request_path.as_str().len(),
             self.map_path.as_str().len(),
+            self.result_path.as_str().len(),
+            self.report_path.as_str().len(),
             self.netlist.len(),
             self.request_json.len(),
             self.spice_identity_map_json.len(),
@@ -233,6 +243,8 @@ fn lower_one(
     let netlist_path = relative_path(analysis, format!("simulation/{path_stem}/analysis.spice"))?;
     let request_path = relative_path(analysis, format!("simulation/{path_stem}/request.json"))?;
     let map_path = relative_path(analysis, format!("simulation/{path_stem}/spice-map.json"))?;
+    let result_path = relative_path(analysis, format!("simulation/{path_stem}/result.json"))?;
+    let report_path = relative_path(analysis, format!("simulation/{path_stem}/report.json"))?;
 
     let mut assertions: Vec<_> = design
         .assertions
@@ -286,6 +298,8 @@ fn lower_one(
         netlist_path,
         request_path,
         map_path,
+        result_path,
+        report_path,
         netlist: lowered.netlist,
         request_json,
         spice_identity_map_json,

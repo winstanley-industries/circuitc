@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 
 use serde::de::DeserializeOwned;
@@ -112,7 +112,7 @@ pub enum AxisKind {
     TimeSeconds,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SignalKind {
     NetVoltage,
@@ -123,7 +123,7 @@ pub enum SignalKind {
     BranchCurrentPhaseDegrees,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResultUnit {
     Volt,
@@ -1021,13 +1021,13 @@ fn verify_result_signal_mappings(
     Ok(())
 }
 
-struct ResultIndex<'a> {
-    samples: BTreeMap<&'a str, usize>,
-    signals: BTreeMap<(SignalKind, &'a str, ResultUnit), &'a ResultSignal>,
+pub(super) struct ResultIndex<'a> {
+    samples: HashMap<&'a str, usize>,
+    signals: HashMap<(SignalKind, &'a str, ResultUnit), &'a ResultSignal>,
 }
 
 impl<'a> ResultIndex<'a> {
-    fn new(result: &'a SimulationResult) -> Self {
+    pub(super) fn new(result: &'a SimulationResult) -> Self {
         Self {
             samples: result
                 .axis
@@ -1049,7 +1049,7 @@ impl<'a> ResultIndex<'a> {
         }
     }
 
-    fn actual(
+    pub(super) fn actual(
         &self,
         signal_kind: SignalKind,
         canonical_identity: &str,
@@ -1548,22 +1548,24 @@ fn validate_assertion_status(
         return;
     }
 
-    let difference = (actual - expected).abs();
-    let allowed = absolute_tolerance + relative_tolerance * expected.abs();
-    if !difference.is_finite() || !allowed.is_finite() {
-        push(
-            diagnostics,
-            "CC-SIM-CONTRACT-005",
-            format!("assertions[{index}].status"),
-            "assertion comparison overflowed the finite floating-point result boundary",
-        );
-        return;
-    }
-
-    let expected_status = if difference <= allowed {
-        AssertionStatus::Pass
-    } else {
-        AssertionStatus::Fail
+    let comparison_path = format!("assertions[{index}].status");
+    let expected_status = match compare_assertion_values(
+        actual,
+        expected,
+        absolute_tolerance,
+        relative_tolerance,
+        &comparison_path,
+    ) {
+        Ok(status) => status,
+        Err(diagnostic) => {
+            push(
+                diagnostics,
+                diagnostic.code,
+                diagnostic.path,
+                diagnostic.message,
+            );
+            return;
+        }
     };
     if assertion.status != expected_status {
         push(
@@ -1573,6 +1575,31 @@ fn validate_assertion_status(
             "pass/fail status contradicts the inclusive absolute-plus-relative tolerance formula",
         );
     }
+}
+
+pub(super) fn compare_assertion_values(
+    actual: f64,
+    expected: f64,
+    absolute_tolerance: f64,
+    relative_tolerance: f64,
+    path: &str,
+) -> Result<AssertionStatus, ContractDiagnostic> {
+    let difference = (actual - expected).abs();
+    let allowed = absolute_tolerance + relative_tolerance * expected.abs();
+    if !difference.is_finite() || !allowed.is_finite() {
+        return Err(ContractDiagnostic {
+            code: "CC-SIM-CONTRACT-005",
+            path: path.to_owned(),
+            message: "assertion comparison overflowed the finite floating-point result boundary"
+                .to_owned(),
+        });
+    }
+
+    Ok(if difference <= allowed {
+        AssertionStatus::Pass
+    } else {
+        AssertionStatus::Fail
+    })
 }
 
 fn expected_unit(kind: SignalKind) -> ResultUnit {

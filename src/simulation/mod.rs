@@ -1,5 +1,6 @@
 //! Versioned simulation process contracts.
 
+pub(crate) mod assert;
 pub mod contract;
 pub(crate) mod lower;
 pub mod runner;
