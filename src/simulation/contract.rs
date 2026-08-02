@@ -1990,6 +1990,27 @@ mod tests {
         inclusive_boundary.assertions[0].absolute_tolerance = canonical_f64(1.0).unwrap();
         assert!(inclusive_boundary.validate().is_ok());
 
+        let mut relative_boundary = report();
+        relative_boundary.assertions[0].expected = canonical_f64(4.0).unwrap();
+        relative_boundary.assertions[0].actual =
+            RequiredNullable::some(canonical_f64(7.0).unwrap());
+        relative_boundary.assertions[0].absolute_tolerance = canonical_f64(1.0).unwrap();
+        relative_boundary.assertions[0].relative_tolerance = canonical_f64(0.5).unwrap();
+        assert!(
+            relative_boundary.validate().is_ok(),
+            "difference 3 must pass at 1 absolute + 0.5 * abs(4) relative"
+        );
+
+        let mut relative_beyond = relative_boundary;
+        relative_beyond.assertions[0].actual = RequiredNullable::some(canonical_f64(8.0).unwrap());
+        relative_beyond.assertions[0].status = AssertionStatus::Fail;
+        relative_beyond.summary.pass = 0;
+        relative_beyond.summary.fail = 1;
+        assert!(
+            relative_beyond.validate().is_ok(),
+            "difference 4 must fail beyond 1 absolute + 0.5 * abs(4) relative"
+        );
+
         let without_actual = json
             .lines()
             .filter(|line| !line.contains("\"actual\":"))
