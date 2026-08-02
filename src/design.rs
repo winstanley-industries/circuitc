@@ -561,6 +561,22 @@ impl Design {
                 &mut diagnostics,
             );
         }
+        let mut schematic_positions = BTreeMap::new();
+        let mut schematic_components: Vec<_> = self.components.iter().collect();
+        schematic_components.sort_by(|left, right| left.path.cmp(&right.path));
+        for component in schematic_components {
+            if let Some(first_path) = schematic_positions.insert(
+                component.schematic_placement.position,
+                component.path.as_str(),
+            ) {
+                push(
+                    &mut diagnostics,
+                    "CC-SCHEMATIC-003",
+                    component.path.as_str(),
+                    format!("schematic placement shares its anchor with component {first_path}"),
+                );
+            }
+        }
 
         let mut route_paths = BTreeSet::new();
         let mut route_keys = BTreeSet::new();
@@ -1544,6 +1560,11 @@ mod tests {
         let mut design = voltage_divider();
         design.components[0].schematic_placement.position.x = MAX_ABS_COORDINATE_NM + 1;
         assert_rejected(design, "CC-SCHEMATIC-002");
+
+        let mut design = voltage_divider();
+        design.components[1].schematic_placement.position =
+            design.components[0].schematic_placement.position;
+        assert_rejected(design, "CC-SCHEMATIC-003");
 
         let mut design = voltage_divider();
         design.components[0].connections.pop();

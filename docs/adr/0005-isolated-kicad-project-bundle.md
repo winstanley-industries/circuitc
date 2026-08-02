@@ -36,6 +36,8 @@ derived from canonical intent.
   contract change.
 - One compile emits an isolated KiCad bundle: schematic, board, project JSON,
   local library tables, and the exact vendored symbol and footprint files.
+  The library-file collection is ordered and derived from the catalog entries
+  used by the design rather than represented by fixed singleton fields.
   Library tables use `${KIPRJMOD}` paths and never refer to user-global tables.
 - Vendored footprint silkscreen and courtyard drawings remain KiCad catalog
   data outside canonical Design IR. Board lowering copies those drawings with
@@ -44,6 +46,9 @@ derived from canonical intent.
 - Schematic symbols and PCB footprints share a deterministically derived
   semantic identity. The PCB path points at the schematic symbol UUID so
   KiCad's schematic-parity check owns acceptance.
+- Component schematic anchors are unique, and lowering rejects transformed
+  pin connection-point collisions when their canonical connection states
+  differ. Coincident labels cannot silently merge distinct CircuitC nets.
 - Source compilation emits a deterministic KiCad identity manifest mapping
   UUIDs to globally unique semantic paths and UTF-8 source locations. Its
   source field is derived from the design name rather than the requested input
@@ -64,7 +69,8 @@ derived from canonical intent.
 ## Consequences
 
 - Adding a supported library part requires a reviewed vendored asset plus a
-  matching catalog entry and ingestion tests.
+  matching catalog entry, drawing geometry, publishable-file mapping, and
+  ingestion tests.
 - Display names and library file order do not participate in canonical entity
   identity.
 - KiCad-specific symbol geometry remains outside Design IR; only the explicit

@@ -122,6 +122,26 @@ cmp \
   "${TEST_TMPDIR}/expected-symlink-board"
 test -L "${symlink_atomic_dir}/CircuitC.pretty"
 
+symlink_ancestor_real="${TEST_TMPDIR}/symlink-ancestor-real"
+symlink_ancestor_link="${TEST_TMPDIR}/symlink-ancestor-link"
+mkdir -p "${symlink_ancestor_real}"
+ln -s "${symlink_ancestor_real}" "${symlink_ancestor_link}"
+set +e
+"${cli}" compile "${source_fixture}" --output-dir "${symlink_ancestor_link}/out" \
+  >"${TEST_TMPDIR}/symlink-ancestor.stdout" \
+  2>"${TEST_TMPDIR}/symlink-ancestor.stderr"
+symlink_ancestor_status=$?
+set -e
+if [[ ${symlink_ancestor_status} -ne 3 ]]; then
+  echo "expected symlink-ancestor I/O exit 3; found ${symlink_ancestor_status}" >&2
+  exit 1
+fi
+grep -F 'CC-CLI-IO-002: failed to write output directory' \
+  "${TEST_TMPDIR}/symlink-ancestor.stderr"
+grep -F 'must be a non-symlinked directory' \
+  "${TEST_TMPDIR}/symlink-ancestor.stderr"
+test ! -e "${symlink_ancestor_real}/out"
+
 set +e
 "${cli}" compile "${TEST_TMPDIR}/missing.circuitc" --output-dir "${TEST_TMPDIR}/io" \
   >"${TEST_TMPDIR}/io.stdout" 2>"${TEST_TMPDIR}/io.stderr"

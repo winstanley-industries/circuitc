@@ -50,7 +50,7 @@ fn run(arguments: Vec<OsString>) -> Result<(), u8> {
     })?;
 
     let stem = &compiled.elaborated.design.name;
-    let outputs = [
+    let mut outputs = vec![
         (
             format!("{stem}.kicad_sch"),
             compiled.artifacts.kicad_schematic.as_bytes(),
@@ -63,14 +63,15 @@ fn run(arguments: Vec<OsString>) -> Result<(), u8> {
             format!("{stem}.kicad_pro"),
             compiled.artifacts.kicad_project.as_bytes(),
         ),
-        (
-            "CircuitC.kicad_sym".to_owned(),
-            compiled.artifacts.kicad_symbol_library.as_bytes(),
-        ),
-        (
-            "CircuitC.pretty/R_0603_1608Metric.kicad_mod".to_owned(),
-            compiled.artifacts.kicad_footprint_library.as_bytes(),
-        ),
+    ];
+    outputs.extend(
+        compiled
+            .artifacts
+            .kicad_library_files
+            .iter()
+            .map(|file| (file.relative_path.clone(), file.contents.as_bytes())),
+    );
+    outputs.extend([
         (
             "sym-lib-table".to_owned(),
             compiled.artifacts.kicad_symbol_table.as_bytes(),
@@ -84,7 +85,7 @@ fn run(arguments: Vec<OsString>) -> Result<(), u8> {
             compiled.kicad_identity_map.as_bytes(),
         ),
         (format!("{stem}.spice"), compiled.artifacts.spice.as_bytes()),
-    ];
+    ]);
     let write_outcome = write_outputs(&output_directory, &outputs).map_err(|error| {
         eprintln!(
             "CC-CLI-IO-002: failed to write output directory {}: {error}",
@@ -742,7 +743,7 @@ mod anchored_output {
                         Ok(child) => current = child,
                         Err(error) => {
                             return Err(with_cleanup_error(
-                                error,
+                                output_directory_component_error(segment, error),
                                 remove_created_directories(&created),
                             ));
                         }
@@ -750,13 +751,23 @@ mod anchored_output {
                 }
                 Err(error) => {
                     return Err(with_cleanup_error(
-                        error,
+                        output_directory_component_error(segment, error),
                         remove_created_directories(&created),
                     ));
                 }
             }
         }
         Ok((current, created))
+    }
+
+    fn output_directory_component_error(segment: &OsStr, error: io::Error) -> io::Error {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "output directory component {} must be a non-symlinked directory: {error}",
+                Path::new(segment).display()
+            ),
+        )
     }
 
     fn open_existing_parent(root: &Directory, relative: &Path) -> io::Result<Option<Directory>> {
@@ -1139,6 +1150,40 @@ mod tests {
         );
         assert!(!external.join("result.txt").exists());
         assert!(!moved_parent.join("result.txt").exists());
+        fs::remove_dir_all(&scratch).expect("remove test scratch directory");
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+    ))]
+    #[test]
+    fn output_directory_symlink_ancestor_fails_closed() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let scratch = scratch_directory("symlink-ancestor");
+        let real = scratch.join("real");
+        let link = scratch.join("link");
+        fs::create_dir_all(&real).expect("create real output ancestor");
+        symlink("real", &link).expect("create output ancestor symlink");
+        let outputs = [("result.txt".to_owned(), b"generated".as_slice())];
+
+        let error = super::write_outputs(&link.join("out"), &outputs)
+            .expect_err("symlinked output ancestor must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("must be a non-symlinked directory"),
+            "unexpected ancestor error: {error}"
+        );
+        assert!(!real.join("out").exists());
         fs::remove_dir_all(&scratch).expect("remove test scratch directory");
     }
 

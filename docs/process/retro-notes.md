@@ -51,3 +51,13 @@
   incomplete publication, but report successful publication plus staging
   residue with a dedicated warning instead of claiming the outputs were not
   written.
+- A positive source fixture does not prove a fail-closed language rule. Every
+  new source diagnostic needs a failure-side assertion for its code, message,
+  primary span, and related span where applicable.
+- Catalog growth is only additive when compiled artifacts carry an ordered,
+  design-derived library-file collection. Fixed symbol or footprint singleton
+  fields can silently publish an incomplete project after the second part is
+  added.
+- Security-relevant path policy needs both an internal regression and a
+  process-boundary test that pins the exit code and actionable diagnostic; an
+  adjacent symlink test is not evidence for ancestor traversal behavior.

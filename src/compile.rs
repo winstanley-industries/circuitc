@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::design::{Design, Diagnostic};
@@ -11,12 +12,17 @@ pub struct KicadIdentity {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KicadLibraryFile {
+    pub relative_path: String,
+    pub contents: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledArtifacts {
     pub kicad_schematic: String,
     pub kicad_pcb: String,
     pub kicad_project: String,
-    pub kicad_symbol_library: String,
-    pub kicad_footprint_library: String,
+    pub kicad_library_files: Vec<KicadLibraryFile>,
     pub kicad_symbol_table: String,
     pub kicad_footprint_table: String,
     pub kicad_identities: Vec<KicadIdentity>,
@@ -59,14 +65,34 @@ pub fn compile(design: &Design) -> Result<CompiledArtifacts, CompileError> {
         kicad_schematic: project.schematic,
         kicad_pcb: project.board,
         kicad_project: project.project,
-        kicad_symbol_library: crate::library::SYMBOL_LIBRARY.to_owned(),
-        kicad_footprint_library: crate::library::RESISTOR_FOOTPRINT_LIBRARY.to_owned(),
+        kicad_library_files: kicad_library_files(design),
         kicad_symbol_table: project.symbol_table,
         kicad_footprint_table: project.footprint_table,
         kicad_identities: project.identities,
         spice: lowered_spice.netlist,
         spice_name_map: lowered_spice.name_map,
     })
+}
+
+fn kicad_library_files(design: &Design) -> Vec<KicadLibraryFile> {
+    let mut files = BTreeMap::new();
+    for component in &design.components {
+        let symbol = crate::library::symbol_library_file(&component.symbol.library_id)
+            .expect("validated catalog symbol must have a publishable library file");
+        files.insert(symbol.relative_path, symbol.contents);
+        if let Some(physical) = &component.physical {
+            let footprint = crate::library::footprint_library_file(&physical.footprint.library_id)
+                .expect("validated catalog footprint must have a publishable library file");
+            files.insert(footprint.relative_path, footprint.contents);
+        }
+    }
+    files
+        .into_iter()
+        .map(|(relative_path, contents)| KicadLibraryFile {
+            relative_path: relative_path.to_owned(),
+            contents: contents.to_owned(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -90,6 +116,17 @@ mod tests {
         assert!(first.kicad_pcb.contains("(net \"VOUT\")"));
         assert!(first.spice.contains("R1 VIN VOUT 10e3"));
         assert!(first.spice.contains("V1 VIN 0 DC 10"));
+        assert_eq!(
+            first
+                .kicad_library_files
+                .iter()
+                .map(|file| file.relative_path.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "CircuitC.kicad_sym",
+                "CircuitC.pretty/R_0603_1608Metric.kicad_mod"
+            ]
+        );
     }
 
     #[test]
@@ -158,6 +195,34 @@ mod tests {
                 "rotation {rotation} emitted the wrong connected-pin coordinate"
             );
         }
+    }
+
+    #[test]
+    fn schematic_connection_point_collisions_fail_before_emission() {
+        let mut design = voltage_divider();
+        let r1_position = design.components[0].schematic_placement.position;
+        let r2 = design
+            .components
+            .iter_mut()
+            .find(|component| component.reference == "R2")
+            .expect("reference resistor exists");
+        r2.schematic_placement.position =
+            crate::design::PointNm::new(r1_position.x, r1_position.y + 7_620_000);
+        r2.connections
+            .iter_mut()
+            .find(|connection| connection.pin == "1")
+            .expect("R2 pin 1 connection exists")
+            .state = ConnectionState::Connected("GND".to_owned());
+
+        let diagnostics = compile(&design)
+            .expect_err("differently connected schematic pins may not share a point")
+            .diagnostics;
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CC-KICAD-SCHEMATIC-002"),
+            "missing schematic collision diagnostic: {diagnostics:#?}"
+        );
     }
 
     #[test]

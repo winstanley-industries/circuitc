@@ -31,19 +31,29 @@ fn main() -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
-    for (filename, contents) in [
-        ("voltage_divider.kicad_sch", artifacts.kicad_schematic),
-        ("voltage_divider.kicad_pcb", artifacts.kicad_pcb),
-        ("voltage_divider.kicad_pro", artifacts.kicad_project),
-        ("CircuitC.kicad_sym", artifacts.kicad_symbol_library),
+    let mut outputs = vec![
         (
-            "CircuitC.pretty/R_0603_1608Metric.kicad_mod",
-            artifacts.kicad_footprint_library,
+            "voltage_divider.kicad_sch".to_owned(),
+            artifacts.kicad_schematic,
         ),
-        ("sym-lib-table", artifacts.kicad_symbol_table),
-        ("fp-lib-table", artifacts.kicad_footprint_table),
-        ("voltage_divider.spice", artifacts.spice),
-    ] {
+        ("voltage_divider.kicad_pcb".to_owned(), artifacts.kicad_pcb),
+        (
+            "voltage_divider.kicad_pro".to_owned(),
+            artifacts.kicad_project,
+        ),
+    ];
+    outputs.extend(
+        artifacts
+            .kicad_library_files
+            .into_iter()
+            .map(|file| (file.relative_path, file.contents)),
+    );
+    outputs.extend([
+        ("sym-lib-table".to_owned(), artifacts.kicad_symbol_table),
+        ("fp-lib-table".to_owned(), artifacts.kicad_footprint_table),
+        ("voltage_divider.spice".to_owned(), artifacts.spice),
+    ]);
+    for (filename, contents) in outputs {
         let path = output_directory.join(filename);
         if let Some(parent) = path.parent()
             && let Err(error) = fs::create_dir_all(parent)

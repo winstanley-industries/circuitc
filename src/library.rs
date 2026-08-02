@@ -5,6 +5,12 @@ pub(crate) const RESISTOR_FOOTPRINT_LIBRARY: &str =
     include_str!("../libraries/CircuitC.pretty/R_0603_1608Metric.kicad_mod");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LibraryFileDefinition {
+    pub relative_path: &'static str,
+    pub contents: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SymbolPinDefinition {
     pub number: &'static str,
     pub electrical_type: ElectricalPinType,
@@ -42,6 +48,13 @@ pub(crate) struct FootprintGraphicsDefinition {
     pub courtyard_start: PointNm,
     pub courtyard_end: PointNm,
     pub courtyard_width_nm: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FootprintCatalogDefinition {
+    footprint: Footprint,
+    graphics: FootprintGraphicsDefinition,
+    library_file: LibraryFileDefinition,
 }
 
 pub(crate) fn part(identity: &PartIdentity) -> Option<PartDefinition> {
@@ -99,27 +112,15 @@ pub(crate) fn symbol(library_id: &str) -> Option<SymbolDefinition> {
     }
 }
 
+pub(crate) fn symbol_library_file(library_id: &str) -> Option<LibraryFileDefinition> {
+    symbol(library_id).map(|_| LibraryFileDefinition {
+        relative_path: "CircuitC.kicad_sym",
+        contents: SYMBOL_LIBRARY,
+    })
+}
+
 pub(crate) fn footprint(library_id: &str) -> Option<Footprint> {
-    match library_id {
-        "CircuitC:R_0603_1608Metric" => Some(Footprint {
-            library_id: library_id.to_owned(),
-            pads: vec![
-                Pad {
-                    number: "1".to_owned(),
-                    offset: PointNm::new(-1_000_000, 0),
-                    size: SizeNm::new(900_000, 950_000),
-                    shape: PadShape::RoundRect,
-                },
-                Pad {
-                    number: "2".to_owned(),
-                    offset: PointNm::new(1_000_000, 0),
-                    size: SizeNm::new(900_000, 950_000),
-                    shape: PadShape::RoundRect,
-                },
-            ],
-        }),
-        _ => None,
-    }
+    footprint_catalog(library_id).map(|definition| definition.footprint)
 }
 
 const RESISTOR_SILKSCREEN: &[GraphicLineDefinition] = &[
@@ -138,12 +139,43 @@ const RESISTOR_SILKSCREEN: &[GraphicLineDefinition] = &[
 ];
 
 pub(crate) fn footprint_graphics(library_id: &str) -> Option<FootprintGraphicsDefinition> {
+    footprint_catalog(library_id).map(|definition| definition.graphics)
+}
+
+pub(crate) fn footprint_library_file(library_id: &str) -> Option<LibraryFileDefinition> {
+    footprint_catalog(library_id).map(|definition| definition.library_file)
+}
+
+fn footprint_catalog(library_id: &str) -> Option<FootprintCatalogDefinition> {
     match library_id {
-        "CircuitC:R_0603_1608Metric" => Some(FootprintGraphicsDefinition {
-            silkscreen_lines: RESISTOR_SILKSCREEN,
-            courtyard_start: PointNm::new(-1_700_000, -750_000),
-            courtyard_end: PointNm::new(1_700_000, 750_000),
-            courtyard_width_nm: 50_000,
+        "CircuitC:R_0603_1608Metric" => Some(FootprintCatalogDefinition {
+            footprint: Footprint {
+                library_id: library_id.to_owned(),
+                pads: vec![
+                    Pad {
+                        number: "1".to_owned(),
+                        offset: PointNm::new(-1_000_000, 0),
+                        size: SizeNm::new(900_000, 950_000),
+                        shape: PadShape::RoundRect,
+                    },
+                    Pad {
+                        number: "2".to_owned(),
+                        offset: PointNm::new(1_000_000, 0),
+                        size: SizeNm::new(900_000, 950_000),
+                        shape: PadShape::RoundRect,
+                    },
+                ],
+            },
+            graphics: FootprintGraphicsDefinition {
+                silkscreen_lines: RESISTOR_SILKSCREEN,
+                courtyard_start: PointNm::new(-1_700_000, -750_000),
+                courtyard_end: PointNm::new(1_700_000, 750_000),
+                courtyard_width_nm: 50_000,
+            },
+            library_file: LibraryFileDefinition {
+                relative_path: "CircuitC.pretty/R_0603_1608Metric.kicad_mod",
+                contents: RESISTOR_FOOTPRINT_LIBRARY,
+            },
         }),
         _ => None,
     }
@@ -154,7 +186,8 @@ mod tests {
     use crate::design::{PadShape, PartIdentity, PointNm, SizeNm};
 
     use super::{
-        RESISTOR_FOOTPRINT_LIBRARY, SYMBOL_LIBRARY, footprint, footprint_graphics, part, symbol,
+        RESISTOR_FOOTPRINT_LIBRARY, SYMBOL_LIBRARY, footprint, footprint_graphics,
+        footprint_library_file, part, symbol, symbol_library_file,
     };
 
     #[test]
@@ -225,6 +258,25 @@ mod tests {
             SYMBOL_LIBRARY
                 .contains("(pin passive line\n        (at 0 -3.81 90)\n        (length 1.27)")
         );
+    }
+
+    #[test]
+    fn every_catalog_entry_has_a_publishable_library_file_and_footprint_graphics() {
+        for library_id in ["CircuitC:R", "CircuitC:VDC"] {
+            assert!(symbol(library_id).is_some());
+            let file = symbol_library_file(library_id)
+                .expect("every catalog symbol must have a publishable library file");
+            assert_eq!(file.relative_path, "CircuitC.kicad_sym");
+            assert!(!file.contents.is_empty());
+        }
+        for library_id in ["CircuitC:R_0603_1608Metric"] {
+            assert!(footprint(library_id).is_some());
+            assert!(footprint_graphics(library_id).is_some());
+            let file = footprint_library_file(library_id)
+                .expect("every catalog footprint must have a publishable library file");
+            assert!(file.relative_path.ends_with(".kicad_mod"));
+            assert!(!file.contents.is_empty());
+        }
     }
 
     #[test]

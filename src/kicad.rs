@@ -34,35 +34,78 @@ pub(crate) fn emit_project(design: &Design) -> ProjectArtifacts {
 pub(crate) fn validate(design: &Design) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     validate_catalog_bindings(design, &mut diagnostics);
+    validate_schematic_connection_points(design, &mut diagnostics);
     let mut uuids = BTreeMap::new();
     let mut semantic_paths = BTreeMap::new();
-    for identity in identities(design) {
-        if let Some(first_uuid) =
-            semantic_paths.insert(identity.semantic_path.clone(), identity.uuid.clone())
-        {
-            diagnostics.push(Diagnostic {
-                code: "CC-KICAD-ID-002",
-                path: identity.semantic_path.clone(),
-                message: format!(
-                    "generated KiCad semantic path is shared by UUIDs {first_uuid} and {}",
-                    identity.uuid
-                ),
-            });
-        }
-        if let Some(first_path) =
-            uuids.insert(identity.uuid.clone(), identity.semantic_path.clone())
-        {
-            diagnostics.push(Diagnostic {
-                code: "CC-KICAD-ID-001",
-                path: identity.semantic_path,
-                message: format!(
-                    "generated KiCad UUID {} collides with entity {first_path}",
-                    identity.uuid
-                ),
-            });
+    if diagnostics.is_empty() {
+        for identity in identities(design) {
+            if let Some(first_uuid) =
+                semantic_paths.insert(identity.semantic_path.clone(), identity.uuid.clone())
+            {
+                diagnostics.push(Diagnostic {
+                    code: "CC-KICAD-ID-002",
+                    path: identity.semantic_path.clone(),
+                    message: format!(
+                        "generated KiCad semantic path is shared by UUIDs {first_uuid} and {}",
+                        identity.uuid
+                    ),
+                });
+            }
+            if let Some(first_path) =
+                uuids.insert(identity.uuid.clone(), identity.semantic_path.clone())
+            {
+                diagnostics.push(Diagnostic {
+                    code: "CC-KICAD-ID-001",
+                    path: identity.semantic_path,
+                    message: format!(
+                        "generated KiCad UUID {} collides with entity {first_path}",
+                        identity.uuid
+                    ),
+                });
+            }
         }
     }
     diagnostics
+}
+
+fn validate_schematic_connection_points(design: &Design, diagnostics: &mut Vec<Diagnostic>) {
+    let mut occupied = BTreeMap::new();
+    let mut components: Vec<_> = design.components.iter().collect();
+    components.sort_by(|left, right| left.path.cmp(&right.path));
+    for component in components {
+        let mut bindings: Vec<_> = component.symbol.pins.iter().collect();
+        bindings.sort_by(|left, right| left.pin.cmp(&right.pin));
+        for binding in bindings {
+            let Some(position) = schematic_pin_position(component, &binding.symbol_pin) else {
+                continue;
+            };
+            let Some(connection) = component.connection_for_pin(&binding.pin) else {
+                continue;
+            };
+            if let Some((first_component, first_pin, first_connection)) = occupied.get(&position)
+                && *first_connection != connection
+            {
+                diagnostics.push(Diagnostic {
+                    code: "CC-KICAD-SCHEMATIC-002",
+                    path: format!("{}.connection.{}", component.path, binding.pin),
+                    message: format!(
+                        "schematic pin {} on {} shares connection point ({}, {}) nm with pin {} on {} but has a different connection state",
+                        binding.pin,
+                        component.path,
+                        position.x,
+                        position.y,
+                        first_pin,
+                        first_component
+                    ),
+                });
+            } else {
+                occupied.insert(
+                    position,
+                    (component.path.as_str(), binding.pin.as_str(), connection),
+                );
+            }
+        }
+    }
 }
 
 fn validate_catalog_bindings(design: &Design, diagnostics: &mut Vec<Diagnostic>) {
@@ -100,6 +143,16 @@ fn validate_catalog_bindings(design: &Design, diagnostics: &mut Vec<Diagnostic>)
             });
         }
         if let Some(symbol) = crate::library::symbol(&component.symbol.library_id) {
+            if crate::library::symbol_library_file(&component.symbol.library_id).is_none() {
+                diagnostics.push(Diagnostic {
+                    code: "CC-KICAD-SYMBOL-007",
+                    path: path.to_owned(),
+                    message: format!(
+                        "symbol {} has no publishable vendored library file",
+                        component.symbol.library_id
+                    ),
+                });
+            }
             let bound_pins: BTreeMap<_, _> = component
                 .symbol
                 .pins
@@ -191,6 +244,24 @@ fn validate_catalog_bindings(design: &Design, diagnostics: &mut Vec<Diagnostic>)
                     });
                     continue;
                 };
+                if crate::library::footprint_library_file(expected).is_none() {
+                    diagnostics.push(Diagnostic {
+                        code: "CC-KICAD-FOOTPRINT-006",
+                        path: path.to_owned(),
+                        message: format!(
+                            "part catalog footprint {expected} has no publishable vendored library file"
+                        ),
+                    });
+                }
+                if crate::library::footprint_graphics(expected).is_none() {
+                    diagnostics.push(Diagnostic {
+                        code: "CC-KICAD-FOOTPRINT-007",
+                        path: path.to_owned(),
+                        message: format!(
+                            "part catalog footprint {expected} has no vendored drawing geometry"
+                        ),
+                    });
+                }
                 expected_footprint
                     .pads
                     .sort_by(|left, right| left.number.cmp(&right.number));
@@ -311,25 +382,23 @@ fn identities(design: &Design) -> Vec<KicadIdentity> {
                     &[&component.path, &pad.number],
                 );
             }
-            if let Some(graphics) =
-                crate::library::footprint_graphics(&physical.footprint.library_id)
-            {
-                for line in graphics.silkscreen_lines {
-                    register(
-                        format!(
-                            "{}.footprint.graphic.silkscreen.{}",
-                            component.path, line.semantic_name
-                        ),
-                        "footprint-silkscreen-line",
-                        &[&component.path, line.semantic_name],
-                    );
-                }
+            let graphics = crate::library::footprint_graphics(&physical.footprint.library_id)
+                .expect("validated catalog footprint must have drawing geometry");
+            for line in graphics.silkscreen_lines {
                 register(
-                    format!("{}.footprint.graphic.courtyard", component.path),
-                    "footprint-courtyard",
-                    &[&component.path],
+                    format!(
+                        "{}.footprint.graphic.silkscreen.{}",
+                        component.path, line.semantic_name
+                    ),
+                    "footprint-silkscreen-line",
+                    &[&component.path, line.semantic_name],
                 );
             }
+            register(
+                format!("{}.footprint.graphic.courtyard", component.path),
+                "footprint-courtyard",
+                &[&component.path],
+            );
         }
     }
     for route in &design.board.routes {

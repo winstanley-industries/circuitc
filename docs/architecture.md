@@ -114,10 +114,13 @@ recorded in the schema and ADRs.
 CircuitC writes documented s-expression files and identifies itself as the
 generator. The M1B slice emits an isolated KiCad 10 schematic, PCB, project,
 local library tables, and the vendored symbol and footprint resources needed by
-the design. Library bindings are resolved before emission, and a deterministic
-identity manifest maps emitted KiCad UUIDs back to CircuitC semantic paths and
-source spans. KiCad objects and library display names remain backend artifacts,
-not canonical compiler intent.
+the design. The compiler derives an ordered library-file set from the symbols
+and footprints actually selected by the design, so catalog growth remains
+additive and cannot silently omit a new footprint asset. Library bindings,
+library files, and footprint drawing geometry are resolved before emission.
+A deterministic identity manifest maps emitted KiCad UUIDs back to CircuitC
+semantic paths and source spans. KiCad objects and library display names remain
+backend artifacts, not canonical compiler intent.
 
 Vendored footprint silkscreen and courtyard drawings are backend catalog data,
 not canonical physical intent. KiCad lowering copies them into each board
@@ -128,6 +131,11 @@ The bootstrap KiCad catalog supports only parts whose symbol pin numbers equal
 their corresponding footprint pad numbers. The canonical IR keeps the two
 bindings explicit and independent; the KiCad backend rejects cross-mapped
 parts instead of misrepresenting their connectivity.
+
+Canonical schematic anchors are unique. The KiCad backend additionally derives
+every rotated symbol-pin connection point before emission and rejects a shared
+point whose canonical connection states differ, preventing distinct nets from
+being collapsed by coincident label anchors.
 
 Every backend integration test has three levels:
 

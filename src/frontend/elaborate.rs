@@ -992,7 +992,7 @@ fn elaborate_component(
     let part = select_single(
         source,
         &parts,
-        syntax.span,
+        syntax.path.span,
         path,
         "CC-LANG-PART-001",
         "CC-LANG-PART-002",
@@ -1004,7 +1004,7 @@ fn elaborate_component(
     let symbol = select_single(
         source,
         &symbols,
-        syntax.span,
+        syntax.path.span,
         path,
         "CC-LANG-SYMBOL-001",
         "CC-LANG-SYMBOL-002",
@@ -1027,7 +1027,7 @@ fn elaborate_component(
     let schematic_placement = select_single(
         source,
         &schematic_placements,
-        syntax.span,
+        syntax.path.span,
         path,
         "CC-LANG-SCHEMATIC-001",
         "CC-LANG-SCHEMATIC-002",
@@ -1086,7 +1086,7 @@ fn elaborate_component(
 
     let mut connection_map = BTreeMap::new();
     let mut lowered_connections = Vec::new();
-    for (pin, net, span) in connections {
+    for (pin, net, _) in connections {
         if !canonical_token_is_valid(&pin.value) {
             diagnostics.push(SourceDiagnostic::new(
                 "CC-LANG-RESOLVE-002",
@@ -1109,7 +1109,7 @@ fn elaborate_component(
             );
             continue;
         }
-        connection_map.insert(pin.value.as_str(), span);
+        connection_map.insert(pin.value.as_str(), pin.span);
         let state = match net {
             Some(net) => {
                 if !nets.contains_key(net.value.as_str()) {
@@ -1131,8 +1131,12 @@ fn elaborate_component(
         });
     }
 
-    if let Some(symbol) = &lowered_symbol {
-        let symbol_pins: BTreeSet<_> = symbol.pins.iter().map(|pin| pin.pin.as_str()).collect();
+    if let Some(lowered_symbol_binding) = &lowered_symbol {
+        let symbol_pins: BTreeSet<_> = lowered_symbol_binding
+            .pins
+            .iter()
+            .map(|pin| pin.pin.as_str())
+            .collect();
         for connection in &lowered_connections {
             if !symbol_pins.contains(connection.pin.as_str()) {
                 diagnostics.push(SourceDiagnostic::new(
@@ -1147,16 +1151,20 @@ fn elaborate_component(
                 ));
             }
         }
-        for pin in &symbol.pins {
+        for pin in &lowered_symbol_binding.pins {
             if !connection_map.contains_key(pin.pin.as_str()) {
+                let span = symbol
+                    .and_then(|syntax| {
+                        syntax
+                            .pins
+                            .iter()
+                            .find(|candidate| candidate.pin.value == pin.pin)
+                    })
+                    .map_or(syntax.path.span, |pin| pin.pin.span);
                 diagnostics.push(SourceDiagnostic::new(
                     "CC-LANG-CONNECT-002",
                     source,
-                    symbol
-                        .pins
-                        .iter()
-                        .find(|candidate| candidate.pin == pin.pin)
-                        .map_or(syntax.span, |_| syntax.span),
+                    span,
                     Some(path.to_owned()),
                     format!(
                         "symbol logical pin `{}` requires `connect` or `no_connect`",
@@ -1178,16 +1186,29 @@ fn elaborate_component(
             ));
         }
         for pin in [positive, negative] {
-            if !lowered_connections.iter().any(|connection| {
-                connection.pin == pin.value
-                    && matches!(connection.state, ConnectionState::Connected(_))
-            }) {
+            let connection = lowered_connections
+                .iter()
+                .find(|connection| connection.pin == pin.value);
+            if connection.is_none() {
                 diagnostics.push(SourceDiagnostic::new(
                     "CC-LANG-RESOLVE-002",
                     source,
                     pin.span,
                     Some(path.to_owned()),
                     format!("terminal references unknown logical pin `{}`", pin.value),
+                ));
+            } else if connection
+                .is_some_and(|connection| matches!(connection.state, ConnectionState::NoConnect))
+            {
+                diagnostics.push(SourceDiagnostic::new(
+                    "CC-LANG-SIM-002",
+                    source,
+                    pin.span,
+                    Some(path.to_owned()),
+                    format!(
+                        "simulation terminal references unconnected logical pin `{}`",
+                        pin.value
+                    ),
                 ));
             }
         }
@@ -1905,6 +1926,26 @@ mod tests {
         elaborate(&tree)
     }
 
+    fn assert_source_diagnostic(
+        source: &str,
+        code: &str,
+        message: &str,
+        expected_start: usize,
+        expected_text: &str,
+        related_count: usize,
+    ) {
+        let diagnostics = elaborate_source(source).expect_err("mutated source must fail");
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == code)
+            .unwrap_or_else(|| panic!("missing {code}: {diagnostics:#?}"));
+        assert_eq!(diagnostic.message, message);
+        assert_eq!(diagnostic.start, expected_start);
+        assert_eq!(diagnostic.end, expected_start + expected_text.len());
+        assert_eq!(&source[diagnostic.start..diagnostic.end], expected_text);
+        assert_eq!(diagnostic.related.len(), related_count);
+    }
+
     #[test]
     fn large_provenance_index_resolves_derived_identity_paths() {
         let mut provenance = ProvenanceMap {
@@ -2113,6 +2154,301 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.code == "CC-LANG-SYMBOL-009"),
             "missing CC-LANG-SYMBOL-009: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_and_duplicate_modules_and_ports_with_precise_diagnostics() {
+        let invalid_module = REFERENCE.replacen("module divider {", "module .divider {", 1);
+        let start = invalid_module
+            .find(".divider")
+            .expect("invalid module token exists");
+        assert_source_diagnostic(
+            &invalid_module,
+            "CC-LANG-MODULE-001",
+            "module instance path is invalid",
+            start,
+            ".divider",
+            0,
+        );
+
+        let duplicate_module = REFERENCE.replacen(
+            "  module divider.analysis {",
+            "  module divider {}\n\n  module divider.analysis {",
+            1,
+        );
+        let start = duplicate_module
+            .match_indices("module divider {}")
+            .nth(0)
+            .map(|(start, _)| start + "module ".len())
+            .expect("duplicate module token exists");
+        assert_source_diagnostic(
+            &duplicate_module,
+            "CC-LANG-MODULE-002",
+            "duplicate module instance path `divider`",
+            start,
+            "divider",
+            1,
+        );
+
+        let invalid_port = REFERENCE.replacen(
+            "port input VIN passive connect VIN;",
+            "port input café passive connect VIN;",
+            1,
+        );
+        let start = invalid_port
+            .find("café")
+            .expect("invalid port token exists");
+        assert_source_diagnostic(
+            &invalid_port,
+            "CC-LANG-PORT-001",
+            "module port name must be a non-empty canonical ASCII token",
+            start,
+            "café",
+            0,
+        );
+
+        let duplicate_port = REFERENCE.replacen(
+            "port output VOUT passive connect VOUT;",
+            "port output VIN passive connect VOUT;",
+            1,
+        );
+        let start = duplicate_port
+            .find("port output VIN")
+            .map(|start| start + "port output ".len())
+            .expect("duplicate port token exists");
+        assert_source_diagnostic(
+            &duplicate_port,
+            "CC-LANG-PORT-002",
+            "duplicate module port `VIN`",
+            start,
+            "VIN",
+            1,
+        );
+
+        let invalid_direction = REFERENCE.replacen(
+            "port input VIN passive connect VIN;",
+            "port sideways VIN passive connect VIN;",
+            1,
+        );
+        let start = invalid_direction
+            .find("sideways")
+            .expect("invalid direction token exists");
+        assert_source_diagnostic(
+            &invalid_direction,
+            "CC-LANG-PORT-003",
+            "unsupported port direction `sideways`; expected `input`, `output`, or `inout`",
+            start,
+            "sideways",
+            0,
+        );
+
+        let invalid_pin_type = REFERENCE.replacen(
+            "port input VIN passive connect VIN;",
+            "port input VIN plasma connect VIN;",
+            1,
+        );
+        let start = invalid_pin_type
+            .find("plasma")
+            .expect("invalid electrical type token exists");
+        assert_source_diagnostic(
+            &invalid_pin_type,
+            "CC-LANG-PIN-TYPE-001",
+            "unsupported electrical pin type `plasma`",
+            start,
+            "plasma",
+            0,
+        );
+    }
+
+    #[test]
+    fn rejects_missing_duplicate_and_incoherent_component_items_with_precise_diagnostics() {
+        let missing_parent =
+            REFERENCE.replacen("resistor divider.r_top R1", "resistor r_top R1", 1);
+        let start = missing_parent
+            .find("r_top R1")
+            .expect("component path exists");
+        assert_source_diagnostic(
+            &missing_parent,
+            "CC-LANG-COMP-010",
+            "component path must include its parent module",
+            start,
+            "r_top",
+            0,
+        );
+
+        const PART: &str = "part \"resistor\" manufacturer \"Yageo\" number \"RC0603FR-0710KL\";";
+        let missing_part = REFERENCE.replacen(&format!("    {PART}\n"), "", 1);
+        let start = missing_part
+            .find("divider.r_top")
+            .expect("component path exists");
+        assert_source_diagnostic(
+            &missing_part,
+            "CC-LANG-PART-001",
+            "component requires one `part` declaration",
+            start,
+            "divider.r_top",
+            0,
+        );
+
+        let duplicate_part = REFERENCE.replacen(
+            &format!("    {PART}\n"),
+            &format!("    {PART}\n    {PART}\n"),
+            1,
+        );
+        let start = duplicate_part
+            .match_indices(PART)
+            .nth(1)
+            .map(|(start, _)| start)
+            .expect("duplicate part declaration exists");
+        assert_source_diagnostic(
+            &duplicate_part,
+            "CC-LANG-PART-002",
+            "component part is declared more than once",
+            start,
+            PART,
+            1,
+        );
+
+        const SYMBOL: &str =
+            "symbol \"CircuitC:R\" {\n      bind 1 1 passive;\n      bind 2 2 passive;\n    }";
+        let missing_symbol = REFERENCE.replacen(&format!("    {SYMBOL}\n"), "", 1);
+        let start = missing_symbol
+            .find("divider.r_top")
+            .expect("component path exists");
+        assert_source_diagnostic(
+            &missing_symbol,
+            "CC-LANG-SYMBOL-001",
+            "component requires one `symbol` declaration",
+            start,
+            "divider.r_top",
+            0,
+        );
+
+        let duplicate_symbol = REFERENCE.replacen(
+            &format!("    {SYMBOL}\n"),
+            &format!("    {SYMBOL}\n    {SYMBOL}\n"),
+            1,
+        );
+        let start = duplicate_symbol
+            .match_indices(SYMBOL)
+            .nth(1)
+            .map(|(start, _)| start)
+            .expect("duplicate symbol declaration exists");
+        assert_source_diagnostic(
+            &duplicate_symbol,
+            "CC-LANG-SYMBOL-002",
+            "component symbol is declared more than once",
+            start,
+            SYMBOL,
+            1,
+        );
+
+        let duplicate_library_pin = REFERENCE.replacen("bind 2 2 passive;", "bind 2 1 passive;", 1);
+        let start = duplicate_library_pin
+            .find("bind 2 1 passive;")
+            .map(|start| start + "bind 2 ".len())
+            .expect("duplicate library pin exists");
+        assert_source_diagnostic(
+            &duplicate_library_pin,
+            "CC-LANG-SYMBOL-005",
+            "library symbol pin `1` is bound more than once",
+            start,
+            "1",
+            1,
+        );
+
+        let unknown_library_pin = REFERENCE.replacen("bind 2 2 passive;", "bind 2 9 passive;", 1);
+        let start = unknown_library_pin
+            .find("bind 2 9 passive;")
+            .map(|start| start + "bind 2 ".len())
+            .expect("unknown library pin exists");
+        assert_source_diagnostic(
+            &unknown_library_pin,
+            "CC-LANG-SYMBOL-006",
+            "symbol `CircuitC:R` has no pin `9`",
+            start,
+            "9",
+            0,
+        );
+
+        let unknown_logical_pin = REFERENCE.replacen("connect 2 VOUT;", "connect 3 VOUT;", 1);
+        let start = unknown_logical_pin
+            .find("connect 3 VOUT;")
+            .map(|start| start + "connect ".len())
+            .expect("unknown logical pin exists");
+        assert_source_diagnostic(
+            &unknown_logical_pin,
+            "CC-LANG-SYMBOL-007",
+            "connection references logical pin `3` absent from the symbol binding",
+            start,
+            "3",
+            0,
+        );
+
+        const SCHEMATIC: &str = "schematic at (81.28 mm, 81.28 mm) rotation 0 deg;";
+        let missing_schematic = REFERENCE.replacen(&format!("    {SCHEMATIC}\n"), "", 1);
+        let start = missing_schematic
+            .find("divider.r_top")
+            .expect("component path exists");
+        assert_source_diagnostic(
+            &missing_schematic,
+            "CC-LANG-SCHEMATIC-001",
+            "component requires one `schematic` placement",
+            start,
+            "divider.r_top",
+            0,
+        );
+
+        let duplicate_schematic = REFERENCE.replacen(
+            &format!("    {SCHEMATIC}\n"),
+            &format!("    {SCHEMATIC}\n    {SCHEMATIC}\n"),
+            1,
+        );
+        let start = duplicate_schematic
+            .match_indices(SCHEMATIC)
+            .nth(1)
+            .map(|(start, _)| start)
+            .expect("duplicate schematic placement exists");
+        assert_source_diagnostic(
+            &duplicate_schematic,
+            "CC-LANG-SCHEMATIC-002",
+            "component schematic placement is declared more than once",
+            start,
+            SCHEMATIC,
+            1,
+        );
+
+        let missing_connection = REFERENCE.replacen("    connect 2 VOUT;\n", "", 1);
+        let start = missing_connection
+            .find("bind 2 2 passive;")
+            .map(|start| start + "bind ".len())
+            .expect("unconnected symbol pin exists");
+        assert_source_diagnostic(
+            &missing_connection,
+            "CC-LANG-CONNECT-002",
+            "symbol logical pin `2` requires `connect` or `no_connect`",
+            start,
+            "2",
+            0,
+        );
+    }
+
+    #[test]
+    fn distinguishes_unknown_and_explicitly_unconnected_simulation_terminals() {
+        let unconnected_terminal =
+            REFERENCE.replacen("    connect 2 VOUT;", "    no_connect 2;", 1);
+        let start = unconnected_terminal
+            .find("terminals 1 2;")
+            .map(|start| start + "terminals 1 ".len())
+            .expect("unconnected terminal token exists");
+        assert_source_diagnostic(
+            &unconnected_terminal,
+            "CC-LANG-SIM-002",
+            "simulation terminal references unconnected logical pin `2`",
+            start,
+            "2",
+            0,
         );
     }
 
