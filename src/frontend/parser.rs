@@ -4,8 +4,9 @@ use super::syntax::{
     BindingSyntax, BoardItemSyntax, BoardSyntax, ComponentItemSyntax, ComponentKindSyntax,
     ComponentSyntax, ConnectionStateSyntax, DeclarationSyntax, DesignSyntax, FootprintItemSyntax,
     FootprintSyntax, ModuleSyntax, NetSyntax, PartSyntax, PlacementSyntax, PointSyntax, PortSyntax,
-    QuantitySyntax, RectangleSyntax, RouteSyntax, SchematicPlacementSyntax, SourceFile, Span,
-    Spanned, SymbolPinSyntax, SymbolSyntax, SyntaxTree,
+    QuantitySyntax, RectangleSyntax, RouteSyntax, SchematicPlacementSyntax,
+    SimulationAnalysisKindSyntax, SimulationAnalysisSyntax, SimulationAssertionSyntax,
+    SimulationSampleSyntax, SourceFile, Span, Spanned, SymbolPinSyntax, SymbolSyntax, SyntaxTree,
 };
 
 pub(crate) fn parse(source: SourceFile) -> Result<SyntaxTree, Vec<SourceDiagnostic>> {
@@ -105,12 +106,142 @@ impl Parser<'_> {
                 .parse_component(ComponentKindSyntax::DcSource)
                 .map(DeclarationSyntax::Component);
         }
+        if self.at_keyword("analysis") {
+            return self
+                .parse_simulation_analysis()
+                .map(DeclarationSyntax::SimulationAnalysis);
+        }
+        if self.at_keyword("assert") {
+            return self
+                .parse_simulation_assertion()
+                .map(DeclarationSyntax::SimulationAssertion);
+        }
         if self.at_keyword("board") {
             return self.parse_board().map(DeclarationSyntax::Board);
         }
         self.unsupported("design declaration");
         self.recover_item();
         None
+    }
+
+    fn parse_simulation_analysis(&mut self) -> Option<SimulationAnalysisSyntax> {
+        let start = self.take().span;
+        let kind = self.expect_name("simulation analysis kind")?;
+        let path = self.expect_name("simulation analysis semantic path")?;
+        let kind = match kind.value.as_str() {
+            "dc_operating_point" => SimulationAnalysisKindSyntax::DcOperatingPoint,
+            "ac_linear_sweep" => {
+                self.require_keyword("source")?;
+                let source = self.expect_name("AC source component path")?;
+                self.require_keyword("points")?;
+                let points = self.expect_number("AC linear sweep point count")?;
+                self.require_keyword("start_frequency")?;
+                let start_frequency = self.parse_quantity()?;
+                self.require_keyword("stop_frequency")?;
+                let stop_frequency = self.parse_quantity()?;
+                self.require_keyword("magnitude")?;
+                let magnitude = self.parse_quantity()?;
+                self.require_keyword("phase")?;
+                let phase = self.parse_quantity()?;
+                SimulationAnalysisKindSyntax::AcLinearSweep {
+                    source,
+                    points,
+                    start_frequency,
+                    stop_frequency,
+                    magnitude,
+                    phase,
+                }
+            }
+            "transient" => {
+                self.require_keyword("step")?;
+                let step = self.parse_quantity()?;
+                self.require_keyword("stop")?;
+                let stop = self.parse_quantity()?;
+                self.require_keyword("start")?;
+                let start = self.parse_quantity()?;
+                self.require_keyword("uic")?;
+                let uic = self.expect_name("`true` or `false` for transient `uic`")?;
+                SimulationAnalysisKindSyntax::Transient {
+                    step,
+                    stop,
+                    start,
+                    uic,
+                }
+            }
+            _ => {
+                self.diagnostics.push(SourceDiagnostic::new(
+                    "CC-LANG-PARSE-002",
+                    self.source,
+                    kind.span,
+                    Some(path.value.clone()),
+                    format!("unsupported simulation analysis kind `{}`", kind.value),
+                ));
+                self.recover_item();
+                return None;
+            }
+        };
+        let end = self.expect_semicolon()?;
+        Some(SimulationAnalysisSyntax {
+            path,
+            kind,
+            span: start.through(end),
+        })
+    }
+
+    fn parse_simulation_assertion(&mut self) -> Option<SimulationAssertionSyntax> {
+        let start = self.take().span;
+        self.require_keyword("net_voltage")?;
+        let path = self.expect_name("simulation assertion semantic path")?;
+        self.require_keyword("analysis")?;
+        let analysis_path = self.expect_name("referenced simulation analysis path")?;
+        self.require_keyword("net")?;
+        let net = self.expect_name("asserted net")?;
+        self.require_keyword("sample")?;
+        let sample_kind = self.expect_name("simulation assertion sample kind")?;
+        let sample = match sample_kind.value.as_str() {
+            "scalar" => SimulationSampleSyntax::Scalar(sample_kind.span),
+            "frequency" => {
+                let quantity = self.parse_quantity()?;
+                let span = sample_kind.span.through(quantity.span);
+                SimulationSampleSyntax::Frequency { quantity, span }
+            }
+            "time" => {
+                let quantity = self.parse_quantity()?;
+                let span = sample_kind.span.through(quantity.span);
+                SimulationSampleSyntax::Time { quantity, span }
+            }
+            _ => {
+                self.diagnostics.push(SourceDiagnostic::new(
+                    "CC-LANG-PARSE-002",
+                    self.source,
+                    sample_kind.span,
+                    Some(path.value.clone()),
+                    format!(
+                        "unsupported simulation assertion sample kind `{}`",
+                        sample_kind.value
+                    ),
+                ));
+                self.recover_item();
+                return None;
+            }
+        };
+        self.require_keyword("expected")?;
+        let expected = self.parse_quantity()?;
+        self.require_keyword("absolute_tolerance")?;
+        let absolute_tolerance = self.parse_quantity()?;
+        self.require_keyword("relative_tolerance")?;
+        let relative_tolerance = self.parse_quantity()?;
+        let end = self.expect_semicolon()?;
+        Some(SimulationAssertionSyntax {
+            path,
+            analysis_path,
+            net,
+            sample,
+            expected,
+            absolute_tolerance,
+            relative_tolerance,
+            span: start.through(end),
+        })
     }
 
     fn parse_net(&mut self, is_ground: bool) -> Option<NetSyntax> {
@@ -846,6 +977,72 @@ mod tests {
                 (semicolon, semicolon + 1),
                 "unexpected diagnostic span for {name}"
             );
+        }
+    }
+
+    #[test]
+    fn parses_explicit_simulation_intent_declarations() {
+        let text = r#"design d {
+  analysis dc_operating_point sim.dc;
+  analysis ac_linear_sweep sim.ac source root.input points 11 start_frequency 10 Hz stop_frequency 2.5 kHz magnitude 1 V phase -90 deg;
+  analysis transient sim.tran step 1 us stop 10 ms start 0 s uic true;
+  assert net_voltage checks.dc analysis sim.dc net OUT sample scalar expected -1 V absolute_tolerance 0.01 V relative_tolerance 0.001 ratio;
+  assert net_voltage checks.ac analysis sim.ac net OUT sample frequency 1 kHz expected 1 V absolute_tolerance 0.01 V relative_tolerance 0 ratio;
+  assert net_voltage checks.tran analysis sim.tran net OUT sample time 2 ms expected 1 V absolute_tolerance 0.01 V relative_tolerance 0 ratio;
+}"#;
+        let tree = parse(SourceFile::new("simulation.circuitc", text))
+            .expect("all explicit simulation forms must parse");
+        assert_eq!(tree.design.declarations.len(), 6);
+        assert!(matches!(
+            &tree.design.declarations[0],
+            DeclarationSyntax::SimulationAnalysis(analysis)
+                if analysis.path.value == "sim.dc"
+        ));
+        assert!(matches!(
+            &tree.design.declarations[3],
+            DeclarationSyntax::SimulationAssertion(assertion)
+                if assertion.path.value == "checks.dc"
+        ));
+
+        let ac = text
+            .find("analysis ac_linear_sweep")
+            .expect("fixture contains AC");
+        let DeclarationSyntax::SimulationAnalysis(analysis) = &tree.design.declarations[1] else {
+            panic!("second declaration must be AC analysis syntax");
+        };
+        assert_eq!(analysis.span.start, ac);
+        assert_eq!(
+            &text[analysis.path.span.start..analysis.path.span.end],
+            "sim.ac"
+        );
+    }
+
+    #[test]
+    fn unsupported_simulation_forms_have_stable_machine_readable_diagnostics() {
+        for (text, needle, path) in [
+            (
+                "design d { analysis logarithmic_sweep sim.bad; }",
+                "logarithmic_sweep",
+                "sim.bad",
+            ),
+            (
+                "design d { assert net_voltage checks.bad analysis sim.dc net OUT sample median expected 1 V absolute_tolerance 0 V relative_tolerance 0 ratio; }",
+                "median",
+                "checks.bad",
+            ),
+        ] {
+            let diagnostics = parse(SourceFile::new("unsupported.circuitc", text))
+                .expect_err("unsupported simulation syntax must fail");
+            let diagnostic = diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.code == "CC-LANG-PARSE-002")
+                .expect("unsupported-form diagnostic must exist");
+            let start = text.find(needle).expect("fixture contains bad keyword");
+            assert_eq!(
+                (diagnostic.start, diagnostic.end),
+                (start, start + needle.len())
+            );
+            assert_eq!(diagnostic.semantic_path.as_deref(), Some(path));
         }
     }
 }

@@ -4,7 +4,9 @@ use crate::design::{
     Board, Component, ComponentValue, Connection, ConnectionState, CopperLayer,
     DESIGN_SCHEMA_VERSION, Design, Diagnostic, ElectricalPinType, ModuleInstance, ModulePort, Net,
     PartIdentity, PhysicalImplementation, PinPadBinding, Placement, PointNm, PortDirection, RectNm,
-    RouteSegment, SchematicPlacement, SimulationModel, SizeNm, SymbolBinding, SymbolPinBinding,
+    RouteSegment, SchematicPlacement, SimulationAnalysis, SimulationAnalysisKind,
+    SimulationAssertion, SimulationModel, SimulationSample, SizeNm, SymbolBinding,
+    SymbolPinBinding,
 };
 use crate::quantity::Unit;
 
@@ -14,7 +16,8 @@ use super::syntax::{
     BoardItemSyntax, BoardSyntax, ComponentItemSyntax, ComponentKindSyntax, ComponentSyntax,
     ConnectionStateSyntax, DeclarationSyntax, FootprintItemSyntax, FootprintSyntax, ModuleSyntax,
     NetSyntax, PartSyntax, PlacementSyntax, PointSyntax, QuantitySyntax, RectangleSyntax,
-    RouteSyntax, SchematicPlacementSyntax, SourceFile, Span, SymbolSyntax, SyntaxTree,
+    RouteSyntax, SchematicPlacementSyntax, SimulationAnalysisKindSyntax, SimulationAnalysisSyntax,
+    SimulationAssertionSyntax, SimulationSampleSyntax, SourceFile, Span, SymbolSyntax, SyntaxTree,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -29,6 +32,8 @@ pub struct ProvenanceMap {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum SemanticProvenanceKey {
     Component(String),
+    Analysis(String),
+    Assertion(String),
     Route(String),
     Footprint(String),
     Placement(String),
@@ -39,6 +44,8 @@ impl SemanticProvenanceKey {
     fn rendered_path(&self) -> String {
         match self {
             Self::Component(path) | Self::Route(path) => path.clone(),
+            Self::Analysis(path) => format!("design.analyses.{path}"),
+            Self::Assertion(path) => format!("design.assertions.{path}"),
             Self::Footprint(component) => format!("{component}.footprint"),
             Self::Placement(component) => format!("{component}.placement"),
             Self::Pad { component, pad } => format!("{component}.footprint.pad.{pad}"),
@@ -107,17 +114,22 @@ impl ProvenanceMap {
 
     fn insert_semantic(&mut self, key: SemanticProvenanceKey, span: Span) {
         let rendered = key.rendered_path();
-        self.rendered_semantic_spans
-            .entry(rendered.clone())
-            .and_modify(|existing| *existing = None)
-            .or_insert(Some(span));
-        if matches!(&key, SemanticProvenanceKey::Route(_)) {
-            self.route_spans.insert(rendered, span);
-        } else {
-            self.identity_owner_spans
-                .entry(rendered)
+        if !matches!(
+            &key,
+            SemanticProvenanceKey::Analysis(_) | SemanticProvenanceKey::Assertion(_)
+        ) {
+            self.rendered_semantic_spans
+                .entry(rendered.clone())
                 .and_modify(|existing| *existing = None)
                 .or_insert(Some(span));
+            if matches!(&key, SemanticProvenanceKey::Route(_)) {
+                self.route_spans.insert(rendered, span);
+            } else {
+                self.identity_owner_spans
+                    .entry(rendered)
+                    .and_modify(|existing| *existing = None)
+                    .or_insert(Some(span));
+            }
         }
         self.semantic_spans.insert(key, span);
     }
@@ -172,12 +184,16 @@ pub(crate) fn elaborate(tree: &SyntaxTree) -> Result<ElaboratedDesign, Vec<Sourc
     let mut net_syntax = Vec::new();
     let mut module_syntax = Vec::new();
     let mut component_syntax = Vec::new();
+    let mut analysis_syntax = Vec::new();
+    let mut assertion_syntax = Vec::new();
     let mut board_syntax = Vec::new();
     for declaration in &tree.design.declarations {
         match declaration {
             DeclarationSyntax::Net(net) => net_syntax.push(net),
             DeclarationSyntax::Module(module) => module_syntax.push(module),
             DeclarationSyntax::Component(component) => component_syntax.push(component),
+            DeclarationSyntax::SimulationAnalysis(analysis) => analysis_syntax.push(analysis),
+            DeclarationSyntax::SimulationAssertion(assertion) => assertion_syntax.push(assertion),
             DeclarationSyntax::Board(board) => board_syntax.push(board),
         }
     }
@@ -191,6 +207,9 @@ pub(crate) fn elaborate(tree: &SyntaxTree) -> Result<ElaboratedDesign, Vec<Sourc
         &mut diagnostics,
     );
     let component_index = index_components(source, &component_syntax, &mut diagnostics);
+    let analyses = elaborate_analyses(source, &analysis_syntax, &mut provenance, &mut diagnostics);
+    let assertions =
+        elaborate_assertions(source, &assertion_syntax, &mut provenance, &mut diagnostics);
     let board = select_board(source, &board_syntax, &mut diagnostics);
     let board_parts = board.map(|board| {
         elaborate_board(
@@ -277,6 +296,8 @@ pub(crate) fn elaborate(tree: &SyntaxTree) -> Result<ElaboratedDesign, Vec<Sourc
         nets: nets.into_values().collect(),
         modules: modules.into_values().collect(),
         components,
+        analyses,
+        assertions,
         board: Board {
             outline: board_parts
                 .outline
@@ -378,7 +399,7 @@ pub(crate) fn map_ir_diagnostics(
                     || diagnostic.code.starts_with("CC-PORT-")
                     || diagnostic.code.starts_with("CC-BOARD-")
                     || diagnostic.code.starts_with("CC-ROUTE-")
-                    || diagnostic.code == "CC-SIM-001";
+                    || diagnostic.code.starts_with("CC-SIM-");
                 let semantic_span = if diagnostic.code.starts_with("CC-KICAD-") {
                     provenance
                         .kicad_span(path)
@@ -423,6 +444,338 @@ pub(crate) fn map_ir_diagnostics(
         .collect();
     sort_diagnostics(&mut mapped);
     mapped
+}
+
+fn elaborate_analyses(
+    source: &SourceFile,
+    syntax: &[&SimulationAnalysisSyntax],
+    provenance: &mut ProvenanceMap,
+    diagnostics: &mut Vec<SourceDiagnostic>,
+) -> Vec<SimulationAnalysis> {
+    let mut first_spans = BTreeMap::new();
+    syntax
+        .iter()
+        .filter_map(|analysis| {
+            let path = analysis.path.value.as_str();
+            let base = format!("design.analyses.{path}");
+            if !semantic_path_is_valid(path) {
+                diagnostics.push(SourceDiagnostic::new(
+                    "CC-LANG-ANALYSIS-003",
+                    source,
+                    analysis.path.span,
+                    Some(base.clone()),
+                    "simulation analysis path is invalid",
+                ));
+            }
+            if let Some(first) = first_spans.get(path).copied() {
+                diagnostics.push(
+                    SourceDiagnostic::new(
+                        "CC-LANG-ANALYSIS-004",
+                        source,
+                        analysis.path.span,
+                        Some(base),
+                        format!("duplicate simulation analysis path `{path}`"),
+                    )
+                    .with_related(source, first, "first declaration is here"),
+                );
+                return None;
+            }
+            first_spans.insert(path, analysis.path.span);
+            provenance.insert_structural("design.analyses", analysis.span);
+            provenance.insert_structural(&base, analysis.span);
+            provenance.insert_structural(format!("{base}.path"), analysis.path.span);
+            provenance.insert_semantic(
+                SemanticProvenanceKey::Analysis(path.to_owned()),
+                analysis.span,
+            );
+            let kind = match &analysis.kind {
+                SimulationAnalysisKindSyntax::DcOperatingPoint => {
+                    SimulationAnalysisKind::DcOperatingPoint
+                }
+                SimulationAnalysisKindSyntax::AcLinearSweep {
+                    source: ac_source,
+                    points,
+                    start_frequency,
+                    stop_frequency,
+                    magnitude,
+                    phase,
+                } => {
+                    provenance.insert_structural(format!("{base}.source"), ac_source.span);
+                    provenance.insert_structural(format!("{base}.points"), points.span);
+                    provenance
+                        .insert_structural(format!("{base}.start_frequency"), start_frequency.span);
+                    provenance
+                        .insert_structural(format!("{base}.stop_frequency"), stop_frequency.span);
+                    provenance.insert_structural(format!("{base}.magnitude"), magnitude.span);
+                    provenance.insert_structural(format!("{base}.phase"), phase.span);
+                    let points = lower_sweep_points(source, points, &base, diagnostics);
+                    let start_frequency = lower_electrical(
+                        source,
+                        start_frequency,
+                        Unit::Hertz,
+                        Some(&format!("{base}.start_frequency")),
+                        diagnostics,
+                    );
+                    let stop_frequency = lower_electrical(
+                        source,
+                        stop_frequency,
+                        Unit::Hertz,
+                        Some(&format!("{base}.stop_frequency")),
+                        diagnostics,
+                    );
+                    let magnitude = lower_electrical(
+                        source,
+                        magnitude,
+                        Unit::Volt,
+                        Some(&format!("{base}.magnitude")),
+                        diagnostics,
+                    );
+                    let phase = lower_electrical(
+                        source,
+                        phase,
+                        Unit::Degree,
+                        Some(&format!("{base}.phase")),
+                        diagnostics,
+                    );
+                    let (
+                        Some(points),
+                        Some(start_frequency),
+                        Some(stop_frequency),
+                        Some(magnitude),
+                        Some(phase),
+                    ) = (points, start_frequency, stop_frequency, magnitude, phase)
+                    else {
+                        return None;
+                    };
+                    SimulationAnalysisKind::AcLinearSweep {
+                        source: ac_source.value.clone(),
+                        points,
+                        start_frequency,
+                        stop_frequency,
+                        magnitude,
+                        phase,
+                    }
+                }
+                SimulationAnalysisKindSyntax::Transient {
+                    step,
+                    stop,
+                    start,
+                    uic,
+                } => {
+                    provenance.insert_structural(format!("{base}.step"), step.span);
+                    provenance.insert_structural(format!("{base}.stop"), stop.span);
+                    provenance.insert_structural(format!("{base}.start"), start.span);
+                    provenance.insert_structural(format!("{base}.uic"), uic.span);
+                    let step = lower_electrical(
+                        source,
+                        step,
+                        Unit::Second,
+                        Some(&format!("{base}.step")),
+                        diagnostics,
+                    );
+                    let stop = lower_electrical(
+                        source,
+                        stop,
+                        Unit::Second,
+                        Some(&format!("{base}.stop")),
+                        diagnostics,
+                    );
+                    let start = lower_electrical(
+                        source,
+                        start,
+                        Unit::Second,
+                        Some(&format!("{base}.start")),
+                        diagnostics,
+                    );
+                    let uic = lower_uic(source, uic, &base, diagnostics);
+                    let (Some(step), Some(stop), Some(start), Some(uic)) = (step, stop, start, uic)
+                    else {
+                        return None;
+                    };
+                    SimulationAnalysisKind::Transient {
+                        step,
+                        stop,
+                        start,
+                        uic,
+                    }
+                }
+            };
+            Some(SimulationAnalysis {
+                path: analysis.path.value.clone(),
+                kind,
+            })
+        })
+        .collect()
+}
+
+fn elaborate_assertions(
+    source: &SourceFile,
+    syntax: &[&SimulationAssertionSyntax],
+    provenance: &mut ProvenanceMap,
+    diagnostics: &mut Vec<SourceDiagnostic>,
+) -> Vec<SimulationAssertion> {
+    let mut first_spans = BTreeMap::new();
+    syntax
+        .iter()
+        .filter_map(|assertion| {
+            let path = assertion.path.value.as_str();
+            let base = format!("design.assertions.{path}");
+            if !semantic_path_is_valid(path) {
+                diagnostics.push(SourceDiagnostic::new(
+                    "CC-LANG-ASSERTION-001",
+                    source,
+                    assertion.path.span,
+                    Some(base.clone()),
+                    "simulation assertion path is invalid",
+                ));
+            }
+            if let Some(first) = first_spans.get(path).copied() {
+                diagnostics.push(
+                    SourceDiagnostic::new(
+                        "CC-LANG-ASSERTION-002",
+                        source,
+                        assertion.path.span,
+                        Some(base),
+                        format!("duplicate simulation assertion path `{path}`"),
+                    )
+                    .with_related(source, first, "first declaration is here"),
+                );
+                return None;
+            }
+            first_spans.insert(path, assertion.path.span);
+            provenance.insert_structural("design.assertions", assertion.span);
+            provenance.insert_structural(&base, assertion.span);
+            provenance.insert_structural(format!("{base}.path"), assertion.path.span);
+            provenance.insert_semantic(
+                SemanticProvenanceKey::Assertion(path.to_owned()),
+                assertion.span,
+            );
+            provenance.insert_structural(
+                format!("{base}.analysis_path"),
+                assertion.analysis_path.span,
+            );
+            provenance.insert_structural(format!("{base}.net"), assertion.net.span);
+            provenance.insert_structural(format!("{base}.sample"), sample_span(&assertion.sample));
+            provenance.insert_structural(format!("{base}.expected"), assertion.expected.span);
+            provenance.insert_structural(
+                format!("{base}.absolute_tolerance"),
+                assertion.absolute_tolerance.span,
+            );
+            provenance.insert_structural(
+                format!("{base}.relative_tolerance"),
+                assertion.relative_tolerance.span,
+            );
+
+            let sample = match &assertion.sample {
+                SimulationSampleSyntax::Scalar(_) => Some(SimulationSample::Scalar),
+                SimulationSampleSyntax::Frequency {
+                    quantity: frequency,
+                    ..
+                } => lower_electrical(
+                    source,
+                    frequency,
+                    Unit::Hertz,
+                    Some(&format!("{base}.sample")),
+                    diagnostics,
+                )
+                .map(SimulationSample::Frequency),
+                SimulationSampleSyntax::Time { quantity: time, .. } => lower_electrical(
+                    source,
+                    time,
+                    Unit::Second,
+                    Some(&format!("{base}.sample")),
+                    diagnostics,
+                )
+                .map(SimulationSample::Time),
+            };
+            let expected = lower_electrical(
+                source,
+                &assertion.expected,
+                Unit::Volt,
+                Some(&format!("{base}.expected")),
+                diagnostics,
+            );
+            let absolute_tolerance = lower_electrical(
+                source,
+                &assertion.absolute_tolerance,
+                Unit::Volt,
+                Some(&format!("{base}.absolute_tolerance")),
+                diagnostics,
+            );
+            let relative_tolerance = lower_electrical(
+                source,
+                &assertion.relative_tolerance,
+                Unit::Dimensionless,
+                Some(&format!("{base}.relative_tolerance")),
+                diagnostics,
+            );
+            let (Some(sample), Some(expected), Some(absolute_tolerance), Some(relative_tolerance)) =
+                (sample, expected, absolute_tolerance, relative_tolerance)
+            else {
+                return None;
+            };
+            Some(SimulationAssertion {
+                path: assertion.path.value.clone(),
+                analysis_path: assertion.analysis_path.value.clone(),
+                net: assertion.net.value.clone(),
+                sample,
+                expected,
+                absolute_tolerance,
+                relative_tolerance,
+            })
+        })
+        .collect()
+}
+
+fn sample_span(sample: &SimulationSampleSyntax) -> Span {
+    match sample {
+        SimulationSampleSyntax::Scalar(span) => *span,
+        SimulationSampleSyntax::Frequency { span, .. }
+        | SimulationSampleSyntax::Time { span, .. } => *span,
+    }
+}
+
+fn lower_sweep_points(
+    source: &SourceFile,
+    points: &super::syntax::Spanned<String>,
+    base: &str,
+    diagnostics: &mut Vec<SourceDiagnostic>,
+) -> Option<u32> {
+    match points.value.parse::<u32>() {
+        Ok(points) => Some(points),
+        Err(_) => {
+            diagnostics.push(SourceDiagnostic::new(
+                "CC-LANG-ANALYSIS-001",
+                source,
+                points.span,
+                Some(format!("{base}.points")),
+                "AC linear sweep point count must be an exact unsigned 32-bit integer",
+            ));
+            None
+        }
+    }
+}
+
+fn lower_uic(
+    source: &SourceFile,
+    uic: &super::syntax::Spanned<String>,
+    base: &str,
+    diagnostics: &mut Vec<SourceDiagnostic>,
+) -> Option<bool> {
+    match uic.value.as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => {
+            diagnostics.push(SourceDiagnostic::new(
+                "CC-LANG-ANALYSIS-002",
+                source,
+                uic.span,
+                Some(format!("{base}.uic")),
+                "transient `uic` must be `true` or `false`",
+            ));
+            None
+        }
+    }
 }
 
 fn elaborate_nets(
@@ -1855,6 +2208,42 @@ fn register_indexed_provenance(design: &Design, provenance: &mut ProvenanceMap) 
             provenance.insert_structural(format!("design.modules[{index}]"), span);
         }
     }
+    for (index, analysis) in design.analyses.iter().enumerate() {
+        register_indexed_fields(
+            provenance,
+            &format!("design.analyses.{}", analysis.path),
+            &format!("design.analyses[{index}]"),
+            &[
+                "path",
+                "source",
+                "points",
+                "start_frequency",
+                "stop_frequency",
+                "magnitude",
+                "phase",
+                "step",
+                "stop",
+                "start",
+                "uic",
+            ],
+        );
+    }
+    for (index, assertion) in design.assertions.iter().enumerate() {
+        register_indexed_fields(
+            provenance,
+            &format!("design.assertions.{}", assertion.path),
+            &format!("design.assertions[{index}]"),
+            &[
+                "path",
+                "analysis_path",
+                "net",
+                "sample",
+                "expected",
+                "absolute_tolerance",
+                "relative_tolerance",
+            ],
+        );
+    }
     for (index, route) in design.board.routes.iter().enumerate() {
         if let Some(span) = provenance
             .structural_spans
@@ -1863,6 +2252,32 @@ fn register_indexed_provenance(design: &Design, provenance: &mut ProvenanceMap) 
         {
             provenance.insert_structural(format!("design.board.routes[{index}]"), span);
         }
+    }
+}
+
+fn register_indexed_fields(
+    provenance: &mut ProvenanceMap,
+    authored_base: &str,
+    indexed_base: &str,
+    fields: &[&str],
+) {
+    let authored: Vec<_> = std::iter::once("")
+        .chain(fields.iter().copied())
+        .filter_map(|field| {
+            let suffix = if field.is_empty() {
+                String::new()
+            } else {
+                format!(".{field}")
+            };
+            provenance
+                .structural_spans
+                .get(&format!("{authored_base}{suffix}"))
+                .copied()
+                .map(|span| (suffix, span))
+        })
+        .collect();
+    for (suffix, span) in authored {
+        provenance.insert_structural(format!("{indexed_base}{suffix}"), span);
     }
 }
 
@@ -1902,6 +2317,27 @@ mod tests {
     ) -> Result<super::ElaboratedDesign, Vec<crate::frontend::SourceDiagnostic>> {
         let tree = parse(SourceFile::new("test.circuitc", source))?;
         elaborate(&tree)
+    }
+
+    fn with_intent(source: &str, intent: &str) -> String {
+        let closing = source.rfind("\n}").expect("reference design closes");
+        let mut result = source.to_owned();
+        result.insert_str(closing, intent);
+        result
+    }
+
+    fn valid_simulation_source() -> String {
+        with_intent(
+            REFERENCE,
+            r#"
+  analysis dc_operating_point sim.dc;
+  analysis ac_linear_sweep sim.ac source divider.analysis.input points 11 start_frequency 10 Hz stop_frequency 2.5 kHz magnitude 1 V phase -90 deg;
+  analysis transient sim.tran step 2 us stop 10 ms start 0 s uic true;
+  assert net_voltage checks.dc analysis sim.dc net VOUT sample scalar expected -5 V absolute_tolerance 0.01 V relative_tolerance 0.001 ratio;
+  assert net_voltage checks.ac analysis sim.ac net VOUT sample frequency 1006 Hz expected 5 V absolute_tolerance 0.01 V relative_tolerance 0 ratio;
+  assert net_voltage checks.tran analysis sim.tran net VOUT sample time 2 ms expected 5 V absolute_tolerance 0.01 V relative_tolerance 0 ratio;
+"#,
+        )
     }
 
     fn assert_source_diagnostic(
@@ -2200,7 +2636,9 @@ mod tests {
                 crate::frontend::syntax::DeclarationSyntax::Module(module) => {
                     module.ports.reverse()
                 }
-                crate::frontend::syntax::DeclarationSyntax::Net(_) => {}
+                crate::frontend::syntax::DeclarationSyntax::Net(_)
+                | crate::frontend::syntax::DeclarationSyntax::SimulationAnalysis(_)
+                | crate::frontend::syntax::DeclarationSyntax::SimulationAssertion(_) => {}
             }
         }
         let reordered = elaborate(&syntax).expect("reordered syntax must elaborate");
@@ -2726,5 +3164,938 @@ mod tests {
                     && diagnostic.message.contains(expected_count)
             }));
         }
+    }
+
+    #[test]
+    fn elaborates_all_explicit_simulation_intent_without_floating_point() {
+        let source = valid_simulation_source();
+        let elaborated = elaborate_source(&source).expect("simulation intent must elaborate");
+        assert_eq!(elaborated.design.analyses.len(), 3);
+        assert_eq!(elaborated.design.assertions.len(), 3);
+
+        let ac = elaborated
+            .design
+            .analyses
+            .iter()
+            .find(|analysis| analysis.path == "sim.ac")
+            .expect("AC analysis exists");
+        let crate::design::SimulationAnalysisKind::AcLinearSweep {
+            points,
+            start_frequency,
+            stop_frequency,
+            magnitude,
+            phase,
+            ..
+        } = &ac.kind
+        else {
+            panic!("sim.ac must lower to a linear AC sweep");
+        };
+        assert_eq!(*points, 11);
+        assert_eq!(
+            *start_frequency,
+            crate::quantity::Quantity::new(10, 0, crate::quantity::Unit::Hertz)
+        );
+        assert_eq!(
+            *stop_frequency,
+            crate::quantity::Quantity::new(25, 2, crate::quantity::Unit::Hertz)
+        );
+        assert_eq!(
+            *magnitude,
+            crate::quantity::Quantity::new(1, 0, crate::quantity::Unit::Volt)
+        );
+        assert_eq!(
+            *phase,
+            crate::quantity::Quantity::new(-90, 0, crate::quantity::Unit::Degree)
+        );
+
+        assert!(matches!(
+            &elaborated.design.assertions[0].sample,
+            crate::design::SimulationSample::Frequency(_)
+                | crate::design::SimulationSample::Scalar
+                | crate::design::SimulationSample::Time(_)
+        ));
+    }
+
+    #[test]
+    fn legacy_source_does_not_gain_an_implicit_analysis() {
+        let elaborated = elaborate_source(REFERENCE).expect("reference source must elaborate");
+        assert!(elaborated.design.analyses.is_empty());
+        assert!(elaborated.design.assertions.is_empty());
+    }
+
+    #[test]
+    fn simulation_declaration_order_and_equivalent_suffixes_do_not_change_ir() {
+        let source = with_intent(
+            REFERENCE,
+            r#"
+  analysis ac_linear_sweep sim.ac source divider.analysis.input points 11 start_frequency 1 kHz stop_frequency 2.5 kHz magnitude 1 V phase 0 deg;
+  analysis transient sim.tran step 1 ms stop 10 ms start 0 s uic false;
+  assert net_voltage checks.ac analysis sim.ac net VOUT sample frequency 1 kHz expected 5 V absolute_tolerance 0.01 V relative_tolerance 0.01 ratio;
+"#,
+        );
+        let expected = elaborate_source(&source).expect("intent must elaborate");
+        let equivalent = source
+            .replace("start_frequency 1 kHz", "start_frequency 1000 Hz")
+            .replace("step 1 ms", "step 1000 us")
+            .replace("0.01 ratio", "0.0100 ratio");
+        assert_eq!(
+            elaborate_source(&equivalent)
+                .expect("equivalent exact suffixes must elaborate")
+                .design,
+            expected.design
+        );
+
+        let mut syntax =
+            parse(SourceFile::new("permuted.circuitc", &source)).expect("intent source must parse");
+        syntax.design.declarations.reverse();
+        assert_eq!(
+            elaborate(&syntax)
+                .expect("permuted intent must elaborate")
+                .design,
+            expected.design
+        );
+    }
+
+    #[test]
+    fn simulation_quantity_diagnostics_render_stably_for_humans_and_json() {
+        let source = with_intent(
+            REFERENCE,
+            "\n  analysis ac_linear_sweep sim.ac source divider.analysis.input points 11 start_frequency 1 ms stop_frequency 1 kHz magnitude 1 V phase 0 deg;\n",
+        );
+        let diagnostics = elaborate_source(&source)
+            .expect_err("a time-valued start frequency must fail elaboration");
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "CC-LANG-QUANTITY-005")
+            .expect("dimension diagnostic exists");
+        assert_eq!(
+            diagnostic.semantic_path.as_deref(),
+            Some("design.analyses.sim.ac.start_frequency")
+        );
+        assert_eq!(&source[diagnostic.start..diagnostic.end], "ms");
+
+        let human = crate::frontend::render_diagnostics(
+            &diagnostics,
+            crate::frontend::DiagnosticFormat::Human,
+        );
+        let json = crate::frontend::render_diagnostics(
+            &diagnostics,
+            crate::frontend::DiagnosticFormat::Json,
+        );
+        assert!(human.contains("CC-LANG-QUANTITY-005 [design.analyses.sim.ac.start_frequency]"));
+        assert!(json.contains("\"code\": \"CC-LANG-QUANTITY-005\""));
+        assert!(json.contains("\"semantic_path\": \"design.analyses.sim.ac.start_frequency\""));
+    }
+
+    fn full_simulation_diagnostic_source() -> &'static str {
+        r#"design sim_gold {
+  net N;
+  ground GND;
+  module root {}
+  resistor root.r R1 {
+    part "resistor" manufacturer "X" number "Y";
+    symbol "CircuitC:R" {
+      bind 1 1 passive;
+      bind 2 2 passive;
+    }
+    schematic at (1 mm, 0 mm) rotation 0 deg;
+    resistance 1 kohm;
+    connect 1 N;
+    connect 2 GND;
+    footprint "CircuitC:R_0603_1608Metric" {
+      bind 1 1;
+      bind 2 2;
+    }
+  }
+  dc_source root.v V1 {
+    part "dc_voltage_source" virtual;
+    symbol "CircuitC:VDC" {
+      bind p 1 passive;
+      bind n 2 passive;
+    }
+    model "spice:Vdc";
+    schematic at (0 mm, 0 mm) rotation 0 deg;
+    voltage 1 V;
+    terminals p n;
+    connect p N;
+    connect n GND;
+  }
+  board {
+    rectangle at (0 mm, 0 mm) size (2 mm, 2 mm);
+    place R1 at (1 mm, 1 mm) rotation 0 deg layer front;
+  }
+  analysis ac_linear_sweep sim.points source root.v points 1 start_frequency 10 Hz stop_frequency 100 Hz magnitude 1 V phase 0 deg;
+  analysis ac_linear_sweep sim.unknown_source source root.missing points 2 start_frequency 10 Hz stop_frequency 100 Hz magnitude 1 V phase 0 deg;
+  analysis ac_linear_sweep sim.non_voltage source root.r points 2 start_frequency 10 Hz stop_frequency 100 Hz magnitude 1 V phase 0 deg;
+  analysis ac_linear_sweep sim.start_zero source root.v points 2 start_frequency 0 Hz stop_frequency 100 Hz magnitude 1 V phase 0 deg;
+  analysis ac_linear_sweep sim.stop_zero source root.v points 2 start_frequency -2 Hz stop_frequency -1 Hz magnitude 1 V phase 0 deg;
+  analysis ac_linear_sweep sim.reversed source root.v points 2 start_frequency 100 Hz stop_frequency 10 Hz magnitude 1 V phase 0 deg;
+  analysis ac_linear_sweep sim.negative_magnitude source root.v points 2 start_frequency 10 Hz stop_frequency 100 Hz magnitude -1 V phase 0 deg;
+  analysis ac_linear_sweep sim.ac_grid source root.v points 3 start_frequency 10 Hz stop_frequency 100 Hz magnitude 1 V phase 0 deg;
+  analysis transient sim.zero_step step 0 s stop 1 s start 0 s uic false;
+  analysis transient sim.zero_stop step 1 s stop 0 s start 0 s uic false;
+  analysis transient sim.negative_start step 1 s stop 1 s start -1 s uic false;
+  analysis transient sim.reversed_tran step 1 s stop 1 s start 2 s uic false;
+  analysis transient sim.oversized_grid step 1 us stop 11 ms start 0 s uic false;
+  analysis transient sim.tran_grid step 0.3 s stop 1 s start 0.1 s uic false;
+  analysis dc_operating_point sim.dc;
+  assert net_voltage checks.invalid_analysis_path analysis .bad net N sample scalar expected 0 V absolute_tolerance 0 V relative_tolerance 0 ratio;
+  assert net_voltage checks.unknown_analysis analysis sim.missing net N sample scalar expected 0 V absolute_tolerance 0 V relative_tolerance 0 ratio;
+  assert net_voltage checks.unknown_net analysis sim.dc net MISSING sample scalar expected 0 V absolute_tolerance 0 V relative_tolerance 0 ratio;
+  assert net_voltage checks.kind_mismatch analysis sim.ac_grid net N sample scalar expected 0 V absolute_tolerance 0 V relative_tolerance 0 ratio;
+  assert net_voltage checks.ac_outside analysis sim.ac_grid net N sample frequency 5 Hz expected 0 V absolute_tolerance 0 V relative_tolerance 0 ratio;
+  assert net_voltage checks.ac_off_grid analysis sim.ac_grid net N sample frequency 56 Hz expected 0 V absolute_tolerance 0 V relative_tolerance 0 ratio;
+  assert net_voltage checks.tran_outside analysis sim.tran_grid net N sample time 1.2 s expected 0 V absolute_tolerance 0 V relative_tolerance 0 ratio;
+  assert net_voltage checks.tran_off_grid analysis sim.tran_grid net N sample time 0.4 s expected 0 V absolute_tolerance 0 V relative_tolerance 0 ratio;
+  assert net_voltage checks.negative_absolute analysis sim.dc net N sample scalar expected 0 V absolute_tolerance -1 V relative_tolerance 0 ratio;
+  assert net_voltage checks.negative_relative analysis sim.dc net N sample scalar expected 0 V absolute_tolerance 0 V relative_tolerance -1 ratio;
+}
+"#
+    }
+
+    fn simulation_count_limit_source(analysis_count: usize, assertion_count: usize) -> String {
+        use std::fmt::Write as _;
+
+        let mut source = String::from(
+            "design count_limits {\n  net N;\n  ground GND;\n  module root {}\n  board {\n    rectangle at (0 mm, 0 mm) size (1 mm, 1 mm);\n  }\n",
+        );
+        if assertion_count != 0 {
+            source.push_str("  analysis dc_operating_point sim.dc;\n");
+        }
+        for index in 0..analysis_count {
+            writeln!(source, "  analysis dc_operating_point sim.a{index:03};").unwrap();
+        }
+        for index in 0..assertion_count {
+            writeln!(
+                source,
+                "  assert net_voltage checks.a{index:05} analysis sim.dc net N sample scalar expected 0 V absolute_tolerance 0 V relative_tolerance 0 ratio;"
+            )
+            .unwrap();
+        }
+        source.push_str("}\n");
+        source
+    }
+
+    #[test]
+    fn source_reachable_simulation_diagnostics_have_full_exact_goldens() {
+        let source = full_simulation_diagnostic_source();
+        let diagnostics = crate::frontend::compile_source("i10-main.circuitc", source)
+            .expect_err("the comprehensive invalid simulation fixture must fail");
+
+        // Unit/path shape failures are rejected as CC-LANG diagnostics before Design IR exists;
+        // this fixture exhausts the CC-SIM analysis/assertion/capability branches reachable from
+        // well-typed source, including every distinct reachable message for shared codes.
+        let expected_codes = [
+            "CC-SIM-CAPABILITY-001",
+            "CC-SIM-ANALYSIS-012",
+            "CC-SIM-ANALYSIS-003",
+            "CC-SIM-ANALYSIS-004",
+            "CC-SIM-ANALYSIS-004",
+            "CC-SIM-ANALYSIS-005",
+            "CC-SIM-ANALYSIS-005",
+            "CC-SIM-ANALYSIS-005",
+            "CC-SIM-ANALYSIS-005",
+            "CC-SIM-ANALYSIS-006",
+            "CC-SIM-ANALYSIS-009",
+            "CC-SIM-ANALYSIS-009",
+            "CC-SIM-ANALYSIS-009",
+            "CC-SIM-ANALYSIS-009",
+            "CC-SIM-ANALYSIS-010",
+            "CC-SIM-ASSERTION-003",
+            "CC-SIM-ASSERTION-003",
+            "CC-SIM-ASSERTION-004",
+            "CC-SIM-ASSERTION-005",
+            "CC-SIM-ASSERTION-007",
+            "CC-SIM-ASSERTION-007",
+            "CC-SIM-ASSERTION-007",
+            "CC-SIM-ASSERTION-007",
+            "CC-SIM-ASSERTION-009",
+            "CC-SIM-ASSERTION-010",
+        ];
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            expected_codes
+        );
+
+        let tree = parse(SourceFile::new("i10-main.circuitc", source))
+            .expect("the golden fixture must parse");
+        let elaborated = elaborate(&tree).expect("the golden fixture must elaborate");
+        let mut permuted = elaborated.design.clone();
+        permuted.analyses.reverse();
+        permuted.assertions.reverse();
+        let permuted_diagnostics = super::map_ir_diagnostics(
+            &tree.source,
+            &elaborated.provenance,
+            permuted
+                .validate()
+                .expect_err("permuted invalid intent must still fail"),
+        );
+        assert_eq!(permuted_diagnostics, diagnostics);
+
+        assert_eq!(
+            crate::frontend::render_diagnostics(
+                &diagnostics,
+                crate::frontend::DiagnosticFormat::Human,
+            ),
+            r###"i10-main.circuitc:5:3: CC-SIM-CAPABILITY-001 [root.r]: electrically participating component has no supported explicit simulation model (bytes 60..401)
+  related i10-main.circuitc:44:3: related entity `design.analyses.sim.ac_grid` is here (bytes 1776..1906)
+i10-main.circuitc:37:3: CC-SIM-ANALYSIS-012 [design.analyses]: aggregate simulation workload exceeds 10000 samples or compute steps (bytes 813..942)
+i10-main.circuitc:37:60: CC-SIM-ANALYSIS-003 [design.analyses.sim.points.points]: AC sweep points must be in 2..=10000; found 1 (bytes 870..871)
+i10-main.circuitc:38:54: CC-SIM-ANALYSIS-004 [design.analyses.sim.unknown_source.source]: AC source references unknown component root.missing (bytes 996..1008)
+i10-main.circuitc:39:51: CC-SIM-ANALYSIS-004 [design.analyses.sim.non_voltage.source]: AC source root.r must select a component with a DC voltage-source simulation model (bytes 1139..1145)
+  related i10-main.circuitc:5:3: related entity `root.r` is here (bytes 60..401)
+i10-main.circuitc:40:82: CC-SIM-ANALYSIS-005 [design.analyses.sim.start_zero.start_frequency]: AC start frequency must be positive (bytes 1307..1311)
+i10-main.circuitc:41:81: CC-SIM-ANALYSIS-005 [design.analyses.sim.stop_zero.start_frequency]: AC start frequency must be positive (bytes 1441..1446)
+i10-main.circuitc:41:102: CC-SIM-ANALYSIS-005 [design.analyses.sim.stop_zero.stop_frequency]: AC stop frequency must be positive (bytes 1462..1467)
+i10-main.circuitc:42:102: CC-SIM-ANALYSIS-005 [design.analyses.sim.reversed.stop_frequency]: AC stop frequency must be greater than its start frequency (bytes 1596..1601)
+i10-main.circuitc:43:128: CC-SIM-ANALYSIS-006 [design.analyses.sim.negative_magnitude.magnitude]: AC source magnitude must be non-negative (bytes 1756..1760)
+i10-main.circuitc:45:41: CC-SIM-ANALYSIS-009 [design.analyses.sim.zero_step.step]: transient step must be positive (bytes 1947..1950)
+i10-main.circuitc:46:50: CC-SIM-ANALYSIS-009 [design.analyses.sim.zero_stop.stop]: transient stop must be positive (bytes 2030..2033)
+i10-main.circuitc:47:65: CC-SIM-ANALYSIS-009 [design.analyses.sim.negative_start.start]: transient start must be non-negative (bytes 2119..2123)
+i10-main.circuitc:48:64: CC-SIM-ANALYSIS-009 [design.analyses.sim.reversed_tran.start]: transient start must not be greater than its stop (bytes 2198..2201)
+i10-main.circuitc:49:46: CC-SIM-ANALYSIS-010 [design.analyses.sim.oversized_grid.step]: inclusive transient grid exceeds 10000 samples (bytes 2258..2262)
+i10-main.circuitc:52:60: CC-SIM-ASSERTION-003 [design.assertions.checks.invalid_analysis_path.analysis_path]: assertion analysis path must be a canonical semantic path (bytes 2470..2474)
+i10-main.circuitc:53:55: CC-SIM-ASSERTION-003 [design.assertions.checks.unknown_analysis.analysis_path]: assertion references unknown analysis sim.missing (bytes 2613..2624)
+i10-main.circuitc:54:61: CC-SIM-ASSERTION-004 [design.assertions.checks.unknown_net.net]: assertion references unknown or invalid net MISSING (bytes 2769..2776)
+i10-main.circuitc:55:77: CC-SIM-ASSERTION-005 [design.assertions.checks.kind_mismatch.sample]: assertion sample kind does not match its analysis kind (bytes 2931..2937)
+  related i10-main.circuitc:44:3: related entity `design.analyses.sim.ac_grid` is here (bytes 1776..1906)
+i10-main.circuitc:56:74: CC-SIM-ASSERTION-007 [design.assertions.checks.ac_outside.sample]: AC assertion sample must lie inside the inclusive sweep range (bytes 3075..3089)
+  related i10-main.circuitc:44:3: related entity `design.analyses.sim.ac_grid` is here (bytes 1776..1906)
+i10-main.circuitc:57:75: CC-SIM-ASSERTION-007 [design.assertions.checks.ac_off_grid.sample]: AC assertion sample must exactly equal a generated linear-grid sample (bytes 3228..3243)
+  related i10-main.circuitc:44:3: related entity `design.analyses.sim.ac_grid` is here (bytes 1776..1906)
+i10-main.circuitc:58:78: CC-SIM-ASSERTION-007 [design.assertions.checks.tran_outside.sample]: transient assertion sample must lie inside the inclusive analysis interval (bytes 3385..3395)
+  related i10-main.circuitc:50:3: related entity `design.analyses.sim.tran_grid` is here (bytes 2297..2372)
+i10-main.circuitc:59:79: CC-SIM-ASSERTION-007 [design.assertions.checks.tran_off_grid.sample]: transient assertion sample must exactly equal a zero-anchored step sample or the forced stop endpoint (bytes 3538..3548)
+  related i10-main.circuitc:50:3: related entity `design.analyses.sim.tran_grid` is here (bytes 2297..2372)
+i10-main.circuitc:60:115: CC-SIM-ASSERTION-009 [design.assertions.checks.negative_absolute.absolute_tolerance]: assertion absolute tolerance must be non-negative (bytes 3727..3731)
+i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negative_relative.relative_tolerance]: assertion relative tolerance must be non-negative (bytes 3897..3905)"###
+        );
+        assert_eq!(
+            crate::frontend::render_diagnostics(
+                &diagnostics,
+                crate::frontend::DiagnosticFormat::Json,
+            ),
+            r###"[
+  {
+    "code": "CC-SIM-CAPABILITY-001",
+    "filename": "i10-main.circuitc",
+    "start": 60,
+    "end": 401,
+    "line": 5,
+    "column": 3,
+    "semantic_path": "root.r",
+    "message": "electrically participating component has no supported explicit simulation model",
+    "related": [
+      {
+        "filename": "i10-main.circuitc",
+        "start": 1776,
+        "end": 1906,
+        "line": 44,
+        "column": 3,
+        "message": "related entity `design.analyses.sim.ac_grid` is here"
+      }
+    ]
+  },
+  {
+    "code": "CC-SIM-ANALYSIS-012",
+    "filename": "i10-main.circuitc",
+    "start": 813,
+    "end": 942,
+    "line": 37,
+    "column": 3,
+    "semantic_path": "design.analyses",
+    "message": "aggregate simulation workload exceeds 10000 samples or compute steps",
+    "related": []
+  },
+  {
+    "code": "CC-SIM-ANALYSIS-003",
+    "filename": "i10-main.circuitc",
+    "start": 870,
+    "end": 871,
+    "line": 37,
+    "column": 60,
+    "semantic_path": "design.analyses.sim.points.points",
+    "message": "AC sweep points must be in 2..=10000; found 1",
+    "related": []
+  },
+  {
+    "code": "CC-SIM-ANALYSIS-004",
+    "filename": "i10-main.circuitc",
+    "start": 996,
+    "end": 1008,
+    "line": 38,
+    "column": 54,
+    "semantic_path": "design.analyses.sim.unknown_source.source",
+    "message": "AC source references unknown component root.missing",
+    "related": []
+  },
+  {
+    "code": "CC-SIM-ANALYSIS-004",
+    "filename": "i10-main.circuitc",
+    "start": 1139,
+    "end": 1145,
+    "line": 39,
+    "column": 51,
+    "semantic_path": "design.analyses.sim.non_voltage.source",
+    "message": "AC source root.r must select a component with a DC voltage-source simulation model",
+    "related": [
+      {
+        "filename": "i10-main.circuitc",
+        "start": 60,
+        "end": 401,
+        "line": 5,
+        "column": 3,
+        "message": "related entity `root.r` is here"
+      }
+    ]
+  },
+  {
+    "code": "CC-SIM-ANALYSIS-005",
+    "filename": "i10-main.circuitc",
+    "start": 1307,
+    "end": 1311,
+    "line": 40,
+    "column": 82,
+    "semantic_path": "design.analyses.sim.start_zero.start_frequency",
+    "message": "AC start frequency must be positive",
+    "related": []
+  },
+  {
+    "code": "CC-SIM-ANALYSIS-005",
+    "filename": "i10-main.circuitc",
+    "start": 1441,
+    "end": 1446,
+    "line": 41,
+    "column": 81,
+    "semantic_path": "design.analyses.sim.stop_zero.start_frequency",
+    "message": "AC start frequency must be positive",
+    "related": []
+  },
+  {
+    "code": "CC-SIM-ANALYSIS-005",
+    "filename": "i10-main.circuitc",
+    "start": 1462,
+    "end": 1467,
+    "line": 41,
+    "column": 102,
+    "semantic_path": "design.analyses.sim.stop_zero.stop_frequency",
+    "message": "AC stop frequency must be positive",
+    "related": []
+  },
+  {
+    "code": "CC-SIM-ANALYSIS-005",
+    "filename": "i10-main.circuitc",
+    "start": 1596,
+    "end": 1601,
+    "line": 42,
+    "column": 102,
+    "semantic_path": "design.analyses.sim.reversed.stop_frequency",
+    "message": "AC stop frequency must be greater than its start frequency",
+    "related": []
+  },
+  {
+    "code": "CC-SIM-ANALYSIS-006",
+    "filename": "i10-main.circuitc",
+    "start": 1756,
+    "end": 1760,
+    "line": 43,
+    "column": 128,
+    "semantic_path": "design.analyses.sim.negative_magnitude.magnitude",
+    "message": "AC source magnitude must be non-negative",
+    "related": []
+  },
+  {
+    "code": "CC-SIM-ANALYSIS-009",
+    "filename": "i10-main.circuitc",
+    "start": 1947,
+    "end": 1950,
+    "line": 45,
+    "column": 41,
+    "semantic_path": "design.analyses.sim.zero_step.step",
+    "message": "transient step must be positive",
+    "related": []
+  },
+  {
+    "code": "CC-SIM-ANALYSIS-009",
+    "filename": "i10-main.circuitc",
+    "start": 2030,
+    "end": 2033,
+    "line": 46,
+    "column": 50,
+    "semantic_path": "design.analyses.sim.zero_stop.stop",
+    "message": "transient stop must be positive",
+    "related": []
+  },
+  {
+    "code": "CC-SIM-ANALYSIS-009",
+    "filename": "i10-main.circuitc",
+    "start": 2119,
+    "end": 2123,
+    "line": 47,
+    "column": 65,
+    "semantic_path": "design.analyses.sim.negative_start.start",
+    "message": "transient start must be non-negative",
+    "related": []
+  },
+  {
+    "code": "CC-SIM-ANALYSIS-009",
+    "filename": "i10-main.circuitc",
+    "start": 2198,
+    "end": 2201,
+    "line": 48,
+    "column": 64,
+    "semantic_path": "design.analyses.sim.reversed_tran.start",
+    "message": "transient start must not be greater than its stop",
+    "related": []
+  },
+  {
+    "code": "CC-SIM-ANALYSIS-010",
+    "filename": "i10-main.circuitc",
+    "start": 2258,
+    "end": 2262,
+    "line": 49,
+    "column": 46,
+    "semantic_path": "design.analyses.sim.oversized_grid.step",
+    "message": "inclusive transient grid exceeds 10000 samples",
+    "related": []
+  },
+  {
+    "code": "CC-SIM-ASSERTION-003",
+    "filename": "i10-main.circuitc",
+    "start": 2470,
+    "end": 2474,
+    "line": 52,
+    "column": 60,
+    "semantic_path": "design.assertions.checks.invalid_analysis_path.analysis_path",
+    "message": "assertion analysis path must be a canonical semantic path",
+    "related": []
+  },
+  {
+    "code": "CC-SIM-ASSERTION-003",
+    "filename": "i10-main.circuitc",
+    "start": 2613,
+    "end": 2624,
+    "line": 53,
+    "column": 55,
+    "semantic_path": "design.assertions.checks.unknown_analysis.analysis_path",
+    "message": "assertion references unknown analysis sim.missing",
+    "related": []
+  },
+  {
+    "code": "CC-SIM-ASSERTION-004",
+    "filename": "i10-main.circuitc",
+    "start": 2769,
+    "end": 2776,
+    "line": 54,
+    "column": 61,
+    "semantic_path": "design.assertions.checks.unknown_net.net",
+    "message": "assertion references unknown or invalid net MISSING",
+    "related": []
+  },
+  {
+    "code": "CC-SIM-ASSERTION-005",
+    "filename": "i10-main.circuitc",
+    "start": 2931,
+    "end": 2937,
+    "line": 55,
+    "column": 77,
+    "semantic_path": "design.assertions.checks.kind_mismatch.sample",
+    "message": "assertion sample kind does not match its analysis kind",
+    "related": [
+      {
+        "filename": "i10-main.circuitc",
+        "start": 1776,
+        "end": 1906,
+        "line": 44,
+        "column": 3,
+        "message": "related entity `design.analyses.sim.ac_grid` is here"
+      }
+    ]
+  },
+  {
+    "code": "CC-SIM-ASSERTION-007",
+    "filename": "i10-main.circuitc",
+    "start": 3075,
+    "end": 3089,
+    "line": 56,
+    "column": 74,
+    "semantic_path": "design.assertions.checks.ac_outside.sample",
+    "message": "AC assertion sample must lie inside the inclusive sweep range",
+    "related": [
+      {
+        "filename": "i10-main.circuitc",
+        "start": 1776,
+        "end": 1906,
+        "line": 44,
+        "column": 3,
+        "message": "related entity `design.analyses.sim.ac_grid` is here"
+      }
+    ]
+  },
+  {
+    "code": "CC-SIM-ASSERTION-007",
+    "filename": "i10-main.circuitc",
+    "start": 3228,
+    "end": 3243,
+    "line": 57,
+    "column": 75,
+    "semantic_path": "design.assertions.checks.ac_off_grid.sample",
+    "message": "AC assertion sample must exactly equal a generated linear-grid sample",
+    "related": [
+      {
+        "filename": "i10-main.circuitc",
+        "start": 1776,
+        "end": 1906,
+        "line": 44,
+        "column": 3,
+        "message": "related entity `design.analyses.sim.ac_grid` is here"
+      }
+    ]
+  },
+  {
+    "code": "CC-SIM-ASSERTION-007",
+    "filename": "i10-main.circuitc",
+    "start": 3385,
+    "end": 3395,
+    "line": 58,
+    "column": 78,
+    "semantic_path": "design.assertions.checks.tran_outside.sample",
+    "message": "transient assertion sample must lie inside the inclusive analysis interval",
+    "related": [
+      {
+        "filename": "i10-main.circuitc",
+        "start": 2297,
+        "end": 2372,
+        "line": 50,
+        "column": 3,
+        "message": "related entity `design.analyses.sim.tran_grid` is here"
+      }
+    ]
+  },
+  {
+    "code": "CC-SIM-ASSERTION-007",
+    "filename": "i10-main.circuitc",
+    "start": 3538,
+    "end": 3548,
+    "line": 59,
+    "column": 79,
+    "semantic_path": "design.assertions.checks.tran_off_grid.sample",
+    "message": "transient assertion sample must exactly equal a zero-anchored step sample or the forced stop endpoint",
+    "related": [
+      {
+        "filename": "i10-main.circuitc",
+        "start": 2297,
+        "end": 2372,
+        "line": 50,
+        "column": 3,
+        "message": "related entity `design.analyses.sim.tran_grid` is here"
+      }
+    ]
+  },
+  {
+    "code": "CC-SIM-ASSERTION-009",
+    "filename": "i10-main.circuitc",
+    "start": 3727,
+    "end": 3731,
+    "line": 60,
+    "column": 115,
+    "semantic_path": "design.assertions.checks.negative_absolute.absolute_tolerance",
+    "message": "assertion absolute tolerance must be non-negative",
+    "related": []
+  },
+  {
+    "code": "CC-SIM-ASSERTION-010",
+    "filename": "i10-main.circuitc",
+    "start": 3897,
+    "end": 3905,
+    "line": 61,
+    "column": 138,
+    "semantic_path": "design.assertions.checks.negative_relative.relative_tolerance",
+    "message": "assertion relative tolerance must be non-negative",
+    "related": []
+  }
+]
+"###
+        );
+    }
+
+    #[test]
+    fn simulation_collection_limits_have_full_exact_goldens() {
+        for (filename, source, expected_human, expected_json) in [
+            (
+                "i10-analysis-limit.circuitc",
+                simulation_count_limit_source(257, 0),
+                r###"i10-analysis-limit.circuitc:8:3: CC-SIM-ANALYSIS-011 [design.analyses]: design declares 257 analyses; the maximum is 256 (bytes 127..164)"###,
+                r###"[
+  {
+    "code": "CC-SIM-ANALYSIS-011",
+    "filename": "i10-analysis-limit.circuitc",
+    "start": 127,
+    "end": 164,
+    "line": 8,
+    "column": 3,
+    "semantic_path": "design.analyses",
+    "message": "design declares 257 analyses; the maximum is 256",
+    "related": []
+  }
+]
+"###,
+            ),
+            (
+                "i10-assertion-limit.circuitc",
+                simulation_count_limit_source(0, 10_001),
+                r###"i10-assertion-limit.circuitc:9:3: CC-SIM-ASSERTION-011 [design.assertions]: design declares 10001 assertions; the maximum is 10000 (bytes 165..297)"###,
+                r###"[
+  {
+    "code": "CC-SIM-ASSERTION-011",
+    "filename": "i10-assertion-limit.circuitc",
+    "start": 165,
+    "end": 297,
+    "line": 9,
+    "column": 3,
+    "semantic_path": "design.assertions",
+    "message": "design declares 10001 assertions; the maximum is 10000",
+    "related": []
+  }
+]
+"###,
+            ),
+        ] {
+            let diagnostics = crate::frontend::compile_source(filename, &source)
+                .expect_err("over-limit source intent must fail");
+            assert_eq!(
+                crate::frontend::render_diagnostics(
+                    &diagnostics,
+                    crate::frontend::DiagnosticFormat::Human,
+                ),
+                expected_human
+            );
+            assert_eq!(
+                crate::frontend::render_diagnostics(
+                    &diagnostics,
+                    crate::frontend::DiagnosticFormat::Json,
+                ),
+                expected_json
+            );
+        }
+    }
+
+    #[test]
+    fn valid_authored_dc_analysis_maps_the_fail_closed_phase_guard() {
+        let declaration = "analysis dc_operating_point sim.dc;";
+        let source = with_intent(REFERENCE, &format!("\n  {declaration}\n"));
+        let diagnostics = crate::frontend::compile_source("phase.circuitc", &source)
+            .expect_err("declared intent must stop before the legacy backend");
+        assert_eq!(diagnostics.len(), 1, "phase guard must be the sole failure");
+        let diagnostic = &diagnostics[0];
+        assert_eq!(diagnostic.code, "CC-SIM-PHASE-001");
+        assert_eq!(
+            diagnostic.semantic_path.as_deref(),
+            Some("design.analyses.sim.dc")
+        );
+        assert_eq!(
+            diagnostic.message,
+            "declared simulation intent cannot be compiled until deterministic per-analysis lowering and checked execution are available"
+        );
+        assert_eq!(&source[diagnostic.start..diagnostic.end], declaration);
+    }
+
+    #[test]
+    fn simulation_capability_diagnostic_maps_component_and_first_analysis_spans() {
+        let declaration = "analysis dc_operating_point sim.dc;";
+        let source = with_intent(REFERENCE, &format!("\n  {declaration}\n"))
+            .replacen("    model \"spice:R\";\n", "", 1)
+            .replacen("    terminals 1 2;\n", "", 1);
+        let diagnostics = crate::frontend::compile_source("capability.circuitc", &source)
+            .expect_err("connected physical-only component must fail static capability validation");
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "CC-SIM-CAPABILITY-001")
+            .unwrap_or_else(|| panic!("missing capability diagnostic: {diagnostics:#?}"));
+        assert_eq!(diagnostic.semantic_path.as_deref(), Some("divider.r_top"));
+        assert_eq!(
+            diagnostic.message,
+            "electrically participating component has no supported explicit simulation model"
+        );
+        let component_start = source
+            .find("resistor divider.r_top R1 {")
+            .expect("fixture contains first resistor");
+        let component_end = source
+            .find("\n\n  resistor divider.r_bottom R2 {")
+            .expect("fixture contains second resistor separator");
+        assert_eq!(
+            (diagnostic.start, diagnostic.end),
+            (component_start, component_end)
+        );
+        assert_eq!(diagnostic.related.len(), 1);
+        let related = &diagnostic.related[0];
+        let analysis_start = source.find(declaration).expect("fixture contains analysis");
+        assert_eq!(
+            (related.start, related.end),
+            (analysis_start, analysis_start + declaration.len())
+        );
+        assert_eq!(
+            related.message,
+            "related entity `design.analyses.sim.dc` is here"
+        );
+    }
+
+    #[test]
+    fn simulation_paths_reject_invalid_and_duplicate_identities_with_related_spans() {
+        let source = with_intent(
+            REFERENCE,
+            r#"
+  analysis dc_operating_point .invalid;
+  analysis dc_operating_point sim.same;
+  analysis dc_operating_point sim.same;
+  assert net_voltage .invalid analysis sim.same net VOUT sample scalar expected 5 V absolute_tolerance 0 V relative_tolerance 0 ratio;
+  assert net_voltage checks.same analysis sim.same net VOUT sample scalar expected 5 V absolute_tolerance 0 V relative_tolerance 0 ratio;
+  assert net_voltage checks.same analysis sim.same net VOUT sample scalar expected 5 V absolute_tolerance 0 V relative_tolerance 0 ratio;
+"#,
+        );
+        let diagnostics = elaborate_source(&source).expect_err("invalid and duplicate paths fail");
+        for code in [
+            "CC-LANG-ANALYSIS-003",
+            "CC-LANG-ANALYSIS-004",
+            "CC-LANG-ASSERTION-001",
+            "CC-LANG-ASSERTION-002",
+        ] {
+            let diagnostic = diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.code == code)
+                .unwrap_or_else(|| panic!("missing {code}: {diagnostics:#?}"));
+            if code.ends_with("004") || code.ends_with("002") {
+                assert_eq!(
+                    diagnostic.related.len(),
+                    1,
+                    "{code} must retain first declaration"
+                );
+            }
+        }
+
+        let expected = [
+            (
+                "CC-LANG-ANALYSIS-003",
+                ".invalid",
+                "simulation analysis path is invalid",
+            ),
+            (
+                "CC-LANG-ANALYSIS-004",
+                "sim.same",
+                "duplicate simulation analysis path `sim.same`",
+            ),
+            (
+                "CC-LANG-ASSERTION-001",
+                ".invalid",
+                "simulation assertion path is invalid",
+            ),
+            (
+                "CC-LANG-ASSERTION-002",
+                "checks.same",
+                "duplicate simulation assertion path `checks.same`",
+            ),
+        ];
+        for (code, authored_path, message) in expected {
+            let diagnostic = diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.code == code)
+                .expect("diagnostic exists");
+            assert_eq!(&source[diagnostic.start..diagnostic.end], authored_path);
+            assert_eq!(diagnostic.message, message);
+            assert!(diagnostic.semantic_path.is_some());
+        }
+    }
+
+    #[test]
+    fn simulation_literal_lowering_diagnostics_are_exact_and_deterministic() {
+        let source = with_intent(
+            REFERENCE,
+            r#"
+  analysis ac_linear_sweep sim.ac source divider.analysis.input points 4294967296 start_frequency 10 Hz stop_frequency 1 kHz magnitude 1 V phase 0 deg;
+  analysis transient sim.tran step 2 us stop 10 ms start 0 s uic maybe;
+"#,
+        );
+        let diagnostics = elaborate_source(&source)
+            .expect_err("out-of-range points and non-boolean uic must fail elaboration");
+        let expected = [
+            (
+                "CC-LANG-ANALYSIS-001",
+                "design.analyses.sim.ac.points",
+                "4294967296",
+                "AC linear sweep point count must be an exact unsigned 32-bit integer",
+            ),
+            (
+                "CC-LANG-ANALYSIS-002",
+                "design.analyses.sim.tran.uic",
+                "maybe",
+                "transient `uic` must be `true` or `false`",
+            ),
+        ];
+        for (code, path, authored, message) in expected {
+            let diagnostic = diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.code == code)
+                .unwrap_or_else(|| panic!("missing {code}: {diagnostics:#?}"));
+            assert_eq!(diagnostic.semantic_path.as_deref(), Some(path));
+            assert_eq!(&source[diagnostic.start..diagnostic.end], authored);
+            assert_eq!(diagnostic.message, message);
+        }
+        let first = crate::frontend::render_diagnostics(
+            &diagnostics,
+            crate::frontend::DiagnosticFormat::Json,
+        );
+        let second = crate::frontend::render_diagnostics(
+            &diagnostics,
+            crate::frontend::DiagnosticFormat::Json,
+        );
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn simulation_path_collision_does_not_erase_component_kicad_provenance() {
+        let source = with_intent(
+            REFERENCE,
+            "\n  analysis dc_operating_point divider.r_top;\n",
+        );
+        let elaborated = elaborate_source(&source).expect("cross-kind identity is namespaced");
+        let component_start = source
+            .find("resistor divider.r_top")
+            .expect("fixture contains component");
+        let span = elaborated
+            .provenance
+            .span_for_identity("divider.r_top")
+            .expect("component KiCad provenance remains unique");
+        assert_eq!(span.start, component_start);
+        assert!(
+            elaborated
+                .provenance
+                .span_for("design.analyses.divider.r_top")
+                .is_some()
+        );
+
+        let mut adversarial = ProvenanceMap {
+            semantic_spans: std::collections::BTreeMap::new(),
+            rendered_semantic_spans: std::collections::BTreeMap::new(),
+            identity_owner_spans: std::collections::BTreeMap::new(),
+            route_spans: std::collections::BTreeMap::new(),
+            structural_spans: std::collections::BTreeMap::new(),
+        };
+        let component_span = crate::frontend::Span::new(10, 20);
+        adversarial.insert_semantic(
+            SemanticProvenanceKey::Component("design.analyses.foo".to_owned()),
+            component_span,
+        );
+        adversarial.insert_semantic(
+            SemanticProvenanceKey::Analysis("foo".to_owned()),
+            crate::frontend::Span::new(30, 40),
+        );
+        assert_eq!(
+            adversarial.span_for_identity("design.analyses.foo"),
+            Some(component_span),
+            "analysis namespace must not participate in KiCad identity ownership"
+        );
     }
 }

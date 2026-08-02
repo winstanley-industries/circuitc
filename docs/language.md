@@ -2,10 +2,10 @@
 
 ## Status and authority
 
-This document defines the active, unreleased M1B grammar. It is deliberately
-limited to the reference voltage-divider project semantics. The grammar may evolve in
-place before the first language release; there is no version declaration or
-compatibility machinery yet.
+This document defines the active, unreleased M2 grammar. It is deliberately
+limited to the reference circuit and simulation-closure semantics. The grammar
+may evolve in place before the first language release; there is no version
+declaration or compatibility machinery yet.
 
 CircuitC source is authoritative. Parsing and elaboration produce the canonical
 Design IR, and only the existing compiler boundary may lower that IR to KiCad or
@@ -37,6 +37,8 @@ source      := "design" name "{" declaration* "}"
 declaration := ("net" | "ground") name ";"
              | module
              | component
+             | analysis
+             | assertion
              | board
 
 module      := "module" path "{" port* "}"
@@ -75,6 +77,28 @@ layer       := "front" | "back"
 electrical_type := "input" | "output" | "bidirectional" | "passive"
                  | "power_input" | "power_output"
                  | "open_collector" | "open_emitter"
+
+analysis    := "analysis" "dc_operating_point" path ";"
+             | "analysis" "ac_linear_sweep" path
+               "source" path "points" integer
+               "start_frequency" frequency "stop_frequency" frequency
+               "magnitude" voltage "phase" angle ";"
+             | "analysis" "transient" path
+               "step" time "stop" time "start" time
+               "uic" boolean ";"
+
+assertion   := "assert" "net_voltage" path
+               "analysis" path "net" net "sample" sample
+               "expected" voltage
+               "absolute_tolerance" voltage
+               "relative_tolerance" ratio ";"
+sample      := "scalar" | "frequency" frequency | "time" time
+frequency   := decimal ("Hz" | "kHz")
+time        := decimal ("s" | "ms" | "us")
+voltage     := decimal "V"
+angle       := decimal "deg"
+ratio       := decimal "ratio"
+boolean     := "true" | "false"
 ```
 
 A resistor value uses `ohm` or `kohm`. A DC source value uses `V`. Lengths must
@@ -86,6 +110,27 @@ canonical coefficient and exponent, so forms such as `10 kohm` and
 `10000 ohm` elaborate identically.
 Orthogonal rotation is counterclockwise as rendered; in KiCad's Y-down frame,
 an offset `(x, y)` at 90 degrees maps to `(y, -x)`.
+
+Simulation intent is always explicit. A legacy design with no `analysis`
+declaration has no implicit operating point or other analysis. Analysis and
+assertion paths are stable semantic identities and declaration order does not
+affect their canonical Design IR order. `points` is an exact integer in
+`2..=10,000`; frequency, time, magnitude, and tolerance values remain exact decimal
+quantities through Design IR elaboration. A DC operating-point assertion uses
+`sample scalar`, an AC assertion uses `sample frequency`, and a transient
+assertion uses `sample time`. AC samples must lie exactly on the declared
+endpoint-inclusive linear grid. Transient samples must be zero-anchored integer
+multiples of `step` within the output interval, or the forced exact `stop`
+endpoint. The referenced analysis, source component, and net are resolved by
+Design validation, which also rejects invalid dimensions,
+nonpositive frequencies, transient steps, or transient stops; negative
+transient starts, AC magnitudes, or tolerances; incompatible sample kinds; and
+ranges ordered backwards. Negative expected voltages and AC phase values are
+valid. A design may declare at most 256 analyses and 10,000 assertions. No
+analysis may exceed 10,000 samples or transient compute steps, and the
+aggregate workload across all analyses may not exceed 10,000. Transient work
+is budgeted from time zero as `ceil(stop / step) + 1`; `start` filters output
+but does not reduce solver work.
 
 Each component has exactly one part, symbol, schematic position, and
 kind-appropriate value, plus at most one footprint. `model` and `terminals` are
@@ -160,6 +205,5 @@ when available, deterministic messages, and related locations for duplicates.
 ## Deferred language work
 
 Reusable parameterized module definitions, general third-party library
-ingestion, new simulation devices and analyses, and released-language
-compatibility are deferred beyond the initial M1B catalog and instance-tree
-slice.
+ingestion, additional simulation devices and analysis forms, and
+released-language compatibility are deferred beyond the current M2 slice.

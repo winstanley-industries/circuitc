@@ -90,6 +90,37 @@ cmp "${invalid_dir}/diagnostic.json" "${golden_diagnostic}"
 cmp "${invalid_dir}/output/invalid.kicad_pcb" "${invalid_dir}/expected.kicad_pcb"
 cmp "${invalid_dir}/output/invalid.spice" "${invalid_dir}/expected.spice"
 
+intent_dir="${TEST_TMPDIR}/declared-intent-case"
+mkdir -p "${intent_dir}/output"
+sed '$d' "${source_fixture}" >"${intent_dir}/intent.circuitc"
+printf '  analysis dc_operating_point divider.simulation.dc;\n' \
+  >>"${intent_dir}/intent.circuitc"
+tail -n 1 "${source_fixture}" >>"${intent_dir}/intent.circuitc"
+printf 'existing board\n' >"${intent_dir}/output/voltage_divider.kicad_pcb"
+printf 'existing spice\n' >"${intent_dir}/output/voltage_divider.spice"
+printf 'existing board\n' >"${intent_dir}/expected.kicad_pcb"
+printf 'existing spice\n' >"${intent_dir}/expected.spice"
+set +e
+"${cli}" compile "${intent_dir}/intent.circuitc" \
+  --output-dir "${intent_dir}/output" --diagnostic-format=json \
+  >"${intent_dir}/diagnostic.stdout" 2>"${intent_dir}/diagnostic.json"
+intent_status=$?
+set -e
+if [[ ${intent_status} -ne 1 ]]; then
+  echo "expected declared-intent exit 1; found ${intent_status}" >&2
+  exit 1
+fi
+grep -F '"code": "CC-SIM-PHASE-001"' "${intent_dir}/diagnostic.json"
+cmp "${intent_dir}/output/voltage_divider.kicad_pcb" \
+  "${intent_dir}/expected.kicad_pcb"
+cmp "${intent_dir}/output/voltage_divider.spice" \
+  "${intent_dir}/expected.spice"
+if [[ $(find "${intent_dir}/output" -type f | wc -l) -ne 2 ]]; then
+  echo "declared simulation intent published unexpected static artifacts" >&2
+  find "${intent_dir}/output" -print >&2
+  exit 1
+fi
+
 atomic_dir="${TEST_TMPDIR}/atomic-output"
 mkdir -p "${atomic_dir}/voltage_divider.spice"
 printf 'existing board\n' >"${atomic_dir}/voltage_divider.kicad_pcb"
