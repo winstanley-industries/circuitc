@@ -108,7 +108,7 @@ bazel test --lockfile_mode=error //...
 bazel mod graph --lockfile_mode=error
 ```
 
-This is the current Bazel gate set, not the full policy-facing CI surface. Re-read `AGENTS.md`, `README.md`, and `.github/workflows/ci.yml`, then run every additional gate CI applies to the changed paths. For changes under `.github/workflows/`, run the pinned workflow-security gate:
+This is the current Bazel gate set, not the full policy-facing CI surface. Re-read `AGENTS.md`, `README.md`, and `.github/workflows/ci.yml`, then run every additional local gate required for the changed paths. CI runs the pinned workflow-security gate on every pull request; reproduce it locally whenever a file under `.github/workflows/` changes:
 
 ```sh
 pipx run zizmor==1.25.2 --persona=regular .github/workflows/
@@ -175,13 +175,7 @@ Use `github:gh-fix-ci` for failing Actions checks and `github:gh-address-comment
 
 Watch checks through completion, not merely until ordinary CI is green. Manual `workflow_dispatch` success is confidence evidence, not a substitute for required PR-event status. After every push, discard stale successes and approvals and restart the snapshot from the new head.
 
-Run the repository-owned read-only helper when `gh` is available:
-
-```sh
-bazel run //tools/github:pr_thread_status -- --repo OWNER/REPO --pr NUMBER
-```
-
-The Bazel-owned helper reports exact head and unresolved current/outdated threads; it never writes to GitHub.
+Use `github:gh-address-comments` to fetch paginated, thread-aware state. If it is unavailable, use the authenticated read-only GraphQL query in [references/github-closeout.md](references/github-closeout.md). Capture the PR head with the thread snapshot, require it to remain stable across pagination, and distinguish unresolved current threads from unresolved outdated threads. Keep inspection separate from reply and resolution mutations.
 
 ## 9. Integrate feedback in bounded rounds
 
@@ -207,7 +201,7 @@ Thread resolution is a distinct delivery operation. After a fix is pushed and th
 2. Resolve the thread only when the code now satisfies it, the changed code makes it inapplicable, or the reviewer accepted the evidence.
 3. For rejected feedback, explain why with a contract or test citation; resolve only when authorized and the disposition is unambiguous.
 4. Leave unresolved any partially addressed, disputed, or newly failing issue.
-5. Re-run `//tools/github:pr_thread_status` immediately and require zero unresolved threads before merge.
+5. Re-fetch the thread-aware snapshot immediately and require zero unresolved threads before merge.
 
 Prefer `github:gh-address-comments`. If the connector cannot expose thread state or resolution, use authenticated `gh api graphql` as described in [references/github-closeout.md](references/github-closeout.md). Keep reply and resolution operations auditable, use small mutation batches, and verify every returned thread state. Do not defer thread cleanup until the merge command fails.
 

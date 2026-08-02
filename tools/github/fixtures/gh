@@ -1,2 +1,0 @@
-#!/bin/sh
-printf '%s\n' '{"data":{"repository":{"pullRequest":{"headRefOid":"head-1","reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"current","isResolved":false,"isOutdated":false,"path":"src/current.rs","line":7,"originalLine":6,"comments":{"nodes":[{"author":{"login":"reviewer"},"body":"body","url":"https://example.test/current","createdAt":"2026-08-02T00:00:00Z"}]}}]}}}}}'
