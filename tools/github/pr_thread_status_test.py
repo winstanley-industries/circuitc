@@ -42,7 +42,7 @@ def thread(
 def page(
     nodes: list[dict],
     *,
-    head: str = "head-1",
+    head: object = "head-1",
     has_next: bool = False,
     cursor: str | None = None,
 ) -> str:
@@ -155,6 +155,27 @@ class CollectionTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "was not found"):
             pr_thread_status.collect("owner/repo", 404, lambda _: response)
 
+    def test_rejects_missing_or_invalid_head_oid(self) -> None:
+        for invalid_head in (None, "", 123):
+            with (
+                self.subTest(head=invalid_head),
+                self.assertRaisesRegex(RuntimeError, "omitted the pull request head OID"),
+            ):
+                pr_thread_status.collect("owner/repo", 3, lambda _: page([], head=invalid_head))
+
+    def test_rejects_graphql_errors_stably(self) -> None:
+        response = json.dumps(
+            {
+                "errors": [{"message": "Resource not accessible", "code": "FORBIDDEN"}],
+                "data": {"repository": None},
+            }
+        )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            'GitHub GraphQL errors: \[{"code": "FORBIDDEN", "message": "Resource not accessible"}\]',
+        ):
+            pr_thread_status.collect("owner/repo", 3, lambda _: response)
+
 
 class ProcessTest(unittest.TestCase):
     def test_missing_gh_uses_runtime_error_contract(self) -> None:
@@ -172,6 +193,12 @@ class ProcessTest(unittest.TestCase):
         )
         with mock.patch.object(pr_thread_status.subprocess, "run", return_value=completed):
             with self.assertRaisesRegex(RuntimeError, "permission denied"):
+                pr_thread_status.run_gh(["api", "graphql"])
+
+    def test_gh_timeout_uses_runtime_error_contract(self) -> None:
+        timeout = subprocess.TimeoutExpired(["gh", "api"], 30)
+        with mock.patch.object(pr_thread_status.subprocess, "run", side_effect=timeout):
+            with self.assertRaisesRegex(RuntimeError, "timed out after 30 seconds"):
                 pr_thread_status.run_gh(["api", "graphql"])
 
     def test_main_reports_query_failure_as_exit_two(self) -> None:
@@ -287,6 +314,26 @@ class OutputTest(unittest.TestCase):
             return output.getvalue()
 
         self.assertEqual(render(), render())
+
+    def test_human_output_joins_collection_and_summary(self) -> None:
+        response = page([thread("current", resolved=False, outdated=False)])
+        output = io.StringIO()
+
+        result = pr_thread_status.main(
+            ["--repo", "owner/repo", "--pr", "3"],
+            runner=lambda _: response,
+            stdout=output,
+            stderr=io.StringIO(),
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            output.getvalue(),
+            "owner/repo#3 head head-1\n"
+            "threads total=1 resolved=0 unresolved=1 current=1 outdated=0\n"
+            "- current [current] src/current.rs:7 @reviewer "
+            "https://example.test/current body\n",
+        )
 
 
 if __name__ == "__main__":

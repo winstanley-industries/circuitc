@@ -108,7 +108,13 @@ bazel test --lockfile_mode=error //...
 bazel mod graph --lockfile_mode=error
 ```
 
-This is the current superset of the repository guide and CI. Re-read both and run any newly required command rather than assuming one invocation is equivalent to another policy gate.
+This is the current Bazel gate set, not the full policy-facing CI surface. Re-read `AGENTS.md`, `README.md`, and `.github/workflows/ci.yml`, then run every additional gate CI applies to the changed paths. For changes under `.github/workflows/`, run the pinned workflow-security gate:
+
+```sh
+pipx run zizmor==1.25.2 --persona=regular .github/workflows/
+```
+
+Report any unavailable gate exactly rather than assuming one invocation is equivalent to another policy signal.
 
 For KiCad backend, artifact, mapping, or policy changes, additionally:
 

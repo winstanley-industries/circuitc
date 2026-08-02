@@ -13,6 +13,7 @@ from typing import Any, TextIO
 Runner = Callable[[list[str]], str]
 
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+_GH_TIMEOUT_SECONDS = 30
 
 QUERY = r"""
 query ReviewThreads(
@@ -56,17 +57,16 @@ def run_gh(arguments: list[str]) -> str:
             capture_output=True,
             check=False,
             text=True,
+            timeout=_GH_TIMEOUT_SECONDS,
         )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f"gh command timed out after {_GH_TIMEOUT_SECONDS} seconds") from error
     except OSError as error:
         raise RuntimeError(f"gh CLI not available: {error}") from error
     if process.returncode != 0:
         detail = process.stderr.strip() or process.stdout.strip()
         raise RuntimeError(f"gh {' '.join(arguments[:2])} failed: {detail}")
     return process.stdout
-
-
-def current_repo(runner: Runner = run_gh) -> str:
-    return runner(["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"]).strip()
 
 
 def parse_repo(value: str) -> tuple[str, str]:
@@ -198,16 +198,13 @@ def main(
     stderr: TextIO = sys.stderr,
 ) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--repo", help="GitHub repository as OWNER/REPO; defaults to current gh repo"
-    )
+    parser.add_argument("--repo", required=True, help="GitHub repository as OWNER/REPO")
     parser.add_argument("--pr", required=True, type=int, help="pull-request number")
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     args = parser.parse_args(argv)
 
     try:
-        repo = args.repo or current_repo(runner)
-        report = collect(repo, args.pr, runner)
+        report = collect(args.repo, args.pr, runner)
     except (RuntimeError, ValueError, json.JSONDecodeError) as error:
         print(f"error: {error}", file=stderr)
         return 2
