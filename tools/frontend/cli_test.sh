@@ -191,6 +191,30 @@ grep -F 'must be a non-symlinked directory' \
   "${TEST_TMPDIR}/symlink-ancestor.stderr"
 test ! -e "${symlink_ancestor_real}/out"
 
+empty_output_cwd="${TEST_TMPDIR}/empty-output-cwd"
+source_fixture_directory="$(cd "$(dirname "${source_fixture}")" && pwd)"
+source_fixture_absolute="${source_fixture_directory}/$(basename "${source_fixture}")"
+mkdir -p "${empty_output_cwd}"
+set +e
+(
+  cd "${empty_output_cwd}"
+  BUILD_WORKSPACE_DIRECTORY="${empty_output_cwd}" \
+    "${cli}" compile "${source_fixture_absolute}" --output-dir "" \
+    >"${TEST_TMPDIR}/empty-output.stdout" \
+    2>"${TEST_TMPDIR}/empty-output.stderr"
+)
+empty_output_status=$?
+set -e
+if [[ ${empty_output_status} -ne 3 ]]; then
+  echo "expected empty-output I/O exit 3; found ${empty_output_status}" >&2
+  exit 1
+fi
+grep -F 'CC-CLI-IO-002: failed to write output directory' \
+  "${TEST_TMPDIR}/empty-output.stderr"
+grep -F 'output directory must not be empty' \
+  "${TEST_TMPDIR}/empty-output.stderr"
+rmdir "${empty_output_cwd}"
+
 set +e
 "${cli}" compile "${TEST_TMPDIR}/missing.circuitc" --output-dir "${TEST_TMPDIR}/io" \
   >"${TEST_TMPDIR}/io.stdout" 2>"${TEST_TMPDIR}/io.stderr"

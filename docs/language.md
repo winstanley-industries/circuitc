@@ -239,10 +239,21 @@ semantic-path order so one checked failure does not suppress evidence for the
 others.
 
 Checked execution uses a unique caller-owned `0700` compiler work root outside
-the output boundary. Its canonical temporary parent must be caller- or
-root-owned and sticky when shared-writable. On macOS, the parent and created
-work root must have no extended ACL. CircuitC removes the work root before any
-success or checked-failure evidence is published.
+the output boundary in the same validated namespace. For an existing output,
+CircuitC creates it as a random sibling in the output's immediate parent. For a
+missing output, it creates it as a sibling of the first missing component in
+the deepest existing ancestor. That parent descriptor comes from the same
+output walk, must be caller- or root-owned and sticky when shared-writable, and
+must have no extended ACL on macOS. CircuitC does not derive the work root from
+the OS temporary directory. Post-creation lexical and device/inode checks reject
+direct aliases and races; the sibling placement also prevents a hidden bind
+source from placing an OS temporary work root below the output. Existing outputs
+therefore require sibling-creation permission, and `/` is rejected because it
+has no outside sibling. The created work root is caller-owned `0700` with no
+extended ACL. Cleanup is descriptor-anchored, verifies the created identity
+instead of recursively deleting an unbound pathname, and removes the empty
+runner root and compiler root before publication. Unexpected contents fail
+cleanup and prevent publication.
 
 Output directories are additive. Publication replaces the paths emitted by
 the current invocation but does not prune unrelated or stale paths; the paths
@@ -267,6 +278,13 @@ renames to and from that transaction directory. CircuitC checks the device and
 performs a reversible rename probe for each pinned parent before staging, so
 nested cross-device and same-device bind-mount boundaries fail before generated
 files are staged.
+
+The output-directory argument must be nonempty. A relative output directory is
+resolved from a descriptor-pinned current directory, including under
+`bazel run`; only a relative input path is rebased through Bazel's invoking
+workspace. CircuitC walks the current directory's absolute path from `/`,
+validates every namespace ancestor, and requires the walked directory identity
+to match the pinned descriptor before it prepares the output tree.
 
 These namespace protections prevent a process running under a different
 effective user ID from replacing a claimed name between identity validation and

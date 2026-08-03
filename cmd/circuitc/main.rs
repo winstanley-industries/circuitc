@@ -5,75 +5,6 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
-#[cfg(target_os = "macos")]
-fn reject_darwin_extended_acl(file: &fs::File, display_path: &Path) -> io::Result<()> {
-    use std::ffi::c_void;
-    use std::os::fd::AsRawFd as _;
-    use std::os::raw::c_int;
-
-    const ACL_TYPE_EXTENDED: c_int = 0x0000_0100;
-    const ACL_FIRST_ENTRY: c_int = 0;
-
-    unsafe extern "C" {
-        fn acl_get_fd_np(descriptor: c_int, acl_type: c_int) -> *mut c_void;
-        fn acl_get_entry(acl: *mut c_void, entry_id: c_int, entry: *mut *mut c_void) -> c_int;
-        fn acl_free(object: *mut c_void) -> c_int;
-    }
-
-    // SAFETY: the descriptor is live and ACL_TYPE_EXTENDED is the Darwin ACL
-    // type for the object referenced by that descriptor.
-    let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
-    if acl.is_null() {
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::NotFound {
-            return Ok(());
-        }
-        return Err(io::Error::new(
-            error.kind(),
-            format!(
-                "failed to inspect extended ACL on {}: {error}",
-                display_path.display()
-            ),
-        ));
-    }
-    let mut entry = std::ptr::null_mut();
-    // SAFETY: `acl` is live and `entry` points to writable storage for the
-    // borrowed entry pointer.
-    let entry_status = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) };
-    let entry_error = (entry_status < 0).then(io::Error::last_os_error);
-    // SAFETY: `acl` was returned by `acl_get_fd_np` and is released once.
-    let free_status = unsafe { acl_free(acl) };
-    if let Some(error) = entry_error {
-        return Err(io::Error::new(
-            error.kind(),
-            format!(
-                "failed to inspect extended ACL on {}: {error}",
-                display_path.display()
-            ),
-        ));
-    }
-    if free_status != 0 {
-        let error = io::Error::last_os_error();
-        return Err(io::Error::new(
-            error.kind(),
-            format!(
-                "failed to release extended ACL for {}: {error}",
-                display_path.display()
-            ),
-        ));
-    }
-    if entry_status == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "{} has an extended ACL and cannot provide private compiler storage",
-                display_path.display()
-            ),
-        ));
-    }
-    Ok(())
-}
-
 use circuitc::CompiledArtifacts;
 use circuitc::frontend::{DiagnosticFormat, compile_source_checked, render_diagnostics};
 
@@ -93,14 +24,11 @@ fn main() -> ExitCode {
 fn run(arguments: Vec<OsString>) -> Result<(), u8> {
     let options = parse_arguments(arguments)?;
     let filename = options.input.to_string_lossy().into_owned();
-    let input_path = resolve_input_path(
+    let input_path = resolve_bazel_run_input_path(
         &options.input,
         env::var_os("BUILD_WORKSPACE_DIRECTORY").as_deref(),
     );
-    let output_directory = resolve_input_path(
-        &options.output_directory,
-        env::var_os("BUILD_WORKSPACE_DIRECTORY").as_deref(),
-    );
+    let output_directory = options.output_directory;
     let source = fs::read_to_string(&input_path).map_err(|error| {
         eprintln!(
             "CC-CLI-IO-001: failed to read {}: {error}",
@@ -108,8 +36,22 @@ fn run(arguments: Vec<OsString>) -> Result<(), u8> {
         );
         EXIT_IO
     })?;
+    let output_directory = validate_output_directory_path(&output_directory).map_err(|error| {
+        eprintln!(
+            "CC-CLI-IO-002: failed to write output directory {}: {error}",
+            output_directory.display()
+        );
+        EXIT_IO
+    })?;
     let work_root = CompileWorkRoot::create(&output_directory).map_err(|error| {
-        eprintln!("CC-CLI-IO-005: failed to create a private compiler work root: {error}");
+        if CompileWorkRoot::is_output_boundary_error(&error) {
+            eprintln!(
+                "CC-CLI-IO-002: failed to write output directory {}: {error}",
+                output_directory.display()
+            );
+        } else {
+            eprintln!("CC-CLI-IO-005: failed to create a private compiler work root: {error}");
+        }
         EXIT_IO
     })?;
     let checked = compile_source_checked(filename, source, work_root.path());
@@ -315,11 +257,32 @@ fn failure_output_directory(output_directory: &Path) -> io::Result<PathBuf> {
     Ok(normalized.with_file_name(failed))
 }
 
-struct CompileWorkRoot(Option<PathBuf>);
+struct CompileWorkRoot {
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+    ))]
+    inner: anchored_output::CompilerWorkRoot,
+}
 
 impl CompileWorkRoot {
     fn create(output_directory: &Path) -> io::Result<Self> {
-        #[cfg(not(unix))]
+        #[cfg(not(any(
+            all(
+                target_os = "linux",
+                any(target_arch = "aarch64", target_arch = "x86_64")
+            ),
+            all(
+                target_os = "macos",
+                any(target_arch = "aarch64", target_arch = "x86_64")
+            ),
+        )))]
         {
             let _ = output_directory;
             return Err(io::Error::new(
@@ -328,118 +291,122 @@ impl CompileWorkRoot {
             ));
         }
 
-        #[cfg(unix)]
+        #[cfg(any(
+            all(
+                target_os = "linux",
+                any(target_arch = "aarch64", target_arch = "x86_64")
+            ),
+            all(
+                target_os = "macos",
+                any(target_arch = "aarch64", target_arch = "x86_64")
+            ),
+        ))]
         {
-            Self::create_in_parent(output_directory, &env::temp_dir())
+            anchored_output::CompilerWorkRoot::create(output_directory).map(|inner| Self { inner })
         }
     }
 
-    #[cfg(unix)]
-    fn create_in_parent(output_directory: &Path, temporary_parent: &Path) -> io::Result<Self> {
-        use std::io::Read as _;
-        use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
+    fn is_output_boundary_error(error: &io::Error) -> bool {
+        #[cfg(any(
+            all(
+                target_os = "linux",
+                any(target_arch = "aarch64", target_arch = "x86_64")
+            ),
+            all(
+                target_os = "macos",
+                any(target_arch = "aarch64", target_arch = "x86_64")
+            ),
+        ))]
+        {
+            anchored_output::compiler_work_root_error_is_output_boundary(error)
+        }
+        #[cfg(not(any(
+            all(
+                target_os = "linux",
+                any(target_arch = "aarch64", target_arch = "x86_64")
+            ),
+            all(
+                target_os = "macos",
+                any(target_arch = "aarch64", target_arch = "x86_64")
+            ),
+        )))]
+        {
+            let _ = error;
+            false
+        }
+    }
 
-        let temporary_parent = fs::canonicalize(temporary_parent)?;
-        let parent_metadata = fs::metadata(&temporary_parent)?;
-        // SAFETY: `geteuid` has no preconditions and does not dereference pointers.
-        let effective_uid = unsafe { libc::geteuid() };
-        let parent_mode = parent_metadata.mode();
-        if !parent_metadata.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "the canonical OS temporary path is not a directory",
-            ));
-        }
-        if parent_metadata.uid() != effective_uid && parent_metadata.uid() != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "the canonical OS temporary directory is not caller- or root-owned",
-            ));
-        }
-        if parent_mode & 0o022 != 0 && parent_mode & 0o1000 == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "the canonical OS temporary directory is writable by other users without the sticky bit",
-            ));
-        }
-        #[cfg(target_os = "macos")]
-        reject_darwin_extended_acl(&fs::File::open(&temporary_parent)?, &temporary_parent)?;
-
-        let output_boundary = canonical_output_boundary(output_directory)?;
-        for _ in 0..16 {
-            let mut nonce = [0_u8; 16];
-            fs::File::open("/dev/urandom")?.read_exact(&mut nonce)?;
-            let nonce = nonce
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>();
-            let candidate =
-                temporary_parent.join(format!("circuitc-compile-{}-{nonce}", std::process::id()));
-            let mut builder = fs::DirBuilder::new();
-            builder.mode(0o700);
-            match builder.create(&candidate) {
-                Ok(()) => {
-                    // Acquire cleanup ownership before any fallible validation.
-                    let work_root = Self(Some(candidate.clone()));
-                    #[cfg(target_os = "macos")]
-                    reject_darwin_extended_acl(
-                        &fs::File::open(work_root.path())?,
-                        work_root.path(),
-                    )?;
-                    let before = fs::symlink_metadata(work_root.path())?;
-                    let canonical = fs::canonicalize(work_root.path())?;
-                    let after = fs::symlink_metadata(work_root.path())?;
-                    if canonical != candidate
-                        || !before.is_dir()
-                        || !after.is_dir()
-                        || before.uid() != effective_uid
-                        || after.uid() != effective_uid
-                        || before.mode() & 0o777 != 0o700
-                        || after.mode() & 0o777 != 0o700
-                        || before.dev() != after.dev()
-                        || before.ino() != after.ino()
-                    {
-                        return Err(io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            "compiler work root is not a stable caller-owned 0700 directory",
-                        ));
-                    }
-                    if canonical.starts_with(&output_boundary)
-                        || output_boundary.starts_with(&canonical)
-                    {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "compiler work root must be outside the output directory",
-                        ));
-                    }
-                    return Ok(work_root);
-                }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
-            }
-        }
-        Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "could not allocate a unique compiler work root",
-        ))
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+    ))]
+    #[cfg(test)]
+    fn create_in_parent(output_directory: &Path, work_parent: &Path) -> io::Result<Self> {
+        anchored_output::CompilerWorkRoot::create_in_parent_for_test(output_directory, work_parent)
+            .map(|inner| Self { inner })
     }
 
     fn path(&self) -> &Path {
-        self.0.as_deref().expect("compiler work root is live")
+        #[cfg(any(
+            all(
+                target_os = "linux",
+                any(target_arch = "aarch64", target_arch = "x86_64")
+            ),
+            all(
+                target_os = "macos",
+                any(target_arch = "aarch64", target_arch = "x86_64")
+            ),
+        ))]
+        {
+            self.inner.path()
+        }
+        #[cfg(not(any(
+            all(
+                target_os = "linux",
+                any(target_arch = "aarch64", target_arch = "x86_64")
+            ),
+            all(
+                target_os = "macos",
+                any(target_arch = "aarch64", target_arch = "x86_64")
+            ),
+        )))]
+        {
+            unreachable!("compiler work roots are unsupported on this platform")
+        }
     }
 
-    fn cleanup(mut self) -> io::Result<()> {
-        let path = self.0.as_deref().expect("compiler work root is live");
-        fs::remove_dir_all(path)?;
-        self.0.take();
-        Ok(())
-    }
-}
-
-impl Drop for CompileWorkRoot {
-    fn drop(&mut self) {
-        if let Some(path) = self.0.take() {
-            let _ = fs::remove_dir_all(path);
+    fn cleanup(self) -> io::Result<()> {
+        #[cfg(any(
+            all(
+                target_os = "linux",
+                any(target_arch = "aarch64", target_arch = "x86_64")
+            ),
+            all(
+                target_os = "macos",
+                any(target_arch = "aarch64", target_arch = "x86_64")
+            ),
+        ))]
+        {
+            self.inner.cleanup()
+        }
+        #[cfg(not(any(
+            all(
+                target_os = "linux",
+                any(target_arch = "aarch64", target_arch = "x86_64")
+            ),
+            all(
+                target_os = "macos",
+                any(target_arch = "aarch64", target_arch = "x86_64")
+            ),
+        )))]
+        {
+            unreachable!("compiler work roots are unsupported on this platform")
         }
     }
 }
@@ -463,29 +430,6 @@ fn absolute_lexical_path(path: &Path) -> io::Result<PathBuf> {
         }
     }
     Ok(normalized)
-}
-
-fn canonical_output_boundary(path: &Path) -> io::Result<PathBuf> {
-    let absolute = absolute_lexical_path(path)?;
-    let mut existing = absolute.as_path();
-    let mut missing = Vec::new();
-    while !existing.exists() {
-        let Some(segment) = existing.file_name() else {
-            break;
-        };
-        missing.push(segment.to_owned());
-        existing = existing.parent().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "output directory has no existing canonical ancestor",
-            )
-        })?;
-    }
-    let mut canonical = fs::canonicalize(existing)?;
-    for segment in missing.iter().rev() {
-        canonical.push(segment);
-    }
-    Ok(canonical)
 }
 
 fn report_successful_publication(
@@ -526,7 +470,10 @@ fn report_successful_publication(
     }
 }
 
-fn resolve_input_path(input: &Path, bazel_workspace: Option<&std::ffi::OsStr>) -> PathBuf {
+fn resolve_bazel_run_input_path(
+    input: &Path,
+    bazel_workspace: Option<&std::ffi::OsStr>,
+) -> PathBuf {
     if input.is_relative()
         && let Some(workspace) = bazel_workspace
     {
@@ -648,6 +595,39 @@ fn write_outputs(
     }
 }
 
+fn validate_output_directory_path(output_directory: &Path) -> io::Result<PathBuf> {
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+    ))]
+    {
+        anchored_output::validate_output_directory_path(output_directory)
+    }
+    #[cfg(not(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+    )))]
+    {
+        let _ = output_directory;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "secure output-path validation is unavailable on this platform",
+        ))
+    }
+}
+
 fn validate_relative_output_path(filename: &str) -> io::Result<&Path> {
     let path = Path::new(filename);
     if path.as_os_str().is_empty()
@@ -676,17 +656,20 @@ fn validate_relative_output_path(filename: &str) -> io::Result<&Path> {
 ))]
 mod anchored_output {
     use std::collections::BTreeSet;
+    use std::env;
     #[cfg(target_os = "macos")]
     use std::ffi::c_void;
     use std::ffi::{CStr, CString, OsStr, OsString};
     use std::fmt;
+    #[cfg(test)]
+    use std::fs;
     use std::fs::File;
     use std::io::{self, Read as _, Write as _};
     use std::os::fd::{AsRawFd as _, FromRawFd as _, RawFd};
     use std::os::raw::{c_char, c_int, c_uint};
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::MetadataExt as _;
-    use std::path::{Component, Path};
+    use std::path::{Component, Path, PathBuf};
     use std::process;
 
     // CircuitC has no third-party Rust crate graph yet. Keep these bindings
@@ -769,6 +752,31 @@ mod anchored_output {
         fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
             Some(&self.source)
         }
+    }
+
+    #[derive(Debug)]
+    struct CompilerOutputBoundaryFailure(io::Error);
+
+    impl fmt::Display for CompilerOutputBoundaryFailure {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.0.fmt(formatter)
+        }
+    }
+
+    impl std::error::Error for CompilerOutputBoundaryFailure {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    fn compiler_output_boundary_error(error: io::Error) -> io::Error {
+        io::Error::new(error.kind(), CompilerOutputBoundaryFailure(error))
+    }
+
+    pub(super) fn compiler_work_root_error_is_output_boundary(error: &io::Error) -> bool {
+        error
+            .get_ref()
+            .is_some_and(|source| source.is::<CompilerOutputBoundaryFailure>())
     }
 
     const O_RDONLY: c_int = 0;
@@ -1136,6 +1144,488 @@ mod anchored_output {
         Ok(nonce.iter().map(|byte| format!("{byte:02x}")).collect())
     }
 
+    #[derive(Clone, Copy)]
+    enum FinalDirectoryPolicy {
+        NamespaceAncestor,
+        #[cfg(test)]
+        TransactionParent,
+    }
+
+    fn open_validated_absolute_directory(
+        path: &Path,
+        final_policy: FinalDirectoryPolicy,
+    ) -> io::Result<Directory> {
+        open_validated_absolute_directory_with_ancestry(path, final_policy)
+            .map(|(directory, _)| directory)
+    }
+
+    fn open_validated_absolute_directory_with_ancestry(
+        path: &Path,
+        final_policy: FinalDirectoryPolicy,
+    ) -> io::Result<(Directory, Vec<(u64, u64)>)> {
+        if !path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "validated directory path {} is not absolute",
+                    path.display()
+                ),
+            ));
+        }
+        let mut current = Directory::open_path(Path::new("/"))?;
+        let components = path
+            .components()
+            .filter(|component| !matches!(component, Component::RootDir | Component::CurDir))
+            .collect::<Vec<_>>();
+        if components.is_empty() {
+            match final_policy {
+                FinalDirectoryPolicy::NamespaceAncestor => {
+                    validate_namespace_ancestor(&current, "/")?
+                }
+                #[cfg(test)]
+                FinalDirectoryPolicy::TransactionParent => {
+                    validate_transaction_parent(&current, "/")?
+                }
+            }
+            let identity = current.identity()?;
+            return Ok((current, vec![identity]));
+        }
+        validate_namespace_ancestor(&current, "/")?;
+        let mut identities = vec![current.identity()?];
+        let mut walked = PathBuf::from("/");
+        for (index, component) in components.iter().enumerate() {
+            let Component::Normal(segment) = component else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "validated directory path {} is not lexically normalized",
+                        path.display()
+                    ),
+                ));
+            };
+            walked.push(segment);
+            let child = current.open_child(&c_name(segment)?)?;
+            let is_final = index + 1 == components.len();
+            if is_final {
+                match final_policy {
+                    FinalDirectoryPolicy::NamespaceAncestor => {
+                        validate_namespace_ancestor(&child, &walked.display().to_string())?
+                    }
+                    #[cfg(test)]
+                    FinalDirectoryPolicy::TransactionParent => {
+                        validate_transaction_parent(&child, &walked.display().to_string())?
+                    }
+                }
+            } else {
+                validate_namespace_ancestor(&child, &walked.display().to_string())?;
+            }
+            identities.push(child.identity()?);
+            current = child;
+        }
+        Ok((current, identities))
+    }
+
+    fn resolve_relative_output_directory(
+        output_directory: &Path,
+        pinned_current_directory: &Directory,
+        current_directory_path: &Path,
+    ) -> io::Result<PathBuf> {
+        let current_directory_path = super::absolute_lexical_path(current_directory_path)?;
+        let walked_current_directory = open_validated_absolute_directory(
+            &current_directory_path,
+            FinalDirectoryPolicy::NamespaceAncestor,
+        )?;
+        if walked_current_directory.identity()? != pinned_current_directory.identity()? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the current directory changed while resolving the relative output path",
+            ));
+        }
+        super::absolute_lexical_path(&current_directory_path.join(output_directory))
+    }
+
+    fn resolve_output_directory(output_directory: &Path) -> io::Result<PathBuf> {
+        if output_directory.as_os_str().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "output directory must not be empty",
+            ));
+        }
+        if output_directory.is_absolute() {
+            return super::absolute_lexical_path(output_directory);
+        }
+        let pinned_current_directory = Directory::open_path(Path::new("."))?;
+        resolve_relative_output_directory(
+            output_directory,
+            &pinned_current_directory,
+            &env::current_dir()?,
+        )
+    }
+
+    struct ExistingPathWalk {
+        identities: Vec<(u64, u64)>,
+        complete: bool,
+        sibling_parent: Option<ValidatedSiblingParent>,
+    }
+
+    struct ValidatedSiblingParent {
+        directory: Directory,
+        path: PathBuf,
+        ancestry: Vec<(u64, u64)>,
+    }
+
+    fn validate_existing_output_directory(path: &Path) -> io::Result<ExistingPathWalk> {
+        let mut current = Directory::open_path(Path::new("/"))?;
+        validate_namespace_ancestor(&current, "/")?;
+        let mut identities = vec![current.identity()?];
+        let mut walked = PathBuf::from("/");
+        let components = path
+            .components()
+            .filter(|component| !matches!(component, Component::RootDir | Component::CurDir))
+            .collect::<Vec<_>>();
+        if components.is_empty() {
+            validate_transaction_parent(&current, "/")?;
+            return Ok(ExistingPathWalk {
+                identities,
+                complete: true,
+                sibling_parent: None,
+            });
+        }
+        for (index, component) in components.iter().enumerate() {
+            let Component::Normal(segment) = component else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "output directory is not a normalized absolute path",
+                ));
+            };
+            let is_final = index + 1 == components.len();
+            let child = match current.open_child(&c_name(segment)?) {
+                Ok(child) => child,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    validate_transaction_parent(&current, &walked.display().to_string())?;
+                    return Ok(ExistingPathWalk {
+                        identities: identities.clone(),
+                        complete: false,
+                        sibling_parent: Some(ValidatedSiblingParent {
+                            directory: current,
+                            path: walked,
+                            ancestry: identities,
+                        }),
+                    });
+                }
+                Err(error) => return Err(output_directory_component_error(segment, error)),
+            };
+            walked.push(segment);
+            if is_final {
+                validate_transaction_parent(&child, &path.display().to_string())?;
+                validate_transaction_parent(
+                    &current,
+                    &format!("compiler work parent of {}", path.display()),
+                )?;
+                identities.push(child.identity()?);
+                let sibling_ancestry = identities[..identities.len() - 1].to_vec();
+                return Ok(ExistingPathWalk {
+                    identities,
+                    complete: true,
+                    sibling_parent: Some(ValidatedSiblingParent {
+                        directory: current,
+                        path: walked
+                            .parent()
+                            .expect("a non-root absolute path has a parent")
+                            .to_owned(),
+                        ancestry: sibling_ancestry,
+                    }),
+                });
+            } else {
+                validate_namespace_ancestor(&child, &segment.to_string_lossy())?;
+            }
+            identities.push(child.identity()?);
+            current = child;
+        }
+        unreachable!("non-root output paths return from the component walk")
+    }
+
+    pub(super) fn validate_output_directory_path(output_directory: &Path) -> io::Result<PathBuf> {
+        let output_directory = resolve_output_directory(output_directory)?;
+        validate_existing_output_directory(&output_directory)?;
+        Ok(output_directory)
+    }
+
+    fn work_root_overlaps_output(
+        temporary_ancestry: &[(u64, u64)],
+        candidate_identity: (u64, u64),
+        output_walk: &ExistingPathWalk,
+    ) -> bool {
+        let output_contains_candidate = output_walk.identities.contains(&candidate_identity);
+        let candidate_is_inside_output = output_walk.complete
+            && output_walk.identities.last().is_some_and(|identity| {
+                *identity == candidate_identity || temporary_ancestry.contains(identity)
+            });
+        output_contains_candidate || candidate_is_inside_output
+    }
+
+    #[cfg(test)]
+    pub(super) fn work_root_overlaps_output_for_test(
+        temporary_ancestry: &[(u64, u64)],
+        candidate_identity: (u64, u64),
+        output_identities: Vec<(u64, u64)>,
+        output_complete: bool,
+    ) -> bool {
+        work_root_overlaps_output(
+            temporary_ancestry,
+            candidate_identity,
+            &ExistingPathWalk {
+                identities: output_identities,
+                complete: output_complete,
+                sibling_parent: None,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn resolve_relative_output_directory_for_test(
+        output_directory: &Path,
+        pinned_current_directory: &Path,
+        current_directory_path: &Path,
+    ) -> io::Result<PathBuf> {
+        resolve_relative_output_directory(
+            output_directory,
+            &Directory::open_path(pinned_current_directory)?,
+            current_directory_path,
+        )
+    }
+
+    struct CompilerWorkRootOwnership {
+        parent: Directory,
+        directory: Directory,
+        name: CString,
+        identity: (u64, u64),
+    }
+
+    pub(super) struct CompilerWorkRoot {
+        path: PathBuf,
+        ownership: Option<CompilerWorkRootOwnership>,
+    }
+
+    impl CompilerWorkRoot {
+        pub(super) fn create(output_directory: &Path) -> io::Result<Self> {
+            let output_boundary = resolve_output_directory(output_directory)
+                .map_err(compiler_output_boundary_error)?;
+            let output_walk = validate_existing_output_directory(&output_boundary)
+                .map_err(compiler_output_boundary_error)?;
+            let sibling_parent = output_walk.sibling_parent.ok_or_else(|| {
+                compiler_output_boundary_error(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "compiler output directory must have an outside sibling",
+                ))
+            })?;
+            Self::create_with_parent(
+                output_boundary,
+                sibling_parent.path,
+                sibling_parent.directory,
+                sibling_parent.ancestry,
+                |output_boundary, _| validate_existing_output_directory(output_boundary),
+            )
+        }
+
+        #[cfg(test)]
+        pub(super) fn create_in_parent_for_test(
+            output_directory: &Path,
+            work_parent: &Path,
+        ) -> io::Result<Self> {
+            Self::create_in_parent_with_walk_for_test(
+                output_directory,
+                work_parent,
+                |boundary, _| validate_existing_output_directory(boundary),
+            )
+        }
+
+        #[cfg(test)]
+        pub(super) fn create_with_candidate_alias_for_test(
+            output_directory: &Path,
+            work_parent: &Path,
+        ) -> io::Result<Self> {
+            Self::create_in_parent_with_walk_for_test(
+                output_directory,
+                work_parent,
+                |_, candidate_identity| {
+                    Ok(ExistingPathWalk {
+                        identities: vec![candidate_identity],
+                        complete: false,
+                        sibling_parent: None,
+                    })
+                },
+            )
+        }
+
+        #[cfg(test)]
+        fn create_in_parent_with_walk_for_test<F>(
+            output_directory: &Path,
+            work_parent: &Path,
+            output_walk_after_create: F,
+        ) -> io::Result<Self>
+        where
+            F: FnMut(&Path, (u64, u64)) -> io::Result<ExistingPathWalk>,
+        {
+            let work_parent_path = fs::canonicalize(work_parent)?;
+            let (parent, work_parent_ancestry) = open_validated_absolute_directory_with_ancestry(
+                &work_parent_path,
+                FinalDirectoryPolicy::TransactionParent,
+            )?;
+            let output_boundary = resolve_output_directory(output_directory)
+                .map_err(compiler_output_boundary_error)?;
+            validate_existing_output_directory(&output_boundary)
+                .map_err(compiler_output_boundary_error)?;
+            Self::create_with_parent(
+                output_boundary,
+                work_parent_path,
+                parent,
+                work_parent_ancestry,
+                output_walk_after_create,
+            )
+        }
+
+        fn create_with_parent<F>(
+            output_boundary: PathBuf,
+            work_parent_path: PathBuf,
+            parent: Directory,
+            work_parent_ancestry: Vec<(u64, u64)>,
+            mut output_walk_after_create: F,
+        ) -> io::Result<Self>
+        where
+            F: FnMut(&Path, (u64, u64)) -> io::Result<ExistingPathWalk>,
+        {
+            validate_transaction_parent(
+                &parent,
+                &format!("compiler work parent {}", work_parent_path.display()),
+            )?;
+            for _ in 0..16 {
+                let basename = format!("circuitc-compile-{}-{}", process::id(), random_nonce()?);
+                let candidate = work_parent_path.join(&basename);
+                if candidate.starts_with(&output_boundary)
+                    || output_boundary.starts_with(&candidate)
+                {
+                    return Err(compiler_output_boundary_error(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "compiler work root must be outside the output directory",
+                    )));
+                }
+                let name = c_name(OsStr::new(&basename))?;
+                let cleanup_parent = parent.try_clone()?;
+                match parent.create_child_with_mode(&name, 0o700 as Mode) {
+                    Ok(false) => continue,
+                    Err(error) => return Err(error),
+                    Ok(true) => {}
+                }
+                let directory = match parent.open_child(&name) {
+                    Ok(directory) => directory,
+                    Err(error) => {
+                        return Err(with_cleanup_error(error, parent.remove_directory(&name)));
+                    }
+                };
+                let identity = match directory.identity() {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        return Err(with_cleanup_error(error, parent.remove_directory(&name)));
+                    }
+                };
+                let work_root = Self {
+                    path: candidate,
+                    ownership: Some(CompilerWorkRootOwnership {
+                        parent: cleanup_parent,
+                        directory,
+                        name,
+                        identity,
+                    }),
+                };
+                work_root.validate_created_directory()?;
+                let output_walk = output_walk_after_create(&output_boundary, identity)
+                    .map_err(compiler_output_boundary_error)?;
+                if work_root_overlaps_output(&work_parent_ancestry, identity, &output_walk) {
+                    return Err(compiler_output_boundary_error(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "compiler work root must be outside the output directory",
+                    )));
+                }
+                return Ok(work_root);
+            }
+            Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "could not allocate a unique compiler work root",
+            ))
+        }
+
+        fn validate_created_directory(&self) -> io::Result<()> {
+            let ownership = self
+                .ownership
+                .as_ref()
+                .expect("compiler work-root ownership is live");
+            let metadata = ownership.directory.0.metadata()?;
+            // SAFETY: `geteuid` has no preconditions and does not dereference pointers.
+            let effective_uid = unsafe { libc::geteuid() };
+            if metadata.uid() != effective_uid || metadata.mode() & 0o777 != 0o700 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "compiler work root is not a caller-owned 0700 directory",
+                ));
+            }
+            reject_extended_acl(&ownership.directory, &self.path.display().to_string())?;
+            Ok(())
+        }
+
+        pub(super) fn path(&self) -> &Path {
+            &self.path
+        }
+
+        pub(super) fn cleanup(mut self) -> io::Result<()> {
+            let result = self.remove_owned_directory();
+            if result.is_ok() {
+                self.ownership.take();
+            }
+            result
+        }
+
+        fn remove_owned_directory(&self) -> io::Result<()> {
+            let ownership = self
+                .ownership
+                .as_ref()
+                .expect("compiler work-root ownership is live");
+            let runner_root_name = c_name(OsStr::new("circuitc-ohmnivore-work"))?;
+            match ownership.directory.open_child(&runner_root_name) {
+                Ok(runner_root) => {
+                    let metadata = runner_root.0.metadata()?;
+                    // SAFETY: `geteuid` has no preconditions and does not dereference pointers.
+                    let effective_uid = unsafe { libc::geteuid() };
+                    if metadata.uid() != effective_uid || metadata.mode() & 0o077 != 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "compiler runner work directory is not private and caller-owned",
+                        ));
+                    }
+                    ownership.directory.remove_directory(&runner_root_name)?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            let current = ownership.parent.open_child(&ownership.name)?;
+            if current.identity()? != ownership.identity {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "compiler work-root name no longer identifies the created directory",
+                ));
+            }
+            ownership.parent.remove_directory(&ownership.name)
+        }
+    }
+
+    impl Drop for CompilerWorkRoot {
+        fn drop(&mut self) {
+            if self.ownership.is_some() && self.remove_owned_directory().is_ok() {
+                self.ownership.take();
+            }
+        }
+    }
+
     fn create_private_quarantine(root: &Directory) -> io::Result<PrivateQuarantine> {
         validate_transaction_parent(root, "transaction output root")?;
         for _ in 0..16 {
@@ -1264,7 +1754,8 @@ mod anchored_output {
             .iter()
             .map(|(filename, _)| super::validate_relative_output_path(filename))
             .collect::<io::Result<_>>()?;
-        let (root, mut created_directories) = prepare_output_directory(output_directory)?;
+        let output_directory = resolve_output_directory(output_directory)?;
+        let (root, mut created_directories) = prepare_output_directory(&output_directory)?;
 
         // This first pass is deliberately non-mutating. A later invalid target
         // cannot leave newly-created generated directories behind.
@@ -2845,7 +3336,7 @@ mod anchored_output {
 
 #[cfg(test)]
 mod tests {
-    use super::{DiagnosticFormat, parse_arguments, resolve_input_path};
+    use super::{DiagnosticFormat, parse_arguments, resolve_bazel_run_input_path};
     use std::ffi::OsString;
 
     struct FailingWriter(std::io::ErrorKind);
@@ -2903,25 +3394,18 @@ mod tests {
     #[test]
     fn resolves_bazel_run_inputs_against_the_invoking_workspace() {
         assert_eq!(
-            resolve_input_path(
+            resolve_bazel_run_input_path(
                 std::path::Path::new("examples/design.circuitc"),
                 Some(std::ffi::OsStr::new("/workspace")),
             ),
             std::path::Path::new("/workspace/examples/design.circuitc")
         );
         assert_eq!(
-            resolve_input_path(
+            resolve_bazel_run_input_path(
                 std::path::Path::new("/absolute/design.circuitc"),
                 Some(std::ffi::OsStr::new("/workspace")),
             ),
             std::path::Path::new("/absolute/design.circuitc")
-        );
-        assert_eq!(
-            resolve_input_path(
-                std::path::Path::new("out"),
-                Some(std::ffi::OsStr::new("/workspace")),
-            ),
-            std::path::Path::new("/workspace/out")
         );
     }
 
@@ -3012,9 +3496,7 @@ mod tests {
         let work_root =
             super::CompileWorkRoot::create(&output).expect("allocate private compiler work root");
         let path = work_root.path().to_owned();
-        let canonical_temporary = std::fs::canonicalize(std::env::temp_dir())
-            .expect("canonicalize OS temporary directory");
-        assert!(path.starts_with(canonical_temporary));
+        assert_eq!(path.parent(), Some(scratch.as_path()));
         assert!(!path.starts_with(&output));
         assert_eq!(
             std::fs::metadata(&path)
@@ -3043,6 +3525,21 @@ mod tests {
             .expect("explicit compiler work-root cleanup must succeed");
         assert!(!path.exists());
 
+        std::fs::create_dir(&output).expect("create existing output root");
+        let existing_output_root = super::CompileWorkRoot::create(&output)
+            .expect("allocate a sibling beside an existing output root");
+        assert_eq!(
+            existing_output_root.path().parent(),
+            Some(scratch.as_path())
+        );
+        existing_output_root.cleanup().unwrap();
+
+        let nested_missing_output = scratch.join("missing/nested-output");
+        let missing_output_root = super::CompileWorkRoot::create(&nested_missing_output)
+            .expect("allocate a sibling of the first missing output component");
+        assert_eq!(missing_output_root.path().parent(), Some(scratch.as_path()));
+        missing_output_root.cleanup().unwrap();
+
         let dropped_path = {
             let work_root = super::CompileWorkRoot::create(&output)
                 .expect("allocate compiler work root for drop cleanup");
@@ -3057,7 +3554,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn compiler_work_root_validates_injected_temporary_parent_and_uses_random_names() {
+    fn compiler_work_root_validates_injected_work_parent_and_uses_random_names() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let scratch = scratch_directory("compiler-work-parent");
@@ -3088,50 +3585,356 @@ mod tests {
         let error = match super::CompileWorkRoot::create_in_parent(&output, &insecure_parent) {
             Ok(root) => {
                 root.cleanup().unwrap();
-                panic!("non-sticky shared temporary parent must be rejected")
+                panic!("non-sticky shared work parent must be rejected")
             }
             Err(error) => error,
         };
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!super::CompileWorkRoot::is_output_boundary_error(&error));
 
+        let unsafe_ancestor = scratch.join("unsafe-ancestor");
+        let nested_parent = unsafe_ancestor.join("nested-private");
+        std::fs::create_dir(&unsafe_ancestor).unwrap();
+        std::fs::create_dir(&nested_parent).unwrap();
+        std::fs::set_permissions(&unsafe_ancestor, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let error = match super::CompileWorkRoot::create_in_parent(&output, &nested_parent) {
+            Ok(root) => {
+                root.cleanup().unwrap();
+                panic!("an unsafe work-parent ancestor must be rejected")
+            }
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("writable by other users without the sticky bit"),
+            "unexpected work-parent ancestor error: {error}"
+        );
+        std::fs::set_permissions(&unsafe_ancestor, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compiler_work_root_cleanup_preserves_a_replacement_name() {
+        let scratch = scratch_directory("compiler-work-cleanup-replacement");
+        let temporary = scratch.join("temporary");
+        std::fs::create_dir(&temporary).unwrap();
+        let output = scratch.join("output");
+        let work_root = super::CompileWorkRoot::create_in_parent(&output, &temporary).unwrap();
+        let path = work_root.path().to_owned();
+        let moved = scratch.join("moved-original-work-root");
+        std::fs::rename(&path, &moved).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("replacement.txt"), b"preserve").unwrap();
+
+        let error = work_root
+            .cleanup()
+            .expect_err("cleanup must reject a replacement work-root name");
+        assert!(
+            error
+                .to_string()
+                .contains("no longer identifies the created directory"),
+            "unexpected replacement error: {error}"
+        );
+        assert_eq!(
+            std::fs::read(path.join("replacement.txt")).unwrap(),
+            b"preserve"
+        );
+        assert!(moved.is_dir());
+
+        std::fs::remove_dir_all(&path).unwrap();
+        std::fs::remove_dir_all(&moved).unwrap();
+        std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compiler_work_root_cleanup_refuses_unexpected_contents() {
+        let scratch = scratch_directory("compiler-work-cleanup-contents");
+        let temporary = scratch.join("temporary");
+        std::fs::create_dir(&temporary).unwrap();
+        let output = scratch.join("output");
+        let work_root = super::CompileWorkRoot::create_in_parent(&output, &temporary).unwrap();
+        let path = work_root.path().to_owned();
+        std::fs::write(path.join("unexpected.txt"), b"preserve").unwrap();
+
+        work_root
+            .cleanup()
+            .expect_err("unexpected compiler work-root contents must prevent cleanup");
+        assert_eq!(
+            std::fs::read(path.join("unexpected.txt")).unwrap(),
+            b"preserve"
+        );
+
+        std::fs::remove_dir_all(&path).unwrap();
+        std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+    ))]
+    #[test]
+    fn relative_output_resolution_validates_and_binds_the_complete_cwd_chain() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let scratch = scratch_directory("relative-output-cwd-chain");
+        let unsafe_ancestor = scratch.join("unsafe");
+        let pinned_cwd = unsafe_ancestor.join("cwd");
+        std::fs::create_dir(&unsafe_ancestor).unwrap();
+        std::fs::create_dir(&pinned_cwd).unwrap();
+        std::fs::set_permissions(&unsafe_ancestor, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let error = super::anchored_output::resolve_relative_output_directory_for_test(
+            std::path::Path::new("output"),
+            &pinned_cwd,
+            &pinned_cwd,
+        )
+        .expect_err("an unsafe cwd ancestor must fail relative-output resolution");
+        assert!(
+            error
+                .to_string()
+                .contains("writable by other users without the sticky bit"),
+            "unexpected cwd-ancestor error: {error}"
+        );
+
+        std::fs::set_permissions(&unsafe_ancestor, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let replacement_cwd = scratch.join("replacement-cwd");
+        std::fs::create_dir(&replacement_cwd).unwrap();
+        let error = super::anchored_output::resolve_relative_output_directory_for_test(
+            std::path::Path::new("output"),
+            &pinned_cwd,
+            &replacement_cwd,
+        )
+        .expect_err("the walked cwd must match the descriptor pinned before resolution");
+        assert!(
+            error
+                .to_string()
+                .contains("current directory changed while resolving"),
+            "unexpected cwd-binding error: {error}"
+        );
+        assert_eq!(
+            super::anchored_output::resolve_relative_output_directory_for_test(
+                std::path::Path::new("output"),
+                &pinned_cwd,
+                &pinned_cwd,
+            )
+            .unwrap(),
+            pinned_cwd.join("output")
+        );
+        std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+    ))]
+    #[test]
+    fn empty_output_directory_is_rejected_before_relative_resolution() {
+        let error =
+            super::anchored_output::validate_output_directory_path(std::path::Path::new(""))
+                .expect_err("an empty output argument must not resolve to the current directory");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("must not be empty"));
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+    ))]
+    #[test]
+    fn compiler_work_root_identity_overlap_rejects_aliases_but_allows_siblings() {
+        let root = (1, 1);
+        let temporary = (1, 2);
+        let candidate = (1, 3);
+        let safe = (1, 4);
+        let output = (1, 5);
+        let temporary_ancestry = [root, temporary];
+
+        assert!(super::anchored_output::work_root_overlaps_output_for_test(
+            &temporary_ancestry,
+            candidate,
+            vec![root, safe, temporary],
+            true,
+        ));
+        assert!(super::anchored_output::work_root_overlaps_output_for_test(
+            &temporary_ancestry,
+            candidate,
+            vec![root, temporary, candidate],
+            false,
+        ));
+        assert!(!super::anchored_output::work_root_overlaps_output_for_test(
+            &temporary_ancestry,
+            candidate,
+            vec![root, temporary, output],
+            true,
+        ));
+        assert!(!super::anchored_output::work_root_overlaps_output_for_test(
+            &temporary_ancestry,
+            candidate,
+            vec![root, temporary],
+            false,
+        ));
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+    ))]
+    #[test]
+    fn compiler_work_root_post_create_overlap_is_classified_and_cleaned() {
+        let scratch = scratch_directory("compiler-work-post-create-overlap");
+        let work_parent = scratch.join("work-parent");
+        std::fs::create_dir(&work_parent).unwrap();
+        let output = scratch.join("output");
+
+        let error =
+            match super::anchored_output::CompilerWorkRoot::create_with_candidate_alias_for_test(
+                &output,
+                &work_parent,
+            ) {
+                Ok(root) => {
+                    root.cleanup().unwrap();
+                    panic!("an injected post-create alias must be rejected")
+                }
+                Err(error) => error,
+            };
+        assert!(super::CompileWorkRoot::is_output_boundary_error(&error));
+        assert!(
+            error
+                .to_string()
+                .contains("must be outside the output directory")
+        );
+        assert_eq!(
+            std::fs::read_dir(&work_parent).unwrap().count(),
+            0,
+            "RAII cleanup must remove the rejected owned candidate"
+        );
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+    ))]
+    #[test]
+    fn compiler_work_root_rejects_the_filesystem_root_output() {
+        let error = match super::CompileWorkRoot::create(std::path::Path::new("/")) {
+            Ok(root) => {
+                root.cleanup().unwrap();
+                panic!("the filesystem root has no outside sibling")
+            }
+            Err(error) => error,
+        };
+        assert!(super::CompileWorkRoot::is_output_boundary_error(&error));
+        assert!(error.to_string().contains("must have an outside sibling"));
+    }
+
+    #[cfg(all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ))]
+    #[test]
+    fn missing_output_requires_a_mutable_deepest_existing_parent() {
+        use std::process::Command;
+
+        let scratch = scratch_directory("missing-output-deny-only-parent");
+        let deepest_existing = scratch.join("deepest-existing");
+        std::fs::create_dir(&deepest_existing).unwrap();
+        let status = Command::new("/bin/chmod")
+            .arg("+a")
+            .arg("everyone deny delete")
+            .arg(&deepest_existing)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let output = deepest_existing.join("missing/nested-output");
+        let error = super::anchored_output::validate_output_directory_path(&output)
+            .expect_err("the future sibling-creation parent must reject every extended ACL");
+        assert!(
+            error
+                .to_string()
+                .contains("has an extended ACL and cannot provide isolated transaction cleanup"),
+            "unexpected deepest-existing-parent ACL error: {error}"
+        );
+
+        let status = Command::new("/bin/chmod")
+            .arg("-N")
+            .arg(&deepest_existing)
+            .status()
+            .unwrap();
+        assert!(status.success());
         std::fs::remove_dir_all(scratch).unwrap();
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn compiler_work_root_rejects_an_extended_acl_parent() {
+    fn compiler_work_root_rejects_an_extended_acl_on_an_injected_work_parent() {
         use std::os::unix::fs::PermissionsExt as _;
         use std::process::Command;
 
         let scratch = scratch_directory("compiler-work-acl-parent");
-        let temporary = scratch.join("temporary");
-        std::fs::create_dir(&temporary).unwrap();
-        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let work_parent = scratch.join("work-parent");
+        std::fs::create_dir(&work_parent).unwrap();
+        std::fs::set_permissions(&work_parent, std::fs::Permissions::from_mode(0o700)).unwrap();
         let status = Command::new("/bin/chmod")
             .arg("+a")
             .arg("everyone allow add_file,add_subdirectory,delete_child")
-            .arg(&temporary)
+            .arg(&work_parent)
             .status()
             .unwrap();
         assert!(status.success());
 
         let error =
-            match super::CompileWorkRoot::create_in_parent(&scratch.join("output"), &temporary) {
+            match super::CompileWorkRoot::create_in_parent(&scratch.join("output"), &work_parent) {
                 Ok(root) => {
                     root.cleanup().unwrap();
-                    panic!("an extended ACL temporary parent must be rejected")
+                    panic!("an extended ACL work parent must be rejected")
                 }
                 Err(error) => error,
             };
         assert!(
             error
                 .to_string()
-                .contains("has an extended ACL and cannot provide private compiler storage"),
+                .contains("has an extended ACL and cannot provide isolated transaction cleanup"),
             "unexpected compiler ACL error: {error}"
         );
         let status = Command::new("/bin/chmod")
             .arg("-N")
-            .arg(&temporary)
+            .arg(&work_parent)
             .status()
             .unwrap();
         assert!(status.success());
@@ -3140,7 +3943,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn compiler_work_root_refuses_to_live_below_the_output_directory() {
+    fn injected_compiler_work_parent_refuses_to_equal_the_output_directory() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let scratch = scratch_directory("compiler-work-boundary");
@@ -3160,7 +3963,7 @@ mod tests {
         let error = match super::CompileWorkRoot::create_in_parent(&temporary, &temporary) {
             Ok(root) => {
                 root.cleanup().expect("clean unexpected work root");
-                panic!("OS temporary output root must be rejected")
+                panic!("a work parent equal to the output root must be rejected")
             }
             Err(error) => error,
         };
@@ -3169,6 +3972,7 @@ mod tests {
                 .to_string()
                 .contains("must be outside the output directory")
         );
+        assert!(super::CompileWorkRoot::is_output_boundary_error(&error));
         let after = std::fs::read_dir(&temporary)
             .unwrap()
             .filter_map(Result::ok)

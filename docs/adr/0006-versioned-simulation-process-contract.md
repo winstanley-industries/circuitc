@@ -90,6 +90,17 @@ publication transactions provide all-or-rollback failure atomicity for their
 emitted paths; they do not claim snapshot isolation for concurrent readers.
 Readers consume a bundle only after the command reports successful publication.
 
+Checked execution creates its private compiler work root outside the output in
+the same validated namespace. For an existing output, the work root is a random
+descriptor-created sibling in the output's immediate parent. For a missing
+output, it is a sibling of the first missing component in the deepest existing
+validated ancestor. The sibling parent is retained from the output walk and is
+validated as a mutable transaction parent; it is not reconstructed through an
+OS temporary path. Post-creation lexical and device/inode checks reject direct
+aliases and races. This placement requires sibling-creation permission even
+when an existing output directory itself is writable, and `/` is not a valid
+output because it has no outside sibling.
+
 Ohmnivore remains behind a process boundary. Bazel owns the exact source
 revision `c2189a651d4879211019e109b2136dee836a5c5d`, builds the executable, and
 passes it to the CircuitC adapter through runfiles. The initial adapter accepts
