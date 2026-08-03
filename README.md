@@ -90,6 +90,22 @@ it, parses the vendored symbol and footprint in an isolated KiCad configuration,
 and accepts only normalized structured ERC/DRC reports with zero unexpected,
 unconnected, or schematic-parity findings.
 
+When ngspice 45.2 is installed, run the explicit differential host gate with:
+
+```sh
+bazel test //:ngspice45_differential_test \
+  --nocache_test_results \
+  --test_output=errors
+```
+
+The `local`/`manual` gate discovers `ngspice` on `PATH` and at the standard
+Homebrew locations. For another installation, pass an absolute executable with
+`--test_env=CIRCUITC_NGSPICE=/path/to/ngspice`. A missing executable or any
+version other than exactly 45.2 fails as unavailable; it is never reported as
+passing. The gate recompiles the checked fixture through the real Ohmnivore CPU
+path twice, compares every declared DC, linear-AC, and transient voltage sample
+within the ADR-0006 tolerance, and requires byte-identical normalized evidence.
+
 ## Current boundary
 
 Implemented now:
@@ -108,13 +124,16 @@ Implemented now:
   source identity-map output;
 - a small vendored KiCad symbol/footprint catalog resolved during elaboration;
 - isolated KiCad 10 symbol/footprint parsing, ERC, DRC, connectivity, and
-  schematic-parity validation; and
+  schematic-parity validation;
 - SPICE output plus a reversible backend-name map suitable for the supported
-  Ohmnivore subset.
+  Ohmnivore subset;
+- Bazel-owned, provenance-authenticated Ohmnivore CPU execution with bounded
+  deterministic normalized results; and
+- checked numerical assertions, transactional evidence publication, and an
+  explicit ngspice 45.2 differential host gate.
 
 Not implemented yet:
 
-- direct Ohmnivore execution;
 - APGAR Board IR lowering and route import; or
 - broad component-library, multi-sheet, and production ERC/DRC rule coverage.
 
