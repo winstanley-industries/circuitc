@@ -89,6 +89,10 @@ relative paths, not a directory scan, identify the current artifact set. The
 publication transactions provide all-or-rollback failure atomicity for their
 emitted paths; they do not claim snapshot isolation for concurrent readers.
 Readers consume a bundle only after the command reports successful publication.
+Transaction cleanup retains the descriptor that established each staged or
+backup file identity until that file is removed or restored, so an unlinked
+inode cannot be recycled for a racing replacement and then pass the recorded
+device/inode comparison.
 
 Checked execution creates its private compiler work root outside the output in
 the same validated namespace. For an existing output, the work root is a random

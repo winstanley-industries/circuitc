@@ -980,6 +980,18 @@ mod anchored_output {
         had_existing_target: bool,
     }
 
+    struct RetainedStagedFile {
+        index: usize,
+        identity: Option<(u64, u64)>,
+        descriptor: File,
+    }
+
+    struct RetainedBackup {
+        index: usize,
+        identity: (u64, u64),
+        _descriptor: File,
+    }
+
     struct WriteHooks<F, P, S, G, H, D> {
         pre_anchor: F,
         before_rename_probe: P,
@@ -1924,11 +1936,17 @@ mod anchored_output {
 
         let mut temporary_files = Vec::new();
         for (index, entry) in entries.iter().enumerate() {
-            let mut file = match entry.parent.create_file(&entry.temporary) {
+            match entry.parent.create_file(&entry.temporary) {
                 Ok(file) => {
-                    // Register cleanup ownership before any later fallible inspection.
-                    temporary_files.push((index, None));
-                    file
+                    // Register cleanup ownership and retain the descriptor
+                    // before any later fallible inspection. Keeping the
+                    // descriptor live also prevents a removed inode from
+                    // being recycled for a racing pathname replacement.
+                    temporary_files.push(RetainedStagedFile {
+                        index,
+                        identity: None,
+                        descriptor: file,
+                    });
                 }
                 Err(error) => {
                     return Err(with_cleanup_error(
@@ -1943,8 +1961,8 @@ mod anchored_output {
                         ),
                     ));
                 }
-            };
-            let metadata = match file.metadata() {
+            }
+            let metadata = match temporary_files[index].descriptor.metadata() {
                 Ok(metadata) => metadata,
                 Err(error) => {
                     return Err(with_cleanup_error(
@@ -1960,8 +1978,8 @@ mod anchored_output {
                     ));
                 }
             };
-            temporary_files[index].1 = Some((metadata.dev(), metadata.ino()));
-            if let Err(error) = file.write_all(entry.contents) {
+            temporary_files[index].identity = Some((metadata.dev(), metadata.ino()));
+            if let Err(error) = temporary_files[index].descriptor.write_all(entry.contents) {
                 return Err(with_cleanup_error(
                     operation_error("write temporary output for", &entry.display_path, error),
                     rollback(
@@ -1974,7 +1992,7 @@ mod anchored_output {
                     ),
                 ));
             }
-            if let Err(error) = sync_staging(index, &file) {
+            if let Err(error) = sync_staging(index, &temporary_files[index].descriptor) {
                 return Err(with_cleanup_error(
                     operation_error("sync temporary output for", &entry.display_path, error),
                     rollback(
@@ -1992,7 +2010,7 @@ mod anchored_output {
         let mut backed_up = Vec::new();
         for (index, entry) in entries.iter().enumerate() {
             if entry.had_existing_target {
-                let expected_identity = match required_regular_file_identity(
+                let (retained_descriptor, expected_identity) = match required_regular_file(
                     &entry.parent,
                     &entry.target,
                     &entry.display_path,
@@ -2032,10 +2050,15 @@ mod anchored_output {
                         ),
                     ));
                 }
-                // The expected identity was captured through the target's open
-                // descriptor. Register the moved backup before inspecting its
-                // new pathname so every post-rename failure can roll it back.
-                backed_up.push((index, expected_identity));
+                // Retain the descriptor that authenticated the expected
+                // identity. Besides registering the moved backup before any
+                // fallible pathname inspection, the live descriptor prevents
+                // its inode from being recycled for a racing replacement.
+                backed_up.push(RetainedBackup {
+                    index,
+                    identity: expected_identity,
+                    _descriptor: retained_descriptor,
+                });
                 let actual_identity = match required_regular_file_identity(
                     &entry.parent,
                     &entry.backup,
@@ -2114,7 +2137,7 @@ mod anchored_output {
             published.push((
                 index,
                 temporary_files[index]
-                    .1
+                    .identity
                     .expect("published temporary output has a recorded identity"),
             ));
         }
@@ -2466,11 +2489,11 @@ mod anchored_output {
         }
     }
 
-    fn required_regular_file_identity(
+    fn required_regular_file(
         parent: &Directory,
         name: &CStr,
         display_path: &str,
-    ) -> io::Result<(u64, u64)> {
+    ) -> io::Result<(File, (u64, u64))> {
         let opened = match parent.open_entry(name) {
             Err(error) if error.raw_os_error() == Some(EACCES) => {
                 parent.open_entry_write_only(name)
@@ -2494,7 +2517,16 @@ mod anchored_output {
                 "transaction-owned path for {display_path} is not a regular file"
             )));
         }
-        Ok((metadata.dev(), metadata.ino()))
+        let identity = (metadata.dev(), metadata.ino());
+        Ok((file, identity))
+    }
+
+    fn required_regular_file_identity(
+        parent: &Directory,
+        name: &CStr,
+        display_path: &str,
+    ) -> io::Result<(u64, u64)> {
+        required_regular_file(parent, name, display_path).map(|(_, identity)| identity)
     }
 
     fn remove_verified_probe(
@@ -2850,8 +2882,8 @@ mod anchored_output {
 
     fn rollback(
         entries: &[OutputEntry<'_>],
-        temporary_files: &[(usize, Option<(u64, u64)>)],
-        backed_up: &[(usize, (u64, u64))],
+        temporary_files: &[RetainedStagedFile],
+        backed_up: &[RetainedBackup],
         published: &[(usize, (u64, u64))],
         quarantine: &PrivateQuarantine,
         created_directories: &[CreatedDirectory],
@@ -2873,8 +2905,8 @@ mod anchored_output {
                 ),
             );
         }
-        for (index, expected_identity) in backed_up.iter().rev() {
-            let entry = &entries[*index];
+        for backup in backed_up.iter().rev() {
+            let entry = &entries[backup.index];
             record_cleanup_error(
                 &mut errors,
                 &format!("restore original output {}", entry.display_path),
@@ -2884,26 +2916,26 @@ mod anchored_output {
                     quarantine,
                     &entry.backup_claim,
                     &entry.target,
-                    *expected_identity,
+                    backup.identity,
                     &entry.display_path,
                 ),
             );
         }
-        for (index, expected_identity) in temporary_files {
+        for temporary in temporary_files {
             if published
                 .iter()
-                .any(|(published_index, _)| published_index == index)
+                .any(|(published_index, _)| *published_index == temporary.index)
             {
                 continue;
             }
-            let entry = &entries[*index];
-            let cleanup = match expected_identity {
+            let entry = &entries[temporary.index];
+            let cleanup = match temporary.identity {
                 Some(expected_identity) => remove_owned_file(
                     &entry.parent,
                     &entry.temporary,
                     quarantine,
                     &entry.temporary_claim,
-                    *expected_identity,
+                    expected_identity,
                     &entry.display_path,
                     true,
                 ),
@@ -2936,12 +2968,12 @@ mod anchored_output {
 
     fn cleanup_backups(
         entries: &[OutputEntry<'_>],
-        backed_up: &[(usize, (u64, u64))],
+        backed_up: &[RetainedBackup],
         quarantine: &PrivateQuarantine,
     ) -> io::Result<()> {
         let mut errors = Vec::new();
-        for (index, expected_identity) in backed_up {
-            let entry = &entries[*index];
+        for backup in backed_up {
+            let entry = &entries[backup.index];
             record_cleanup_error(
                 &mut errors,
                 &format!("remove backup for {}", entry.display_path),
@@ -2950,7 +2982,7 @@ mod anchored_output {
                     &entry.backup,
                     quarantine,
                     &entry.backup_claim,
-                    *expected_identity,
+                    backup.identity,
                     &entry.display_path,
                     false,
                 ),
@@ -5157,8 +5189,11 @@ mod tests {
         let error =
             super::anchored_output::write_outputs_before_publish_hook(&output, &outputs, |index| {
                 if index == 1 {
-                    fs::remove_file(output.join("first.txt"))?;
-                    fs::write(output.join("first.txt"), b"racing writer")?;
+                    require_matching_open_descriptor(&output.join("first.txt"))?;
+                    replace_file_with_inode_reuse_pressure(
+                        &output.join("first.txt"),
+                        b"racing writer",
+                    )?;
                     Err(io::Error::other(
                         "injected failure after racing replacement",
                     ))
@@ -5213,8 +5248,11 @@ mod tests {
         let error =
             super::anchored_output::write_outputs_before_publish_hook(&output, &outputs, |index| {
                 if index == 1 {
-                    fs::remove_file(output.join("first.txt"))?;
-                    fs::write(output.join("first.txt"), b"racing writer")?;
+                    require_matching_open_descriptor(&output.join("first.txt"))?;
+                    replace_file_with_inode_reuse_pressure(
+                        &output.join("first.txt"),
+                        b"racing writer",
+                    )?;
                     Err(io::Error::other(
                         "injected failure after racing replacement",
                     ))
@@ -5265,8 +5303,8 @@ mod tests {
         let error =
             super::anchored_output::write_outputs_before_publish_hook(&output, &outputs, |index| {
                 if index == 0 {
-                    fs::remove_file(&temporary)?;
-                    fs::write(&temporary, b"racing temporary writer")?;
+                    require_matching_open_descriptor(&temporary)?;
+                    replace_file_with_inode_reuse_pressure(&temporary, b"racing temporary writer")?;
                     Err(io::Error::other(
                         "injected failure after temporary replacement",
                     ))
@@ -5311,8 +5349,8 @@ mod tests {
 
         let outcome =
             super::anchored_output::write_outputs_after_publication_hook(&output, &outputs, || {
-                fs::remove_file(&backup)?;
-                fs::write(&backup, b"racing backup writer")
+                require_matching_open_descriptor(&backup)?;
+                replace_file_with_inode_reuse_pressure(&backup, b"racing backup writer")
             })
             .expect("published outputs remain successful when cleanup preserves a changed backup");
 
@@ -5403,5 +5441,83 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir(&path).expect("create unique test scratch directory");
         path
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+    ))]
+    fn replace_file_with_inode_reuse_pressure(
+        path: &std::path::Path,
+        contents: &[u8],
+    ) -> std::io::Result<()> {
+        #[cfg(target_os = "linux")]
+        use std::os::unix::fs::MetadataExt as _;
+
+        #[cfg(target_os = "linux")]
+        let original_identity = {
+            let original = std::fs::metadata(path)?;
+            (original.dev(), original.ino())
+        };
+        std::fs::remove_file(path)?;
+
+        #[cfg(target_os = "linux")]
+        for attempt in 0..256 {
+            std::fs::write(path, contents)?;
+            let replacement = std::fs::metadata(path)?;
+            if (replacement.dev(), replacement.ino()) == original_identity || attempt == 255 {
+                return Ok(());
+            }
+            std::fs::remove_file(path)?;
+        }
+
+        #[cfg(target_os = "macos")]
+        return std::fs::write(path, contents);
+
+        #[cfg(target_os = "linux")]
+        unreachable!("bounded inode-reuse pressure loop always leaves a replacement")
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+    ))]
+    fn require_matching_open_descriptor(path: &std::path::Path) -> std::io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let expected = std::fs::metadata(path)?;
+            let expected_identity = (expected.dev(), expected.ino());
+            let retained = std::fs::read_dir("/proc/self/fd")?.any(|entry| {
+                entry
+                    .ok()
+                    .and_then(|entry| std::fs::metadata(entry.path()).ok())
+                    .is_some_and(|metadata| (metadata.dev(), metadata.ino()) == expected_identity)
+            });
+            if !retained {
+                return Err(std::io::Error::other(format!(
+                    "transaction identity for {} has no retained descriptor",
+                    path.display()
+                )));
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        let _ = path;
+
+        Ok(())
     }
 }

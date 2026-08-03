@@ -273,7 +273,10 @@ contain permissive or unrecognized entries; mutable parents and the quarantine
 must have no extended ACL. Rollback first moves
 each claimed file into a random caller-owned `0700` transaction directory held
 open by descriptor, verifies its recorded device and inode there, and only then
-removes or restores it. Every emitted parent must support atomic no-replace
+removes or restores it. The descriptor that established each staged or backup
+file's recorded identity remains open through disposition, preventing an
+unlinked inode from being recycled for a racing replacement that would
+otherwise compare equal. Every emitted parent must support atomic no-replace
 renames to and from that transaction directory. CircuitC checks the device and
 performs a reversible rename probe for each pinned parent before staging, so
 nested cross-device and same-device bind-mount boundaries fail before generated
