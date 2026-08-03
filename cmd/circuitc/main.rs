@@ -744,6 +744,8 @@ mod anchored_output {
     #[cfg(target_os = "macos")]
     const ACL_FIRST_ENTRY: c_int = 0;
     #[cfg(target_os = "macos")]
+    const ACL_NEXT_ENTRY: c_int = -1;
+    #[cfg(target_os = "macos")]
     type Mode = u16;
 
     #[derive(Debug)]
@@ -810,6 +812,7 @@ mod anchored_output {
         ) -> c_int;
         fn acl_get_fd_np(descriptor: c_int, acl_type: c_int) -> *mut c_void;
         fn acl_get_entry(acl: *mut c_void, entry_id: c_int, entry: *mut *mut c_void) -> c_int;
+        fn acl_get_tag_type(entry: *mut c_void, tag_type: *mut c_int) -> c_int;
         fn acl_free(object: *mut c_void) -> c_int;
     }
 
@@ -977,7 +980,10 @@ mod anchored_output {
         sync_directory: D,
     }
 
-    fn validate_transaction_parent(directory: &Directory, display_path: &str) -> io::Result<()> {
+    fn validate_directory_owner_and_mode(
+        directory: &Directory,
+        display_path: &str,
+    ) -> io::Result<()> {
         let metadata = directory.0.metadata().map_err(|error| {
             operation_error("inspect mutable output directory", display_path, error)
         })?;
@@ -998,7 +1004,18 @@ mod anchored_output {
                 ),
             ));
         }
+        Ok(())
+    }
+
+    fn validate_transaction_parent(directory: &Directory, display_path: &str) -> io::Result<()> {
+        validate_directory_owner_and_mode(directory, display_path)?;
         reject_extended_acl(directory, display_path)?;
+        Ok(())
+    }
+
+    fn validate_namespace_ancestor(directory: &Directory, display_path: &str) -> io::Result<()> {
+        validate_directory_owner_and_mode(directory, display_path)?;
+        reject_permissive_extended_acl(directory, display_path)?;
         Ok(())
     }
 
@@ -1010,8 +1027,30 @@ mod anchored_output {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    fn reject_permissive_extended_acl(
+        _directory: &Directory,
+        _display_path: &str,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
     #[cfg(target_os = "macos")]
     fn reject_extended_acl(directory: &Directory, display_path: &str) -> io::Result<()> {
+        validate_darwin_extended_acl(directory, display_path, false)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn reject_permissive_extended_acl(directory: &Directory, display_path: &str) -> io::Result<()> {
+        validate_darwin_extended_acl(directory, display_path, true)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn validate_darwin_extended_acl(
+        directory: &Directory,
+        display_path: &str,
+        allow_deny_only: bool,
+    ) -> io::Result<()> {
         // SAFETY: the descriptor is live and ACL_TYPE_EXTENDED is the Darwin
         // ACL type for the object referenced by that descriptor.
         let acl = unsafe { acl_get_fd_np(directory.0.as_raw_fd(), ACL_TYPE_EXTENDED) };
@@ -1027,10 +1066,39 @@ mod anchored_output {
             ));
         }
         let mut entry = std::ptr::null_mut();
-        // SAFETY: `acl` is live and `entry` points to writable storage for the
-        // borrowed entry pointer.
-        let entry_status = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) };
-        let entry_error = (entry_status < 0).then(io::Error::last_os_error);
+        let mut entry_id = ACL_FIRST_ENTRY;
+        let mut rejected_entry = false;
+        let mut entry_error = None;
+        loop {
+            // SAFETY: `acl` is live and `entry` points to writable storage for
+            // the borrowed entry pointer.
+            let entry_status = unsafe { acl_get_entry(acl, entry_id, &mut entry) };
+            if entry_status < 0 {
+                let error = io::Error::last_os_error();
+                if entry_id == ACL_NEXT_ENTRY && error.raw_os_error() == Some(EINVAL) {
+                    break;
+                }
+                entry_error = Some(error);
+                break;
+            }
+            if !allow_deny_only {
+                rejected_entry = true;
+                break;
+            }
+            let mut tag_type = 0;
+            // SAFETY: `entry` is the live borrowed entry returned above and
+            // `tag_type` points to writable storage.
+            if unsafe { acl_get_tag_type(entry, &mut tag_type) } != 0 {
+                entry_error = Some(io::Error::last_os_error());
+                break;
+            }
+            const ACL_EXTENDED_DENY: c_int = 2;
+            if tag_type != ACL_EXTENDED_DENY {
+                rejected_entry = true;
+                break;
+            }
+            entry_id = ACL_NEXT_ENTRY;
+        }
         // SAFETY: `acl` was returned by `acl_get_fd_np` and is released once.
         let free_status = unsafe { acl_free(acl) };
         if let Some(error) = entry_error {
@@ -1047,13 +1115,17 @@ mod anchored_output {
                 io::Error::last_os_error(),
             ));
         }
-        if entry_status == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
+        if rejected_entry {
+            let message = if allow_deny_only {
+                format!(
+                    "output namespace ancestor {display_path} has a permissive or unrecognized extended ACL"
+                )
+            } else {
                 format!(
                     "mutable output directory {display_path} has an extended ACL and cannot provide isolated transaction cleanup"
-                ),
-            ));
+                )
+            };
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, message));
         }
         Ok(())
     }
@@ -1587,9 +1659,14 @@ mod anchored_output {
         };
         let mut current = Directory::open_path(anchor)?;
         let mut created = Vec::new();
-        for component in output_directory.components() {
+        validate_namespace_ancestor(&current, &anchor.display().to_string())?;
+        let mut components = output_directory
+            .components()
+            .filter(|component| !matches!(component, Component::RootDir | Component::CurDir))
+            .peekable();
+        while let Some(component) = components.next() {
+            let is_final = components.peek().is_none();
             let segment = match component {
-                Component::RootDir | Component::CurDir => continue,
                 Component::ParentDir => OsStr::new(".."),
                 Component::Normal(segment) => segment,
                 Component::Prefix(_) => {
@@ -1598,10 +1675,22 @@ mod anchored_output {
                         "output directory contains an unsupported path prefix",
                     ));
                 }
+                Component::RootDir | Component::CurDir => unreachable!("components were filtered"),
             };
             let name = c_name(segment)?;
             match current.open_child(&name) {
-                Ok(child) => current = child,
+                Ok(child) => {
+                    if !is_final
+                        && let Err(error) =
+                            validate_namespace_ancestor(&child, &segment.to_string_lossy())
+                    {
+                        return Err(with_cleanup_error(
+                            error,
+                            remove_created_directories(&created),
+                        ));
+                    }
+                    current = child;
+                }
                 Err(error)
                     if error.kind() == io::ErrorKind::NotFound
                         && !matches!(component, Component::ParentDir) =>
@@ -1759,7 +1848,9 @@ mod anchored_output {
         created: &mut Vec<CreatedDirectory>,
     ) -> io::Result<Directory> {
         let mut current = root.try_clone()?;
-        for component in relative.components() {
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
+            let is_final = components.peek().is_none();
             let Component::Normal(segment) = component else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -1768,7 +1859,12 @@ mod anchored_output {
             };
             let name = c_name(segment)?;
             match current.open_child(&name) {
-                Ok(child) => current = child,
+                Ok(child) => {
+                    if !is_final {
+                        validate_namespace_ancestor(&child, &segment.to_string_lossy())?;
+                    }
+                    current = child;
+                }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     validate_transaction_parent(
                         &current,
@@ -3452,6 +3548,86 @@ mod tests {
         ),
     ))]
     #[test]
+    fn publication_rejects_an_unsafe_existing_output_ancestor() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = scratch_directory("unsafe-output-ancestor");
+        let unsafe_ancestor = scratch.join("unsafe");
+        let output = unsafe_ancestor.join("output");
+        fs::create_dir(&unsafe_ancestor).expect("create output ancestor");
+        fs::create_dir(&output).expect("create output directory");
+        fs::set_permissions(&unsafe_ancestor, fs::Permissions::from_mode(0o777))
+            .expect("make output ancestor shared writable");
+        let outputs = [("result.txt".to_owned(), b"generated".as_slice())];
+
+        let error = super::write_outputs(&output, &outputs)
+            .expect_err("an unsafe existing output ancestor must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("writable by other users without the sticky bit"),
+            "unexpected unsafe-ancestor error: {error}"
+        );
+        assert!(!output.join("result.txt").exists());
+        fs::set_permissions(&unsafe_ancestor, fs::Permissions::from_mode(0o700))
+            .expect("restore ancestor permissions for cleanup");
+        fs::remove_dir_all(&scratch).expect("remove test scratch directory");
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+    ))]
+    #[test]
+    fn publication_rejects_an_unsafe_existing_generated_parent_ancestor() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = scratch_directory("unsafe-generated-parent-ancestor");
+        let output = scratch.join("output");
+        let unsafe_ancestor = output.join("unsafe");
+        fs::create_dir(&output).expect("create output directory");
+        fs::create_dir(&unsafe_ancestor).expect("create generated-parent ancestor");
+        fs::create_dir(unsafe_ancestor.join("nested")).expect("create generated parent");
+        fs::set_permissions(&unsafe_ancestor, fs::Permissions::from_mode(0o777))
+            .expect("make generated-parent ancestor shared writable");
+        let outputs = [(
+            "unsafe/nested/result.txt".to_owned(),
+            b"generated".as_slice(),
+        )];
+
+        let error = super::write_outputs(&output, &outputs)
+            .expect_err("an unsafe generated-parent ancestor must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("writable by other users without the sticky bit"),
+            "unexpected unsafe-ancestor error: {error}"
+        );
+        assert!(!unsafe_ancestor.join("nested/result.txt").exists());
+        fs::set_permissions(&unsafe_ancestor, fs::Permissions::from_mode(0o700))
+            .expect("restore ancestor permissions for cleanup");
+        fs::remove_dir_all(&scratch).expect("remove test scratch directory");
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+    ))]
+    #[test]
     fn publication_allows_a_sticky_shared_writable_parent() {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
@@ -3510,6 +3686,85 @@ mod tests {
             .status()
             .expect("remove Darwin ACL");
         assert!(status.success(), "remove inherited everyone ACL");
+        fs::remove_dir_all(&scratch).expect("remove test scratch directory");
+    }
+
+    #[cfg(all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ))]
+    #[test]
+    fn publication_rejects_a_permissive_acl_on_an_existing_output_ancestor() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let scratch = scratch_directory("extended-acl-output-ancestor");
+        let ancestor = scratch.join("ancestor");
+        let output = ancestor.join("output");
+        fs::create_dir(&ancestor).expect("create output ancestor");
+        fs::create_dir(&output).expect("create output directory");
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o700))
+            .expect("make output ancestor mode-private");
+        let status = Command::new("/bin/chmod")
+            .arg("+a")
+            .arg("everyone allow add_file,add_subdirectory,delete_child")
+            .arg(&ancestor)
+            .status()
+            .expect("invoke Darwin ACL editor");
+        assert!(status.success(), "install permissive ancestor ACL");
+        let outputs = [("result.txt".to_owned(), b"generated".as_slice())];
+
+        let error = super::write_outputs(&output, &outputs)
+            .expect_err("a permissive ancestor ACL must fail the namespace check");
+        assert!(
+            error
+                .to_string()
+                .contains("has a permissive or unrecognized extended ACL"),
+            "unexpected ancestor ACL error: {error}"
+        );
+        assert!(!output.join("result.txt").exists());
+        let status = Command::new("/bin/chmod")
+            .arg("-N")
+            .arg(&ancestor)
+            .status()
+            .expect("remove Darwin ACL");
+        assert!(status.success(), "remove permissive ancestor ACL");
+        fs::remove_dir_all(&scratch).expect("remove test scratch directory");
+    }
+
+    #[cfg(all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ))]
+    #[test]
+    fn publication_allows_a_deny_only_acl_on_an_existing_output_ancestor() {
+        use std::fs;
+        use std::process::Command;
+
+        let scratch = scratch_directory("deny-only-acl-output-ancestor");
+        let ancestor = scratch.join("ancestor");
+        let output = ancestor.join("output");
+        fs::create_dir(&ancestor).expect("create output ancestor");
+        fs::create_dir(&output).expect("create output directory");
+        let status = Command::new("/bin/chmod")
+            .arg("+a")
+            .arg("everyone deny delete")
+            .arg(&ancestor)
+            .status()
+            .expect("invoke Darwin ACL editor");
+        assert!(status.success(), "install deny-only ancestor ACL");
+        let outputs = [("result.txt".to_owned(), b"generated".as_slice())];
+
+        super::write_outputs(&output, &outputs)
+            .expect("a deny-only ancestor ACL must preserve namespace isolation");
+        assert_eq!(fs::read(output.join("result.txt")).unwrap(), b"generated");
+        let status = Command::new("/bin/chmod")
+            .arg("-N")
+            .arg(&ancestor)
+            .status()
+            .expect("remove Darwin ACL");
+        assert!(status.success(), "remove deny-only ancestor ACL");
         fs::remove_dir_all(&scratch).expect("remove test scratch directory");
     }
 

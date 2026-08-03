@@ -255,16 +255,18 @@ Every generated artifact name must be a safe relative path. The output root
 and each generated parent are pinned with no-follow directory handles; staging,
 backup, publication, rollback, and cleanup are descriptor-relative and use
 no-replace renames. CircuitC creates missing output parents with mode `0700`.
-Mutable parents must be caller- or root-owned; a parent that is group- or
-other-writable must also have the sticky bit. Rollback first moves
+Every existing output-path ancestor and mutable parent must be caller- or
+root-owned; one that is group- or other-writable must also have the sticky bit.
+On macOS, namespace ancestors may contain deny-only ACL entries but must not
+contain permissive or unrecognized entries; mutable parents and the quarantine
+must have no extended ACL. Rollback first moves
 each claimed file into a random caller-owned `0700` transaction directory held
 open by descriptor, verifies its recorded device and inode there, and only then
 removes or restores it. Every emitted parent must support atomic no-replace
 renames to and from that transaction directory. CircuitC checks the device and
 performs a reversible rename probe for each pinned parent before staging, so
 nested cross-device and same-device bind-mount boundaries fail before generated
-files are staged. On macOS, every mutable parent and the quarantine must also
-have no extended ACL.
+files are staged.
 
 These namespace protections prevent a process running under a different
 effective user ID from replacing a claimed name between identity validation and
