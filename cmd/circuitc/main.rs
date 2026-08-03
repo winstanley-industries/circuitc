@@ -655,6 +655,7 @@ fn validate_relative_output_path(filename: &str) -> io::Result<&Path> {
     ),
 ))]
 mod anchored_output {
+    use std::cell::RefCell;
     use std::collections::BTreeSet;
     use std::env;
     #[cfg(target_os = "macos")]
@@ -963,6 +964,7 @@ mod anchored_output {
         name: CString,
         directory: Directory,
         identity: (u64, u64),
+        cleanup_descriptor_reserve: RefCell<Vec<File>>,
     }
 
     struct OutputEntry<'a> {
@@ -1712,6 +1714,7 @@ mod anchored_output {
                         name,
                         directory,
                         identity,
+                        cleanup_descriptor_reserve: RefCell::new(Vec::new()),
                     });
                 }
                 Ok(false) => continue,
@@ -1722,6 +1725,18 @@ mod anchored_output {
             io::ErrorKind::AlreadyExists,
             "could not allocate a unique private transaction quarantine",
         ))
+    }
+
+    fn acquire_cleanup_descriptor_reserve() -> io::Result<Vec<File>> {
+        const RESERVED_DESCRIPTORS: usize = 4;
+
+        (0..RESERVED_DESCRIPTORS)
+            .map(|_| File::open("/dev/null"))
+            .collect()
+    }
+
+    fn release_cleanup_descriptor_reserve(quarantine: &PrivateQuarantine) {
+        quarantine.cleanup_descriptor_reserve.borrow_mut().clear();
     }
 
     pub(super) fn write_outputs(
@@ -1815,6 +1830,25 @@ mod anchored_output {
                 ));
             }
         };
+        let cleanup_descriptor_reserve = match acquire_cleanup_descriptor_reserve() {
+            Ok(reserve) => reserve,
+            Err(error) => {
+                // The quarantine retains its own parent and directory
+                // descriptors. Release the redundant root descriptor so its
+                // cleanup can still authenticate the renamed directory when
+                // reserve acquisition itself reaches the descriptor limit.
+                drop(root);
+                return Err(with_cleanup_error(
+                    operation_error(
+                        "reserve descriptor capacity for transaction cleanup in",
+                        &output_directory.display().to_string(),
+                        error,
+                    ),
+                    rollback(&[], &[], &[], &[], &quarantine, &created_directories),
+                ));
+            }
+        };
+        *quarantine.cleanup_descriptor_reserve.borrow_mut() = cleanup_descriptor_reserve;
 
         let entries_result = relative_paths
             .iter()
@@ -2141,6 +2175,7 @@ mod anchored_output {
                     .expect("published temporary output has a recorded identity"),
             ));
         }
+        release_cleanup_descriptor_reserve(&quarantine);
         let hook_result = after_publication_hook();
         let cleanup_result = cleanup_backups(&entries, &backed_up, &quarantine);
         let quarantine_cleanup_result = remove_private_quarantine(&quarantine);
@@ -2847,13 +2882,84 @@ mod anchored_output {
     }
 
     fn remove_private_quarantine(quarantine: &PrivateQuarantine) -> io::Result<()> {
-        let cleanup = CreatedDirectory {
-            parent: quarantine.parent.try_clone()?,
-            name: quarantine.name.clone(),
-            cleanup: created_directory_cleanup_name(OsStr::from_bytes(quarantine.name.to_bytes()))?,
-            identity: Some(quarantine.identity),
-        };
-        remove_owned_directory(&cleanup)
+        let cleanup =
+            created_directory_cleanup_name(OsStr::from_bytes(quarantine.name.to_bytes()))?;
+        match rename_noreplace_with_context(
+            &quarantine.parent,
+            &quarantine.name,
+            &quarantine.parent,
+            &cleanup,
+            "claim private transaction quarantine for cleanup of",
+            &quarantine.name.to_string_lossy(),
+        ) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        }
+
+        let actual_identity = quarantine
+            .parent
+            .open_child(&cleanup)
+            .and_then(|directory| directory.identity());
+        match actual_identity {
+            Ok(identity) if identity == quarantine.identity => {
+                match quarantine.parent.remove_directory(&cleanup) {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        let restore = rename_noreplace_with_context(
+                            &quarantine.parent,
+                            &cleanup,
+                            &quarantine.parent,
+                            &quarantine.name,
+                            "restore nonempty private transaction quarantine after failed cleanup of",
+                            &quarantine.name.to_string_lossy(),
+                        );
+                        match restore {
+                            Ok(()) => Err(io::Error::new(
+                                error.kind(),
+                                format!(
+                                    "failed to remove private transaction quarantine {}: {error}; restored it at its original name",
+                                    quarantine.name.to_string_lossy()
+                                ),
+                            )),
+                            Err(restore_error) => Err(io::Error::new(
+                                error.kind(),
+                                format!(
+                                    "failed to remove private transaction quarantine {}: {error}; recovery directory remains at {} because its original name could not be restored: {restore_error}",
+                                    quarantine.name.to_string_lossy(),
+                                    cleanup.to_string_lossy()
+                                ),
+                            )),
+                        }
+                    }
+                }
+            }
+            Ok(_) => {
+                let error = io::Error::other(
+                    "private transaction quarantine changed before cleanup; refusing to remove it",
+                );
+                let restore = rename_noreplace_with_context(
+                    &quarantine.parent,
+                    &cleanup,
+                    &quarantine.parent,
+                    &quarantine.name,
+                    "restore changed private transaction quarantine cleanup claim for",
+                    &quarantine.name.to_string_lossy(),
+                );
+                Err(with_cleanup_error(error, restore))
+            }
+            Err(error) => {
+                let restore = rename_noreplace_with_context(
+                    &quarantine.parent,
+                    &cleanup,
+                    &quarantine.parent,
+                    &quarantine.name,
+                    "restore unverified private transaction quarantine cleanup claim for",
+                    &quarantine.name.to_string_lossy(),
+                );
+                Err(with_cleanup_error(error, restore))
+            }
+        }
     }
 
     fn preserve_unidentified_file(
@@ -2888,6 +2994,7 @@ mod anchored_output {
         quarantine: &PrivateQuarantine,
         created_directories: &[CreatedDirectory],
     ) -> io::Result<()> {
+        release_cleanup_descriptor_reserve(quarantine);
         let mut errors = Vec::new();
         for (index, expected_identity) in published.iter().rev() {
             let entry = &entries[*index];
@@ -5159,6 +5266,125 @@ mod tests {
             ]
         );
         fs::remove_dir_all(&scratch).expect("remove test scratch directory");
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ))]
+    #[test]
+    fn descriptor_exhaustion_restores_every_original_without_residue() {
+        const CHILD: &str = "CIRCUITC_DESCRIPTOR_EXHAUSTION_CHILD";
+        const TEST_NAME: &str =
+            "tests::descriptor_exhaustion_restores_every_original_without_residue";
+
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST_NAME, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .expect("run descriptor-exhaustion child test");
+            assert!(
+                output.status.success(),
+                "descriptor-exhaustion child failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        use std::fs;
+
+        const OUTPUT_COUNT: usize = 8;
+        let scratch = scratch_directory("publication-fd-exhaustion");
+        let output = scratch.join("output");
+        fs::create_dir(&output).unwrap();
+        let originals: Vec<_> = (0..OUTPUT_COUNT)
+            .map(|index| {
+                (
+                    format!("result-{index:02}.txt"),
+                    format!("original-{index:02}").into_bytes(),
+                )
+            })
+            .collect();
+        let original_outputs: Vec<_> = originals
+            .iter()
+            .map(|(name, contents)| (name.clone(), contents.as_slice()))
+            .collect();
+        super::anchored_output::write_outputs(&output, &original_outputs)
+            .expect("publish original outputs before constraining descriptors");
+
+        let replacements: Vec<_> = (0..OUTPUT_COUNT)
+            .map(|index| {
+                (
+                    format!("result-{index:02}.txt"),
+                    format!("replacement-{index:02}").into_bytes(),
+                )
+            })
+            .collect();
+        let replacement_outputs: Vec<_> = replacements
+            .iter()
+            .map(|(name, contents)| (name.clone(), contents.as_slice()))
+            .collect();
+
+        let mut original_limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        // SAFETY: the pointer is valid for one `rlimit` result.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, original_limit.as_mut_ptr()) },
+            0
+        );
+        // SAFETY: `getrlimit` succeeded and initialized the value.
+        let original_limit = unsafe { original_limit.assume_init() };
+        let baseline = fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .count()
+            .saturating_sub(1);
+        let constrained_soft = (baseline + 7 + 2 * OUTPUT_COUNT + 2) as libc::rlim_t;
+        assert!(original_limit.rlim_max >= constrained_soft);
+        let constrained_limit = libc::rlimit {
+            rlim_cur: constrained_soft,
+            rlim_max: original_limit.rlim_max,
+        };
+        // SAFETY: the child process deliberately lowers only its own soft limit.
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &constrained_limit) },
+            0
+        );
+        let publication = super::anchored_output::write_outputs(&output, &replacement_outputs);
+        // SAFETY: restore the child process limit before inspecting evidence.
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &original_limit) },
+            0
+        );
+
+        let error = publication.expect_err("descriptor exhaustion must fail publication");
+        assert!(
+            error.to_string().contains("Too many open files"),
+            "unexpected descriptor-exhaustion diagnostic: {error}"
+        );
+        for (name, contents) in &originals {
+            assert_eq!(
+                fs::read(output.join(name)).unwrap(),
+                *contents,
+                "rollback must restore {name}"
+            );
+        }
+        let mut names: Vec<_> = fs::read_dir(&output)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        let mut expected: Vec<_> = originals
+            .iter()
+            .map(|(name, _)| std::ffi::OsString::from(name))
+            .collect();
+        expected.sort();
+        assert_eq!(
+            names, expected,
+            "rollback must leave no transaction residue"
+        );
+
+        fs::remove_dir_all(&scratch).unwrap();
     }
 
     #[cfg(any(

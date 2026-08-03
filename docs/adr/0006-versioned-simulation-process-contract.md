@@ -92,7 +92,10 @@ Readers consume a bundle only after the command reports successful publication.
 Transaction cleanup retains the descriptor that established each staged or
 backup file identity until that file is removed or restored, so an unlinked
 inode cannot be recycled for a racing replacement and then pass the recorded
-device/inode comparison.
+device/inode comparison. It reserves cleanup descriptor capacity before
+staging and releases that reserve before rollback or successful disposition;
+descriptor exhaustion must therefore either fail before staging or roll back
+without displacing originals or leaving transaction residue.
 
 Checked execution creates its private compiler work root outside the output in
 the same validated namespace. For an existing output, the work root is a random
