@@ -781,6 +781,7 @@ mod anchored_output {
 
     const O_RDONLY: c_int = 0;
     const O_WRONLY: c_int = 1;
+    #[cfg(target_os = "macos")]
     const ENOENT: c_int = 2;
     const EACCES: c_int = 13;
     const EISDIR: c_int = 21;
