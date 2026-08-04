@@ -186,10 +186,13 @@ APGAR remains a C++/CUDA Bazel library with a CAD-neutral, exact Board IR.
 CircuitC lowers placed physical connectivity and rules into a versioned APGAR
 request, then imports immutable route candidates or selected routes.
 
-The initial boundary should be a checksummed serialized request/result and a
-process-level integration test. An in-process C ABI or `cxx` bridge is only
-worth adding after the schema stabilizes. APGAR's exact validation and KiCad
-DRC both gate a route; neither is bypassed for convenience.
+The initial boundary is a checksummed serialized request/result and a
+process-level integration test. Bazel pins the exact APGAR source revision,
+builds the CPU adapter from APGAR's public Board IR, geometry compiler, CPU
+A-star, candidate-construction, and exact-admission APIs, and binds the adapter
+executable digest into every result. An in-process C ABI or `cxx` bridge is
+only worth adding after the schema stabilizes. APGAR's exact validation and
+KiCad DRC both gate a route; neither is bypassed for convenience.
 
 ## 7. Parts and libraries
 

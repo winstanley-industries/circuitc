@@ -4,6 +4,17 @@ module(
 
 bazel_dep(name = "rules_rust", version = "0.71.3")
 bazel_dep(name = "rules_shell", version = "0.7.1")
+bazel_dep(name = "rules_cc", version = "0.2.22")
+bazel_dep(name = "apgar", version = "0.0.0")
+git_override(
+    module_name = "apgar",
+    commit = "85a4f75b8c0c6142d319a8a743087f65ef9e9796",
+    patch_strip = 1,
+    patches = ["//bazel:apgar_cpu_consumer.patch"],
+    remote = "https://github.com/winstanley-industries/apgar.git",
+)
+
+bazel_dep(name = "nlohmann_json", version = "3.12.0.bcr.1")
 
 bazel_dep(name = "buildifier_prebuilt", version = "8.5.1.3", dev_dependency = True)
 bazel_dep(name = "ruff_prebuilt", version = "0.15.19.1", dev_dependency = True, repo_name = "ruff")

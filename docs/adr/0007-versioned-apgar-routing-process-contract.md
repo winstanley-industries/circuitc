@@ -40,6 +40,14 @@ vertical, or 45-degree centreline segments. Vias, arcs, multipin routing,
 multiple simultaneous routing profiles, other headings, and approximations of
 unsupported geometry or rules are rejected with machine-readable diagnostics.
 
+The request carries only that selected layer. Because the pinned APGAR M1
+Board IR validates a complete two-signal-layer stack, the process adapter
+deterministically materializes the unselected front-or-back companion layer.
+Its identity derives from the selected layer under a versioned domain, it is
+excluded from the allowed routing layers, and it participates in the APGAR
+board-content fingerprint. This adapter-owned stack context cannot authorize
+copper on the companion layer or widen the one-layer CircuitC capability.
+
 CircuitC lowers nanometres to APGAR database units with checked multiplication
 by two. Import performs the inverse check: every returned coordinate and width
 must be exactly divisible by two and must fit the Design IR envelope. No
@@ -52,6 +60,15 @@ checksums over exact bytes, request/result association, stable identities,
 toolchain provenance, deterministic failure states, and bounded parsing. They
 must not serialize APGAR implementation layouts. Identical canonical input to
 the pinned CPU implementation must produce byte-identical contract artifacts.
+
+Bazel pins the adapter to one immutable APGAR commit and checks that the build,
+Rust verifier, and C++ adapter declare the same source identity. The CPU-only
+consumer patch changes only APGAR module evaluation: it makes the unconditionally
+loaded Python rules a regular dependency and omits the unused CUDA GCC module
+extension that cannot be evaluated on the supported Darwin host. It does not
+change APGAR routing source, public APIs, candidate evidence, or exact
+admission. CUDA execution is outside this initial boundary and is not implied
+to be validated by the CPU adapter.
 
 A result remains untrusted routing evidence until CircuitC strictly parses it,
 authenticates it against the exact request and toolchain, verifies the selected
