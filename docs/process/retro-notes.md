@@ -1,5 +1,45 @@
 # Process retrospective notes
 
+## EPIC-0004 APGAR routing integration (2026-08-04)
+
+- The six-layer split was directionally correct: source intent, wire contracts,
+  import/projection, real adapter execution, checked compilation, and host
+  acceptance each had one reviewable authority. No feedback round required
+  moving a fix into another layer, so the mandatory split trigger did not fire.
+- PR #16 needed one correction round for checked coordinate arithmetic and
+  missing frontend diagnostic coverage. PR #17 needed four request-changes
+  verdicts to align request cardinality, bound untrusted resource expansion
+  before allocation, and make the regression discriminate the early guard.
+- PR #18 needed six request-changes verdicts around simulation-phase
+  preservation, exact layer equality, and one-to-one projection failure
+  coverage. Several reviews ran on unchanged heads; do not spend another
+  convergence run until a new candidate actually contains the promised fix.
+- PR #19 needed two correction rounds around process-exit diagnostic precedence
+  and real-adapter/process-failure coverage. PR #20 needed one automated round
+  plus adversarial follow-up for non-Unix compilation, accepted/provisional
+  terminology, post-execution identity checks, and checked routing/simulation
+  phase order.
+- PR #21 needed four request-changes verdicts before approval. The missing
+  ledger rows were reverse PCB-set membership, whitespace-independent KiCad
+  structure, unsupported copper forms, provenance rejection paths, canonical
+  projection order, exclusive no-follow output publication, and the temporal
+  binding between source bytes and the KiCad report.
+- Most rework concentrated at external trust boundaries rather than in the
+  source/IR slice. CI was largely confirmatory; the longer wall-clock waits were
+  exact-head APGAR builds and automated review, while mutation-oriented local
+  tests found the same classes quickly once the ledger named them.
+- A digest recorded after a host process is not evidence of the bytes that
+  process read. Host acceptance must snapshot privately, hash from one open
+  handle before execution, recheck identity and digest afterward, and carry
+  that pre-execution digest into normalization and the final join.
+- Exact evidence joins require reverse as well as forward coverage. For every
+  projected collection, enumerate the complete host structure independently,
+  reject unsupported sibling forms, and test canonical, alternate-encoding,
+  coordinated-extra, and stale-time mutations.
+- The durable workflow change is to add two explicit ledger questions for each
+  acceptance manifest: "what extra host structure is not projected?" and
+  "when were the exact accepted bytes observed by the external authority?"
+
 ## EPIC-0002 adversarial remediation (2026-08-01)
 
 - Exercise every accepted IR state through the public source language and the
