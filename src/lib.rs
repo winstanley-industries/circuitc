@@ -23,3 +23,13 @@ pub use compile::{
     KicadLibraryFile, KicadLibraryFileKind, RelativeArtifactPath, compile, compile_checked,
 };
 pub use spice::{SpiceComponentNameMapping, SpiceNameMap, SpiceNetNameMapping};
+
+#[doc(hidden)]
+pub fn verify_apgar_route_evidence(
+    request_json: &str,
+    result_json: &str,
+    provenance: &str,
+) -> Result<String, String> {
+    routing::evidence::verify(request_json, result_json, provenance)
+        .map_err(|error| error.to_string())
+}

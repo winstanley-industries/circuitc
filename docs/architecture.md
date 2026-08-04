@@ -192,7 +192,11 @@ builds the CPU adapter from APGAR's public Board IR, geometry compiler, CPU
 A-star, candidate-construction, and exact-admission APIs, and binds the adapter
 executable digest into every result. An in-process C ABI or `cxx` bridge is
 only worth adding after the schema stabilizes. APGAR's exact validation and
-KiCad DRC both gate a route; neither is bypassed for convenience.
+KiCad DRC both gate a route; neither is bypassed for convenience. A separate
+canonical acceptance manifest recomputes the exact request, result, projection,
+emitted-board, and normalized KiCad ERC/DRC digest joins after the supported
+host has parsed the generated project. Checked compilation produces
+provisional routed artifacts; only this post-host manifest denotes acceptance.
 
 ## 7. Parts and libraries
 
@@ -270,7 +274,8 @@ silently redefine them.
 - physical-design lowering to APGAR's exact Board IR;
 - versioned request, route, provenance, and replay schemas;
 - selected-route import into KiCad output;
-- APGAR exact validation followed by KiCad DRC; and
+- APGAR exact validation followed by KiCad DRC with one authenticated
+  acceptance manifest; and
 - deterministic CPU reference fixtures before GPU performance work.
 
 ### M4: product and manufacturing closure

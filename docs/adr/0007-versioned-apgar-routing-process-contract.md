@@ -93,6 +93,22 @@ subset. KiCad DRC establishes whether the emitted board is accepted by the
 supported KiCad host. Every accepted imported route requires both results,
 bound to the same authenticated request, selected result, imported Design IR,
 and emitted board; neither result substitutes for the other.
+The versioned route-acceptance manifest independently recomputes the digest
+chain after supported-host ERC and DRC. The acceptance host runner first
+copies the complete generated project into a private snapshot, hashes the
+source artifact from one open handle, invokes KiCad on that immutable staged
+file, and verifies its filesystem identity and digest again before and after
+normalization. The normalizer records that pre-execution digest, so a report
+cannot be rebound to source bytes changed after KiCad returned. The manifest
+then re-derives the lossless selected
+geometry projection, and binds the exact normalized host reports and emitted
+board. Acceptance v1 closes over boards whose complete KiCad segment set is
+the authenticated imported projection and rejects top-level arc, via, or zone
+copper outside that projection. Checked compilation may still produce
+provisional mixed boards containing source-authored copper, but accepting them
+requires a future full-design join that independently authenticates those
+additional segments. It does not make host validation part of the canonical
+Design IR.
 
 CircuitC source remains the human-authored authority. The authored request
 authorizes route search, the authenticated import supplies the selected exact

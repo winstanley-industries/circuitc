@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import pathlib
 import re
+import stat
 import sys
 from typing import Any
 
@@ -21,6 +23,7 @@ UUID_V8_PATTERN = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z"
 )
 CANONICAL_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_+\-./]+\Z")
+MAX_SOURCE_BYTES = 64 * 1024 * 1024
 
 
 class ValidationError(Exception):
@@ -421,6 +424,28 @@ def validate_manifest_source(report: dict[str, Any], manifest_source: str | None
         )
 
 
+def source_artifact_sha256(report: dict[str, Any], path: pathlib.Path) -> str:
+    metadata = path.lstat()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_SOURCE_BYTES:
+        raise ValidationError("KiCad source artifact is not a bounded regular file")
+    report_source = report.get("source")
+    if not isinstance(report_source, str):
+        raise ValidationError("KiCad report is missing source")
+    if pathlib.PurePosixPath(report_source.replace("\\", "/")).name != path.name:
+        raise ValidationError("KiCad report source does not match the exact source artifact")
+    digest = hashlib.sha256()
+    total = 0
+    with path.open("rb") as source:
+        while chunk := source.read(8192):
+            total += len(chunk)
+            if total > MAX_SOURCE_BYTES:
+                raise ValidationError("KiCad source artifact exceeds the byte limit")
+            digest.update(chunk)
+    if total != metadata.st_size:
+        raise ValidationError("KiCad source artifact changed while it was hashed")
+    return digest.hexdigest()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--raw", required=True, type=pathlib.Path)
@@ -429,9 +454,19 @@ def main() -> int:
     parser.add_argument("--allow-library-warning", action="append", default=[])
     parser.add_argument("--allow-ignored-check", action="append", default=[])
     parser.add_argument("--identity-map", type=pathlib.Path)
+    parser.add_argument("--source-artifact", type=pathlib.Path)
+    parser.add_argument("--expected-source-sha256")
     args = parser.parse_args()
 
     try:
+        if (args.source_artifact is None) != (args.expected_source_sha256 is None):
+            raise ValidationError(
+                "source artifact and pre-execution SHA-256 must be provided together"
+            )
+        if args.expected_source_sha256 is not None and not re.fullmatch(
+            r"[0-9a-f]{64}", args.expected_source_sha256
+        ):
+            raise ValidationError("pre-execution source SHA-256 is not canonical")
         with args.raw.open(encoding="utf-8") as source:
             report = json.load(source)
         if not isinstance(report, dict):
@@ -455,6 +490,13 @@ def main() -> int:
                 args.allow_ignored_check,
                 identity_map,
             )
+        if args.source_artifact is not None:
+            source_sha256 = source_artifact_sha256(report, args.source_artifact)
+            if source_sha256 != args.expected_source_sha256:
+                raise ValidationError(
+                    "KiCad source artifact changed after the host execution snapshot"
+                )
+            normalized["source_sha256"] = source_sha256
     except (OSError, json.JSONDecodeError, ValidationError) as error:
         print(f"CircuitC KiCad validation failed: {error}", file=sys.stderr)
         return 1

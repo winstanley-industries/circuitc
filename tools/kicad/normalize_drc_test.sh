@@ -43,6 +43,46 @@ python3 "${normalizer}" \
 cmp "${first_normalized}" "${second_normalized}"
 grep -F '"report_kind": "drc"' "${first_normalized}"
 
+source_artifact="${TEST_TMPDIR}/voltage_divider.kicad_pcb"
+printf 'immutable KiCad source snapshot\n' >"${source_artifact}"
+source_digest="$(python3 - "${source_artifact}" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
+PY
+)"
+python3 "${normalizer}" \
+  --raw "${first_raw}" \
+  --normalized "${TEST_TMPDIR}/source-bound.normalized.json" \
+  --expected-major 10 \
+  --allow-library-warning R1 \
+  --allow-library-warning R2 \
+  --allow-ignored-check missing_courtyard \
+  --allow-ignored-check track_not_centered_on_via \
+  --source-artifact "${source_artifact}" \
+  --expected-source-sha256 "${source_digest}"
+grep -F "\"source_sha256\": \"${source_digest}\"" \
+  "${TEST_TMPDIR}/source-bound.normalized.json"
+expect_failure source-without-prehash \
+  'source artifact and pre-execution SHA-256 must be provided together' \
+  --raw "${first_raw}" \
+  --normalized "${TEST_TMPDIR}/source-without-prehash.normalized.json" \
+  --expected-major 10 \
+  --source-artifact "${source_artifact}"
+expect_failure stale-source-prehash \
+  'KiCad source artifact changed after the host execution snapshot' \
+  --raw "${first_raw}" \
+  --normalized "${TEST_TMPDIR}/stale-source-prehash.normalized.json" \
+  --expected-major 10 \
+  --allow-library-warning R1 \
+  --allow-library-warning R2 \
+  --allow-ignored-check missing_courtyard \
+  --allow-ignored-check track_not_centered_on_via \
+  --source-artifact "${source_artifact}" \
+  --expected-source-sha256 "$(printf '0%.0s' {1..64})"
+
 null_location_normalized="${TEST_TMPDIR}/null-location.normalized.json"
 python3 "${normalizer}" \
   --raw "${first_raw}" \
