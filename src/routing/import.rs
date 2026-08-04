@@ -377,12 +377,12 @@ fn import_geometry(
     Ok(imported)
 }
 
-struct DerivedFields {
-    resources: Vec<PhysicalEdgeSpan>,
-    metrics: CandidateMetrics,
+pub(super) struct DerivedFields {
+    pub(super) resources: Vec<PhysicalEdgeSpan>,
+    pub(super) metrics: CandidateMetrics,
 }
 
-fn derive_candidate_fields(
+pub(super) fn derive_candidate_fields(
     request: &RouteRequestContract,
     candidate: &AdmittedCandidate,
 ) -> Result<DerivedFields, ContractDiagnostic> {
@@ -578,7 +578,7 @@ fn derive_candidate_fields(
     })
 }
 
-fn expected_associations(request: &RouteRequestContract) -> CandidateAssociations {
+pub(super) fn expected_associations(request: &RouteRequestContract) -> CandidateAssociations {
     CandidateAssociations {
         board_content_hash: board_content_hash(request),
         compiler_profile_fingerprint: compiler_profile_fingerprint(request),
@@ -712,14 +712,14 @@ fn rule_bucket_identity(request: &RouteRequestContract) -> u64 {
     hash.finish()
 }
 
-fn fingerprint_policy(policy: &CandidatePolicyContract) -> u64 {
+pub(super) fn fingerprint_policy(policy: &CandidatePolicyContract) -> u64 {
     let mut hash = StableHash::new();
     hash.string("APGAR-CANDIDATE-POLICY-V1");
     encode_policy(&mut hash, policy);
     hash.finish()
 }
 
-fn candidate_id(
+pub(super) fn candidate_id(
     net: EntityRef,
     associations: &CandidateAssociations,
     policy_identity: u64,
@@ -742,7 +742,7 @@ fn candidate_id(
     format!("{high:016x}{low:016x}")
 }
 
-fn geometry_signature(geometry: &[LinePrimitive]) -> String {
+pub(super) fn geometry_signature(geometry: &[LinePrimitive]) -> String {
     hash128(
         "APGAR-CANDIDATE-GEOMETRY-V1-A",
         "APGAR-CANDIDATE-GEOMETRY-V1-B",
@@ -755,7 +755,7 @@ fn geometry_signature(geometry: &[LinePrimitive]) -> String {
     )
 }
 
-fn resource_signature(resources: &[PhysicalEdgeSpan]) -> String {
+pub(super) fn resource_signature(resources: &[PhysicalEdgeSpan]) -> String {
     hash128(
         "APGAR-CANDIDATE-RESOURCES-V1-A",
         "APGAR-CANDIDATE-RESOURCES-V1-B",
@@ -781,7 +781,7 @@ where
     format!("{:016x}{:016x}", first.finish(), second.finish())
 }
 
-fn candidate_checksum_and_bytes(candidate: &AdmittedCandidate) -> (u64, u64) {
+pub(super) fn candidate_checksum_and_bytes(candidate: &AdmittedCandidate) -> (u64, u64) {
     let mut encoder = CandidateEncoder::new("APGAR-ROUTE-CANDIDATE-V1");
     encoder.u16(candidate.schema_major);
     encoder.u16(candidate.schema_minor);
