@@ -985,7 +985,11 @@ mod tests {
         let bundle = lower_request(&routing_design()).unwrap().unwrap();
         for (label, body, expected_code) in [
             ("nonzero", "exit 7", PROCESS_EXIT),
-            ("malformed", "printf not-json", PROCESS_OUTPUT),
+            (
+                "malformed",
+                "/bin/cat >/dev/null; printf not-json",
+                PROCESS_OUTPUT,
+            ),
         ] {
             let (runner, root) = fake_runner(label, body, false);
             let error = runner.execute(&bundle).unwrap_err();
