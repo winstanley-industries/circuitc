@@ -4106,6 +4106,34 @@ mod tests {
     }
 
     #[test]
+    fn reports_duplicate_catalog_snapshots_with_related_location() {
+        const CATALOG: &str = "catalog_snapshot \"layer1-contract-fixture\" sha256 \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\" evaluated_on \"2026-08-04\";";
+        let source = REFERENCE.replacen(CATALOG, &format!("{CATALOG}\n  {CATALOG}"), 1);
+        let first_start = source.find(CATALOG).expect("first catalog exists");
+        let duplicate_start = source.rfind(CATALOG).expect("duplicate catalog exists");
+        let diagnostics = elaborate_source(&source).expect_err("duplicate catalog must fail");
+        let duplicate = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "CC-LANG-CATALOG-001")
+            .expect("duplicate catalog diagnostic must exist");
+
+        assert_eq!(
+            duplicate.message,
+            "catalog snapshot is declared more than once"
+        );
+        assert_eq!(duplicate.start, duplicate_start);
+        assert_eq!(&source[duplicate.start..duplicate.end], CATALOG);
+        assert_eq!(duplicate.related.len(), 1);
+        assert_eq!(duplicate.related[0].start, first_start);
+        assert_eq!(duplicate.related[0].end, first_start + CATALOG.len());
+        assert_eq!(
+            &source[duplicate.related[0].start..duplicate.related[0].end],
+            CATALOG
+        );
+        assert_eq!(duplicate.related[0].message, "first declaration is here");
+    }
+
+    #[test]
     fn reports_duplicate_semantic_identities_references_and_symbol_pins() {
         let duplicate_component =
             REFERENCE.replace("resistor divider.r_bottom R2", "resistor divider.r_top R1");

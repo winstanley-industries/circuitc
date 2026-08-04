@@ -2206,7 +2206,9 @@ mod tests {
 
         let mut design = voltage_divider();
         design.components[0].physical = None;
-        let diagnostics = crate::kicad::validate(&design).diagnostics;
+        let diagnostics = compile(&design)
+            .expect_err("a catalog part without board placement must reach KiCad validation")
+            .diagnostics;
         for code in ["CC-KICAD-SYMBOL-005", "CC-KICAD-FOOTPRINT-004"] {
             assert!(
                 diagnostics.iter().any(|diagnostic| diagnostic.code == code),

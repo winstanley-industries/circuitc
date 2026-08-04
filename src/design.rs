@@ -598,7 +598,7 @@ impl Design {
         let physical_component_count = self
             .components
             .iter()
-            .filter(|component| component.physical.is_some())
+            .filter(|component| is_physical_part(component))
             .count();
         if product_variant_resources_are_bounded(&self.product.variants, physical_component_count) {
             for variant in &mut self.product.variants {
@@ -2228,6 +2228,10 @@ fn validate_component<'a>(
     }
 }
 
+fn is_physical_part(component: &Component) -> bool {
+    component.part.manufacturer.is_some()
+}
+
 fn validate_part_identity(component: &Component, path: &str, diagnostics: &mut Vec<Diagnostic>) {
     let part = &component.part;
     if !token_is_valid(&part.logical_function) {
@@ -2239,7 +2243,7 @@ fn validate_part_identity(component: &Component, path: &str, diagnostics: &mut V
         );
     }
 
-    let physical = component.physical.is_some();
+    let physical = is_physical_part(component);
     if physical
         && (part.manufacturer.is_none()
             || part.manufacturer_part_number.is_none()
@@ -2490,7 +2494,7 @@ fn validate_product_intent(
         .collect();
     let physical_paths: BTreeSet<_> = components
         .iter()
-        .filter(|component| component.physical.is_some())
+        .filter(|component| is_physical_part(component))
         .map(|component| component.path.as_str())
         .collect();
 
@@ -2611,7 +2615,7 @@ fn validate_product_intent(
                             assignment.component_path
                         ),
                     ),
-                    Some(component) if component.physical.is_none() => push(
+                    Some(component) if !is_physical_part(component) => push(
                         diagnostics,
                         "CC-PRODUCT-VARIANT-008",
                         variant_path,
@@ -4303,7 +4307,7 @@ mod tests {
         let mut design = voltage_divider();
         design.components[0].part.manufacturer = None;
         design.components[0].part.manufacturer_part_number = None;
-        assert_rejected(design, "CC-PRODUCT-PART-002");
+        assert_rejected(design, "CC-PRODUCT-PART-003");
 
         let mut design = voltage_divider();
         design.components[0].part.manufacturer_part_number = None;
@@ -4744,6 +4748,19 @@ mod tests {
     }
 
     #[test]
+    fn manufacturer_identified_part_remains_physical_without_board_placement() {
+        let mut design = product_design();
+        design
+            .components
+            .iter_mut()
+            .find(|component| component.reference == "R1")
+            .expect("manufacturer-identified fixture component exists")
+            .physical = None;
+
+        assert_eq!(design.validate(), Ok(()));
+    }
+
+    #[test]
     fn product_part_identity_fails_closed_for_missing_or_virtual_physical_fields() {
         let mut logical_function = product_design();
         physical_part_mut(&mut logical_function, "R1").logical_function = "bad function".to_owned();
@@ -4751,7 +4768,10 @@ mod tests {
 
         let mut manufacturer = product_design();
         physical_part_mut(&mut manufacturer, "R1").manufacturer = None;
-        assert_rejected(manufacturer, "CC-PRODUCT-PART-002");
+        let diagnostics = rejected_diagnostics(manufacturer);
+        assert!(has_code(&diagnostics, "CC-PRODUCT-PART-003"));
+        assert!(has_code(&diagnostics, "CC-PRODUCT-VARIANT-008"));
+        assert!(!has_code(&diagnostics, "CC-PRODUCT-PART-002"));
 
         let mut package = product_design();
         physical_part_mut(&mut package, "R1").package = None;
@@ -5000,6 +5020,12 @@ mod tests {
             state: PopulationState::Fitted,
         };
         let mut boundary = product_design();
+        boundary
+            .components
+            .iter_mut()
+            .find(|component| component.reference == "R1")
+            .expect("manufacturer-identified fixture component exists")
+            .physical = None;
         variant_mut(&mut boundary).components =
             vec![repeated_assignment.clone(); MAX_PRODUCT_VARIANT_WORK - 2];
         let diagnostics = rejected_diagnostics(boundary);
@@ -5007,6 +5033,12 @@ mod tests {
         assert!(has_code(&diagnostics, "CC-PRODUCT-VARIANT-006"));
 
         let mut one_over = product_design();
+        one_over
+            .components
+            .iter_mut()
+            .find(|component| component.reference == "R1")
+            .expect("manufacturer-identified fixture component exists")
+            .physical = None;
         variant_mut(&mut one_over).components =
             vec![repeated_assignment; MAX_PRODUCT_VARIANT_WORK - 1];
         let diagnostics = rejected_diagnostics(one_over);
