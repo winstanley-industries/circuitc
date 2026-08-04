@@ -71,6 +71,32 @@ struct ProjectionPoint {
 pub(crate) fn project_imported_route(
     imported: &ImportedRoute,
 ) -> Result<ProjectedRoute, ContractDiagnostic> {
+    validate_projectable(imported)?;
+    let candidate = selected_candidate(imported)?;
+    let static_artifacts = compile(&imported.design).map_err(|error| {
+        error.diagnostics.into_iter().next().map_or_else(
+            || projection_error("design", "KiCad projection failed without a diagnostic"),
+            |diagnostic| {
+                projection_error(
+                    diagnostic.path,
+                    format!("{}: {}", diagnostic.code, diagnostic.message),
+                )
+            },
+        )
+    })?;
+    project_with_static_artifacts(imported, candidate, static_artifacts)
+}
+
+pub(crate) fn project_imported_route_with_static_artifacts(
+    imported: &ImportedRoute,
+    static_artifacts: CompiledArtifacts,
+) -> Result<ProjectedRoute, ContractDiagnostic> {
+    validate_projectable(imported)?;
+    let candidate = selected_candidate(imported)?;
+    project_with_static_artifacts(imported, candidate, static_artifacts)
+}
+
+fn validate_projectable(imported: &ImportedRoute) -> Result<(), ContractDiagnostic> {
     imported.design.validate().map_err(|diagnostics| {
         diagnostics.into_iter().next().map_or_else(
             || {
@@ -93,18 +119,14 @@ pub(crate) fn project_imported_route(
             "imported route projection requires a fully resolved Design IR",
         ));
     }
-    let candidate = selected_candidate(imported)?;
-    let static_artifacts = compile(&imported.design).map_err(|error| {
-        error.diagnostics.into_iter().next().map_or_else(
-            || projection_error("design", "KiCad projection failed without a diagnostic"),
-            |diagnostic| {
-                projection_error(
-                    diagnostic.path,
-                    format!("{}: {}", diagnostic.code, diagnostic.message),
-                )
-            },
-        )
-    })?;
+    Ok(())
+}
+
+fn project_with_static_artifacts(
+    imported: &ImportedRoute,
+    candidate: &AdmittedCandidate,
+    static_artifacts: CompiledArtifacts,
+) -> Result<ProjectedRoute, ContractDiagnostic> {
     let segments = bind_segments(imported, candidate, &static_artifacts)?;
     let contract = RouteProjectionContract {
         schema_name: PROJECTION_SCHEMA_NAME.to_owned(),

@@ -214,7 +214,7 @@ Rust callers with simulation or autoroute intent use
 `compile_source_checked(..., work_root)`; the CLI always uses the checked
 source-compilation path. Checked routing validates and lowers the exact
 request, executes the pinned CPU adapter, authenticates and imports the result,
-then projects the fresh accepted Design IR into static and simulation
+then projects the fresh validated imported Design IR into static and simulation
 artifacts.
 
 Each component has exactly one part, symbol, schematic position, and
@@ -257,16 +257,19 @@ The command accepts exactly one input. It transactionally writes a complete
 KiCad project bundle, `<design>.kicad-map.json`, `<design>.spice`, every
 five-file per-analysis simulation chain, and, when autorouting was requested,
 the canonical routing request, authenticated result, and projection manifest.
+These routing outputs are provisional compiled artifacts, not accepted route
+evidence; supported-host KiCad validation and the separate route-acceptance
+manifest are still required.
 All files are published in one failure-atomic transaction only after parsing,
 elaboration, Design validation, route execution and authenticated import,
 KiCad identity validation, lowering, checked simulation execution, and
 assertion evaluation all succeed.
 
 Routing process, contract, authentication, import, or projection failure emits
-a machine-readable diagnostic and publishes neither accepted output nor a
+a machine-readable diagnostic and publishes neither provisional output nor a
 `<OUTPUT_DIRECTORY>.failed` tree. If routing succeeds but a later simulation
 fails, the routing chain and static artifacts are discarded because the route
-projection binds the exact KiCad board that was not accepted for publication.
+projection binds the exact KiCad board that will not be published.
 Only the existing complete per-analysis simulation evidence chains are then
 eligible for the failure directory.
 

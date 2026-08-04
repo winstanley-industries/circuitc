@@ -8,7 +8,9 @@ use crate::routing::contract::{
 };
 use crate::routing::import::import_result;
 use crate::routing::lower::lower_request;
-use crate::routing::project::project_imported_route;
+use crate::routing::project::{
+    project_imported_route, project_imported_route_with_static_artifacts,
+};
 use crate::routing::runner::ApgarRunner;
 use crate::simulation::assert::evaluate_assertions;
 use crate::simulation::lower::{self, SimulationInputBundle};
@@ -327,9 +329,17 @@ fn prepare_checked_routing(
         .map_err(|error| checked_routing_error(&bundle.request.request_path, "execution", error))?;
     let imported = import_result(design, &bundle, &executed.result_json, &executed.tool)
         .map_err(|error| checked_routing_error(&bundle.request.request_path, "import", error))?;
-    let projected = project_imported_route(&imported).map_err(|error| {
-        checked_routing_error(&bundle.request.request_path, "projection", error)
-    })?;
+    let projected = if imported.design.analyses.is_empty() {
+        project_imported_route(&imported)
+    } else {
+        let static_artifacts =
+            compile_static_validated(&imported.design).map_err(|error| CheckedCompileError {
+                diagnostics: error.diagnostics,
+                simulations: Vec::new(),
+            })?;
+        project_imported_route_with_static_artifacts(&imported, static_artifacts)
+    }
+    .map_err(|error| checked_routing_error(&bundle.request.request_path, "projection", error))?;
     let result_sha256 = route_sha256_hex(imported.result_json.as_bytes());
     let routing = CompiledRouting {
         request_path: imported.request_path.clone(),

@@ -15,7 +15,11 @@ use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
+use std::io::{Seek as _, SeekFrom};
+#[cfg(unix)]
+use std::os::unix::fs::{
+    DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt as _;
 
@@ -66,8 +70,31 @@ pub(crate) struct ApgarRunner {
 struct VerifiedExecutable {
     path: PathBuf,
     tool: ToolIdentity,
+    identity: ExecutableIdentity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExecutableIdentity {
+    sha256: String,
+    length: u64,
+    #[cfg(unix)]
     device: u64,
+    #[cfg(unix)]
     inode: u64,
+    #[cfg(unix)]
+    mode: u32,
+}
+
+struct OpenedExecutable {
+    #[cfg(unix)]
+    file: fs::File,
+    identity: ExecutableIdentity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StagedExecutable {
+    path: PathBuf,
+    identity: ExecutableIdentity,
 }
 
 impl ApgarRunner {
@@ -128,6 +155,7 @@ impl ApgarRunner {
                 "could not create a private APGAR working directory",
             )
         })?;
+        let staged = self.stage_executable(&cached, directory.path())?;
         let timeout = Duration::from_millis(bundle.request.resource_limits.timeout_milliseconds);
         let stdout_limit = usize::try_from(bundle.request.resource_limits.stdout_bytes)
             .unwrap_or(usize::MAX)
@@ -142,7 +170,7 @@ impl ApgarRunner {
             OsString::from(&cached.tool.executable_sha256),
         ];
         let process = run_process(
-            &cached.path,
+            &staged.path,
             directory.path(),
             &arguments,
             bundle.request_json.as_bytes(),
@@ -151,6 +179,7 @@ impl ApgarRunner {
             stderr_limit,
         );
         let post_execution = self.verify_executable();
+        let post_staged = executable_identity(&staged.path).map(|opened| opened.identity);
         let cleanup = directory.cleanup();
         if cleanup.is_err() {
             return Err(process_error(
@@ -159,7 +188,11 @@ impl ApgarRunner {
                 "could not clean the private APGAR working directory",
             ));
         }
-        if post_execution.as_ref() != Ok(&cached) {
+        if post_execution.as_ref() != Ok(&cached)
+            || post_staged
+                .as_ref()
+                .map_or(true, |identity| identity != &staged.identity)
+        {
             return Err(process_error(
                 PROCESS_IDENTITY,
                 "runner.executable",
@@ -227,6 +260,7 @@ impl ApgarRunner {
         })
     }
 
+    #[cfg(unix)]
     fn verify_executable(&self) -> Result<VerifiedExecutable, ContractDiagnostic> {
         let executable = self.executable.canonicalize().map_err(|_| {
             process_error(
@@ -238,23 +272,15 @@ impl ApgarRunner {
         let deadline = Instant::now()
             .checked_add(IDENTITY_WALL)
             .unwrap_or_else(Instant::now);
-        let metadata = executable.metadata().map_err(|_| {
-            process_error(
-                PROCESS_IDENTITY,
-                "runner.executable",
-                "could not inspect the Bazel-owned APGAR executable",
-            )
-        })?;
-        let executable_sha256 =
-            sha256_bounded_regular_file(&executable, MAX_EXECUTABLE_BYTES, deadline).map_err(
-                |_| {
-                    process_error(
-                        PROCESS_IDENTITY,
-                        "runner.executable",
-                        "could not hash the bounded Bazel-owned APGAR executable",
-                    )
-                },
-            )?;
+        let opened =
+            open_bounded_executable(&executable, MAX_EXECUTABLE_BYTES, deadline).map_err(|_| {
+                process_error(
+                    PROCESS_IDENTITY,
+                    "runner.executable",
+                    "could not identify the bounded Bazel-owned APGAR executable",
+                )
+            })?;
+        let executable_sha256 = opened.identity.sha256.clone();
         let provenance =
             read_bounded_regular_file(&self.provenance, MAX_PROVENANCE_BYTES, deadline).map_err(
                 |_| {
@@ -285,9 +311,114 @@ impl ApgarRunner {
         Ok(VerifiedExecutable {
             path: executable,
             tool: expected_cpu_tool(executable_sha256),
-            device: metadata.dev(),
-            inode: metadata.ino(),
+            identity: opened.identity,
         })
+    }
+
+    #[cfg(not(unix))]
+    fn verify_executable(&self) -> Result<VerifiedExecutable, ContractDiagnostic> {
+        Err(process_error(
+            PROCESS_IDENTITY,
+            "runner.platform",
+            "APGAR execution requires the supported Unix process-isolation boundary",
+        ))
+    }
+
+    #[cfg(unix)]
+    fn stage_executable(
+        &self,
+        cached: &VerifiedExecutable,
+        directory: &Path,
+    ) -> Result<StagedExecutable, ContractDiagnostic> {
+        let deadline = Instant::now()
+            .checked_add(IDENTITY_WALL)
+            .unwrap_or_else(Instant::now);
+        let mut opened = open_bounded_executable(&cached.path, MAX_EXECUTABLE_BYTES, deadline)
+            .map_err(|_| {
+                process_error(
+                    PROCESS_IDENTITY,
+                    "runner.executable",
+                    "could not reopen the verified APGAR executable",
+                )
+            })?;
+        if opened.identity != cached.identity {
+            return Err(process_error(
+                PROCESS_IDENTITY,
+                "runner.executable",
+                "APGAR executable identity changed before staging",
+            ));
+        }
+
+        let path = directory.join("apgar-route-adapter");
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o500)
+            .open(&path)
+            .map_err(|_| {
+                process_error(
+                    PROCESS_IO,
+                    "runner.executable",
+                    "could not create the private APGAR executable",
+                )
+            })?;
+        copy_bounded_executable(&mut opened, &mut output, deadline).map_err(|_| {
+            process_error(
+                PROCESS_IO,
+                "runner.executable",
+                "could not stage the verified APGAR executable",
+            )
+        })?;
+        output.sync_all().map_err(|_| {
+            process_error(
+                PROCESS_IO,
+                "runner.executable",
+                "could not persist the private APGAR executable",
+            )
+        })?;
+        drop(output);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o500)).map_err(|_| {
+            process_error(
+                PROCESS_IO,
+                "runner.executable",
+                "could not restrict the private APGAR executable",
+            )
+        })?;
+
+        let staged = executable_identity(&path).map_err(|_| {
+            process_error(
+                PROCESS_IDENTITY,
+                "runner.executable",
+                "could not identify the private APGAR executable",
+            )
+        })?;
+        if staged.identity.sha256 != cached.identity.sha256
+            || staged.identity.length != cached.identity.length
+            || staged.identity.mode & 0o777 != 0o500
+        {
+            return Err(process_error(
+                PROCESS_IDENTITY,
+                "runner.executable",
+                "private APGAR executable does not match verified bytes",
+            ));
+        }
+        Ok(StagedExecutable {
+            path,
+            identity: staged.identity,
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn stage_executable(
+        &self,
+        _cached: &VerifiedExecutable,
+        _directory: &Path,
+    ) -> Result<StagedExecutable, ContractDiagnostic> {
+        Err(process_error(
+            PROCESS_IDENTITY,
+            "runner.platform",
+            "APGAR execution requires the supported Unix process-isolation boundary",
+        ))
     }
 }
 
@@ -363,7 +494,18 @@ fn read_bounded_regular_file(path: &Path, limit: u64, deadline: Instant) -> io::
     Ok(bytes)
 }
 
-fn sha256_bounded_regular_file(path: &Path, limit: u64, deadline: Instant) -> io::Result<String> {
+fn executable_identity(path: &Path) -> io::Result<OpenedExecutable> {
+    let deadline = Instant::now()
+        .checked_add(IDENTITY_WALL)
+        .unwrap_or_else(Instant::now);
+    open_bounded_executable(path, MAX_EXECUTABLE_BYTES, deadline)
+}
+
+fn open_bounded_executable(
+    path: &Path,
+    limit: u64,
+    deadline: Instant,
+) -> io::Result<OpenedExecutable> {
     let mut file = fs::File::open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.len() == 0 || metadata.len() > limit {
@@ -372,6 +514,31 @@ fn sha256_bounded_regular_file(path: &Path, limit: u64, deadline: Instant) -> io
             "executable is not a bounded regular file",
         ));
     }
+    let sha256 = sha256_bounded_open_file(&mut file, metadata.len(), limit, deadline)?;
+    #[cfg(unix)]
+    file.seek(SeekFrom::Start(0))?;
+    Ok(OpenedExecutable {
+        #[cfg(unix)]
+        file,
+        identity: ExecutableIdentity {
+            sha256,
+            length: metadata.len(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            mode: metadata.mode(),
+        },
+    })
+}
+
+fn sha256_bounded_open_file(
+    file: &mut fs::File,
+    expected_length: u64,
+    limit: u64,
+    deadline: Instant,
+) -> io::Result<String> {
     let mut digest = Sha256::new();
     let mut chunk = [0_u8; READ_CHUNK_BYTES];
     let mut total = 0_u64;
@@ -397,7 +564,7 @@ fn sha256_bounded_regular_file(path: &Path, limit: u64, deadline: Instant) -> io
         }
         digest.update(&chunk[..count]);
     }
-    if total != metadata.len() {
+    if total != expected_length {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "executable changed while hashing",
@@ -408,6 +575,46 @@ fn sha256_bounded_regular_file(path: &Path, limit: u64, deadline: Instant) -> io
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())
+}
+
+#[cfg(unix)]
+fn copy_bounded_executable(
+    source: &mut OpenedExecutable,
+    destination: &mut fs::File,
+    deadline: Instant,
+) -> io::Result<()> {
+    source.file.seek(SeekFrom::Start(0))?;
+    let mut chunk = [0_u8; READ_CHUNK_BYTES];
+    let mut total = 0_u64;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "executable staging deadline expired",
+            ));
+        }
+        let count = source.file.read(&mut chunk)?;
+        if count == 0 {
+            break;
+        }
+        total = total.checked_add(count as u64).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "executable size overflow")
+        })?;
+        if total > source.identity.length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "executable changed while staging",
+            ));
+        }
+        destination.write_all(&chunk[..count])?;
+    }
+    if total != source.identity.length {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "executable changed while staging",
+        ));
+    }
+    destination.flush()
 }
 
 struct ScopedWorkDirectory(Option<PathBuf>);
@@ -474,10 +681,9 @@ fn create_new_private_directory(path: &Path) -> io::Result<()> {
 #[cfg(unix)]
 fn verify_private_directory(path: &Path) -> io::Result<()> {
     let metadata = fs::metadata(path)?;
-    if !metadata.is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o077 != 0
-    {
+    // SAFETY: geteuid has no preconditions and only reads the caller's effective UID.
+    let effective_uid = unsafe { libc::geteuid() };
+    if !metadata.is_dir() || metadata.uid() != effective_uid || metadata.mode() & 0o077 != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "APGAR work root is not private and caller-owned",
@@ -828,10 +1034,9 @@ mod tests {
         goal: PointDbu,
         obstacle: Option<BoxDbu>,
     ) -> RouteInputBundle {
-        let mut bundle =
-            lower_request(&routing_design(CopperLayer::Front, 200_000))
-                .unwrap()
-                .unwrap();
+        let mut bundle = lower_request(&routing_design(CopperLayer::Front, 200_000))
+            .unwrap()
+            .unwrap();
         let request = &mut bundle.request;
         let mut obstacle_template = request.obstacles[0].clone();
         request.obstacles.clear();
@@ -929,6 +1134,23 @@ mod tests {
         assert_eq!(status, RouteFailureStatus::RouteNotFound);
         assert_eq!(diagnostic.code, "CC-APGAR-ROUTE-001");
         assert_eq!(diagnostic.path, "board.autoroute.vout");
+    }
+
+    #[test]
+    fn pinned_real_cpu_adapter_enforces_authenticated_diagnostic_bound() {
+        let design = routing_design(CopperLayer::Front, 9_000_000);
+        let mut bundle = lower_request(&design).unwrap().unwrap();
+        bundle.request.resource_limits.diagnostic_bytes = 1;
+        bundle.request_json = render_request(&bundle.request).unwrap();
+        bundle.request_sha256 = sha256_hex(bundle.request_json.as_bytes());
+
+        let error = ApgarRunner::from_bazel_runfiles(test_root("diagnostic-adapter"))
+            .unwrap()
+            .execute(&bundle)
+            .unwrap_err();
+        assert_eq!(error.code, PROCESS_EXIT);
+        assert_eq!(error.path, bundle.request.request_path);
+        assert_eq!(error.message, "APGAR route adapter exited unsuccessfully");
     }
 
     #[test]
@@ -1093,6 +1315,37 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn runner_enforces_authenticated_diagnostic_bound_on_canonical_output() {
+        let design = routing_design(CopperLayer::Front, 9_000_000);
+        let original = lower_request(&design).unwrap().unwrap();
+        let real = ApgarRunner::from_bazel_runfiles(test_root("diagnostic-template"))
+            .unwrap()
+            .execute(&original)
+            .unwrap();
+
+        let mut bundle = original.clone();
+        bundle.request.resource_limits.diagnostic_bytes = 1;
+        bundle.request_json = render_request(&bundle.request).unwrap();
+        bundle.request_sha256 = sha256_hex(bundle.request_json.as_bytes());
+
+        let template = real
+            .result_json
+            .replace(&original.request_sha256, "${2}")
+            .replace(&real.tool.executable_sha256, "${4}");
+        let body = format!("/bin/cat >/dev/null\n/bin/cat <<EOF\n{template}EOF");
+        let (runner, root) = fake_runner("diagnostic-runner", &body, false);
+        let error = runner.execute(&bundle).unwrap_err();
+        assert_eq!(error.code, PROCESS_RESOURCE);
+        assert_eq!(error.path, bundle.request.request_path);
+        assert_eq!(
+            error.message,
+            "APGAR normalized diagnostic exceeded its authenticated byte limit"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
     fn fake_runner(label: &str, body: &str, corrupt_provenance: bool) -> (ApgarRunner, PathBuf) {
         let root = test_root(label);
         fs::create_dir_all(&root).unwrap();
@@ -1192,6 +1445,24 @@ mod tests {
         let error = runner.execute(&bundle).unwrap_err();
         assert_eq!(error.code, super::PROCESS_IDENTITY);
         assert_eq!(error.path, "runner.provenance");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_executable_mutation_during_process_fails_closed() {
+        let design = routing_design(CopperLayer::Front, 200_000);
+        let bundle = lower_request(&design).unwrap().unwrap();
+        let body = "printf '#!/bin/sh\\nexit 0\\n' > \"$0.replacement\"\n/bin/chmod 500 \"$0.replacement\"\n/bin/mv \"$0.replacement\" \"$0\"\nexit 0";
+        let (runner, root) = fake_runner("during-execution", body, false);
+
+        let error = runner.execute(&bundle).unwrap_err();
+        assert_eq!(error.code, PROCESS_IDENTITY);
+        assert_eq!(error.path, "runner.executable");
+        assert_eq!(
+            error.message,
+            "APGAR executable identity changed during process execution"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
