@@ -1160,7 +1160,11 @@ impl Directory {
         if status == 0 {
             // SAFETY: successful fstatat initialized the complete stat value.
             let metadata = unsafe { metadata.assume_init() };
-            Ok((metadata.st_dev as u64, metadata.st_ino))
+            #[cfg(target_os = "linux")]
+            let device = metadata.st_dev;
+            #[cfg(target_os = "macos")]
+            let device = metadata.st_dev as u64;
+            Ok((device, metadata.st_ino))
         } else {
             Err(io::Error::last_os_error())
         }
