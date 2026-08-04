@@ -234,13 +234,11 @@ fn bind_segments(
                 ));
             }
             let identity = unique_identity(&artifacts.kicad_identities, &route.path)?;
-            if !artifacts
-                .kicad_pcb
-                .contains(&format!("(uuid \"{}\")", identity.uuid))
-            {
+            let pcb_identity = format!("(uuid \"{}\")", identity.uuid);
+            if artifacts.kicad_pcb.match_indices(&pcb_identity).count() != 1 {
                 return Err(projection_error(
                     &route.path,
-                    "route identity is absent from the emitted KiCad PCB",
+                    "route identity is not unique in the emitted KiCad PCB",
                 ));
             }
             Ok(projected_segment(index, route, identity))
@@ -323,7 +321,9 @@ mod tests {
         resource_signature,
     };
     use super::super::lower::lower_request;
-    use super::{RouteProjectionContract, project_imported_route};
+    use super::{
+        RouteProjectionContract, bind_segments, project_imported_route, selected_candidate,
+    };
 
     const MM: i64 = 1_000_000;
     const EXECUTABLE_SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -470,5 +470,28 @@ mod tests {
         let mut identity_drift = imported();
         identity_drift.selected_candidate_id = "ffffffffffffffffffffffffffffffff".to_owned();
         assert!(project_imported_route(&identity_drift).is_err());
+    }
+
+    #[test]
+    fn duplicate_route_uuid_in_emitted_pcb_is_rejected() {
+        let imported = imported();
+        let projected = project_imported_route(&imported).unwrap();
+        let candidate = selected_candidate(&imported).unwrap();
+        let mut artifacts = projected.static_artifacts;
+        let route_identity = artifacts
+            .kicad_identities
+            .iter()
+            .find(|identity| {
+                identity
+                    .semantic_path
+                    .starts_with("board.autoroute.vout.segment.")
+            })
+            .unwrap();
+        artifacts
+            .kicad_pcb
+            .push_str(&format!("\n(uuid \"{}\")\n", route_identity.uuid));
+        let error = bind_segments(&imported, candidate, &artifacts).unwrap_err();
+        assert_eq!(error.path, "board.autoroute.vout.segment.00000000");
+        assert!(error.message.contains("not unique"));
     }
 }
