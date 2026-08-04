@@ -171,7 +171,7 @@ pub(crate) fn write_json_string(output: &mut String, value: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{DiagnosticFormat, compile_source, render_diagnostics};
+    use super::{DiagnosticFormat, compile_source, elaborate_source, render_diagnostics};
 
     const MINIMAL_VIRTUAL_SOURCE: &str = r#"design d {
   ground GND;
@@ -211,6 +211,26 @@ mod tests {
             Some("design.board.routes[0]")
         );
         assert_eq!(&source[route.start..route.start + "route".len()], "route");
+    }
+
+    #[test]
+    fn authored_routing_intent_is_distinct_and_fails_closed_before_execution() {
+        let source = include_str!("../../examples/voltage_divider.circuitc").replace(
+            "route board.routes.vout_bridge net VOUT from (16 mm, 10 mm) to (24 mm, 10 mm) width 0.25 mm layer front;",
+            "autoroute board.autoroute.vout net VOUT width 0.25 mm clearance 0.2 mm grid 0.25 mm layer front;",
+        );
+        let elaborated = elaborate_source("autoroute.circuitc", &source)
+            .expect("valid routing intent must elaborate");
+        assert!(elaborated.design.board.routes.is_empty());
+        assert_eq!(elaborated.design.board.routing_requests.len(), 1);
+
+        let diagnostics = compile_source("autoroute.circuitc", &source)
+            .expect_err("routing intent must not be emitted without checked APGAR execution");
+        let phase = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "CC-AUTOROUTE-PHASE-001")
+            .expect("fail-closed phase diagnostic must exist");
+        assert!(source[phase.start..].starts_with("autoroute board.autoroute.vout"));
     }
 
     #[test]

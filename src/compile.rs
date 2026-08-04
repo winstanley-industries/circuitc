@@ -186,6 +186,17 @@ pub fn compile(design: &Design) -> Result<CompiledArtifacts, CompileError> {
 }
 
 fn compile_static_validated(design: &Design) -> Result<CompiledArtifacts, CompileError> {
+    if let Some(request) = design.board.routing_requests.first() {
+        return Err(CompileError {
+            diagnostics: vec![Diagnostic {
+                code: "CC-AUTOROUTE-PHASE-001",
+                path: format!("design.board.routing_requests.{}", request.path),
+                related_path: None,
+                message: "the static compiler cannot emit authored routing intent before APGAR exact routing and authenticated import"
+                    .to_owned(),
+            }],
+        });
+    }
     let validated_kicad = kicad::validate(design);
     if !validated_kicad.diagnostics.is_empty() {
         return Err(CompileError {

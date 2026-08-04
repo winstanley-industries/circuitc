@@ -1,12 +1,13 @@
 use super::diagnostic::{SourceDiagnostic, sort_diagnostics};
 use super::lexer::{Token, TokenKind, lex, token_word};
 use super::syntax::{
-    BindingSyntax, BoardItemSyntax, BoardSyntax, ComponentItemSyntax, ComponentKindSyntax,
-    ComponentSyntax, ConnectionStateSyntax, DeclarationSyntax, DesignSyntax, FootprintItemSyntax,
-    FootprintSyntax, ModuleSyntax, NetSyntax, PartSyntax, PlacementSyntax, PointSyntax, PortSyntax,
-    QuantitySyntax, RectangleSyntax, RouteSyntax, SchematicPlacementSyntax,
-    SimulationAnalysisKindSyntax, SimulationAnalysisSyntax, SimulationAssertionSyntax,
-    SimulationSampleSyntax, SourceFile, Span, Spanned, SymbolPinSyntax, SymbolSyntax, SyntaxTree,
+    AutorouteSyntax, BindingSyntax, BoardItemSyntax, BoardSyntax, ComponentItemSyntax,
+    ComponentKindSyntax, ComponentSyntax, ConnectionStateSyntax, DeclarationSyntax, DesignSyntax,
+    FootprintItemSyntax, FootprintSyntax, ModuleSyntax, NetSyntax, PartSyntax, PlacementSyntax,
+    PointSyntax, PortSyntax, QuantitySyntax, RectangleSyntax, RouteSyntax,
+    SchematicPlacementSyntax, SimulationAnalysisKindSyntax, SimulationAnalysisSyntax,
+    SimulationAssertionSyntax, SimulationSampleSyntax, SourceFile, Span, Spanned, SymbolPinSyntax,
+    SymbolSyntax, SyntaxTree,
 };
 
 pub(crate) fn parse(source: SourceFile) -> Result<SyntaxTree, Vec<SourceDiagnostic>> {
@@ -557,6 +558,9 @@ impl Parser<'_> {
             } else if self.at_keyword("route") {
                 self.parse_route()
                     .map(|route| BoardItemSyntax::Route(Box::new(route)))
+            } else if self.at_keyword("autoroute") {
+                self.parse_autoroute()
+                    .map(|request| BoardItemSyntax::Autoroute(Box::new(request)))
             } else {
                 self.unsupported("board declaration");
                 self.recover_item();
@@ -630,6 +634,31 @@ impl Parser<'_> {
             start: route_start,
             end: end_point,
             width,
+            layer,
+            span: start.through(end),
+        })
+    }
+
+    fn parse_autoroute(&mut self) -> Option<AutorouteSyntax> {
+        let start = self.take().span;
+        let path = self.expect_name("routing request semantic path")?;
+        self.require_keyword("net")?;
+        let net = self.expect_name("routing request net")?;
+        self.require_keyword("width")?;
+        let width = self.parse_quantity()?;
+        self.require_keyword("clearance")?;
+        let clearance = self.parse_quantity()?;
+        self.require_keyword("grid")?;
+        let grid_step = self.parse_quantity()?;
+        self.require_keyword("layer")?;
+        let layer = self.expect_name("copper layer")?;
+        let end = self.expect_semicolon()?;
+        Some(AutorouteSyntax {
+            path,
+            net,
+            width,
+            clearance,
+            grid_step,
             layer,
             span: start.through(end),
         })
