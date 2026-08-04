@@ -3,6 +3,7 @@
 pub(crate) mod contract;
 pub(crate) mod import;
 pub(crate) mod lower;
+pub(crate) mod project;
 
 pub(crate) const PINNED_APGAR_SOURCE_REVISION: &str = "85a4f75b8c0c6142d319a8a743087f65ef9e9796";
 pub(crate) const APGAR_CONTRACT_IDENTITY: &str =
