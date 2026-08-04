@@ -10,6 +10,9 @@ frontend="$6"
 binder="$7"
 source_fixture="$8"
 catalog_snapshot="$9"
+checked_source_fixture="${10}"
+routed_source_fixture="${11}"
+raw_fixture_generator="${12}"
 
 # Bazel data dependencies are exposed through a runfiles symlink forest. Stage
 # ordinary files before exercising the production gate, which intentionally
@@ -18,6 +21,10 @@ cp "${source_fixture}" "${TEST_TMPDIR}/fixture.circuitc"
 source_fixture="${TEST_TMPDIR}/fixture.circuitc"
 cp "${catalog_snapshot}" "${TEST_TMPDIR}/catalog.json"
 catalog_snapshot="${TEST_TMPDIR}/catalog.json"
+cp "${checked_source_fixture}" "${TEST_TMPDIR}/checked-fixture.circuitc"
+checked_source_fixture="${TEST_TMPDIR}/checked-fixture.circuitc"
+cp "${routed_source_fixture}" "${TEST_TMPDIR}/routed-fixture.circuitc"
+routed_source_fixture="${TEST_TMPDIR}/routed-fixture.circuitc"
 
 cp "${mutating_host}" "${TEST_TMPDIR}/mutating-host"
 chmod +x "${TEST_TMPDIR}/mutating-host"
@@ -38,6 +45,55 @@ board_fixture="${TEST_TMPDIR}/compiled/voltage_divider.kicad_pcb"
   "${catalog_snapshot}" \
   production \
   "${board_fixture}" >"${TEST_TMPDIR}/request.json"
+
+# The production gate must preserve checked compiler evidence for both reasons
+# ADR-0011 requires it: declared simulations and APGAR routing requests.
+"${frontend}" compile "${checked_source_fixture}" --output-dir "${TEST_TMPDIR}/checked-compiled"
+checked_board="${TEST_TMPDIR}/checked-compiled/checked_voltage_divider.kicad_pcb"
+"${binder}" prepare \
+  "${checked_source_fixture}" \
+  "${catalog_snapshot}" \
+  production \
+  "${checked_board}" \
+  >"${TEST_TMPDIR}/checked-request.json"
+"${frontend}" compile "${routed_source_fixture}" --output-dir "${TEST_TMPDIR}/routed-compiled"
+routed_board="${TEST_TMPDIR}/routed-compiled/routed_voltage_divider.kicad_pcb"
+"${binder}" prepare \
+  "${routed_source_fixture}" \
+  "${catalog_snapshot}" \
+  production \
+  "${routed_board}" \
+  >"${TEST_TMPDIR}/routed-request.json"
+
+for checked_case in checked routed; do
+  if [[ "${checked_case}" == "checked" ]]; then
+    checked_source="${checked_source_fixture}"
+    checked_design="checked_voltage_divider"
+    checked_board_path="${checked_board}"
+  else
+    checked_source="${routed_source_fixture}"
+    checked_design="routed_voltage_divider"
+    checked_board_path="${routed_board}"
+  fi
+  checked_request="${TEST_TMPDIR}/${checked_case}-request.json"
+  checked_raw="${TEST_TMPDIR}/${checked_case}-raw"
+  python3 "${raw_fixture_generator}" \
+    "${checked_raw}" \
+    "${checked_design}" \
+    "${checked_request}" \
+    "${checked_board_path}" \
+    "${mutating_host}"
+  "${binder}" bind \
+    "${checked_source}" \
+    "${catalog_snapshot}" \
+    production \
+    "${checked_board_path}" \
+    "${checked_raw}" \
+    "${mutating_host}" \
+    >"${TEST_TMPDIR}/${checked_case}-manifest.json"
+  python3 -c 'import json,pathlib,sys; value=json.loads(pathlib.Path(sys.argv[1]).read_bytes()); assert value["schema_name"]=="circuitc.fabrication_manifest"' \
+    "${TEST_TMPDIR}/${checked_case}-manifest.json"
+done
 
 expect_failure() {
   expected="$1"

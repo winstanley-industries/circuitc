@@ -4,12 +4,13 @@ use std::ffi::{CStr, CString};
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
-use circuitc::frontend::compile_source;
+use circuitc::frontend::{CheckedCompiledSource, compile_source_checked};
 use circuitc::manufacturing::{
     FabricationCompilerArtifacts, FabricationHostFile, bind_kicad10_fabrication,
     prepare_kicad10_fabrication_request, verify_kicad10_fabrication_manifest,
@@ -22,6 +23,176 @@ const ANALYSIS_PATH: &str = "release.manufacturability";
 const ASSERTION_PATH: &str = "release.manufacturability.fabrication";
 const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_RAW_AGGREGATE_BYTES: u64 = 256 * 1024 * 1024;
+
+struct CompilerWorkRootOwnership {
+    parent: File,
+    directory: File,
+    name: CString,
+    device: u64,
+    inode: u64,
+}
+
+struct CompilerWorkRoot {
+    path: PathBuf,
+    ownership: Option<CompilerWorkRootOwnership>,
+}
+
+impl CompilerWorkRoot {
+    fn create() -> Result<Self, String> {
+        #[cfg(target_os = "linux")]
+        let parent_path = Path::new("/tmp");
+        #[cfg(target_os = "macos")]
+        let parent_path = Path::new("/private/tmp");
+        let parent = OpenOptions::new()
+            .read(true)
+            .custom_flags(directory_flags())
+            .open(parent_path)
+            .map_err(|error| format!("failed to open trusted temporary root: {error}"))?;
+        let parent_metadata = parent
+            .metadata()
+            .map_err(|error| format!("failed to inspect trusted temporary root: {error}"))?;
+        if !parent_metadata.is_dir()
+            || parent_metadata.uid() != 0
+            || parent_metadata.mode() & 0o7777 != 0o1777
+        {
+            return Err("trusted temporary root is not a root-owned sticky directory".to_owned());
+        }
+        let template_path = parent_path.join("circuitc-fabrication-XXXXXX");
+        let mut template = template_path.as_os_str().as_bytes().to_vec();
+        template.push(0);
+        // SAFETY: `template` is writable, NUL-terminated, and ends in the six
+        // `X` bytes required by `mkdtemp`; its allocation remains live here.
+        let created = unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) };
+        if created.is_null() {
+            return Err(format!(
+                "failed to create private compiler work root: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: successful `mkdtemp` returns a pointer into the still-live,
+        // NUL-terminated `template` allocation.
+        let path = PathBuf::from(std::ffi::OsString::from_vec(
+            unsafe { CStr::from_ptr(created) }.to_bytes().to_vec(),
+        ));
+        let basename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "compiler work-root name is not UTF-8".to_owned())?;
+        let name = CString::new(basename)
+            .map_err(|_| "compiler work-root name contains NUL".to_owned())?;
+        let directory = match open_directory_at(&parent, basename) {
+            Ok(directory) => directory,
+            Err(error) => {
+                let _ = remove_directory_at(&parent, &name);
+                return Err(error);
+            }
+        };
+        let metadata = match directory.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                let _ = remove_directory_at(&parent, &name);
+                return Err(format!("failed to inspect compiler work root: {error}"));
+            }
+        };
+        // SAFETY: `geteuid` has no preconditions and reads process state.
+        let effective_uid = unsafe { libc::geteuid() };
+        if metadata.uid() != effective_uid || metadata.mode() & 0o777 != 0o700 {
+            let _ = remove_directory_at(&parent, &name);
+            return Err("compiler work root is not a caller-owned 0700 directory".to_owned());
+        }
+        Ok(Self {
+            path,
+            ownership: Some(CompilerWorkRootOwnership {
+                parent,
+                directory,
+                name,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }),
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn cleanup(mut self) -> Result<(), String> {
+        self.remove_owned_directory()?;
+        self.ownership.take();
+        Ok(())
+    }
+
+    fn remove_owned_directory(&self) -> Result<(), String> {
+        let ownership = self
+            .ownership
+            .as_ref()
+            .expect("compiler work-root ownership is live");
+        let runner_root = CString::new("circuitc-ohmnivore-work").expect("literal has no NUL");
+        match remove_directory_at(&ownership.directory, &runner_root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed to remove compiler runner work directory: {error}"
+                ));
+            }
+        }
+        let current = open_directory_at(
+            &ownership.parent,
+            ownership
+                .name
+                .to_str()
+                .map_err(|_| "compiler work-root name is not UTF-8 during cleanup".to_owned())?,
+        )?;
+        let metadata = current
+            .metadata()
+            .map_err(|error| format!("failed to inspect compiler work root at cleanup: {error}"))?;
+        if metadata.dev() != ownership.device || metadata.ino() != ownership.inode {
+            return Err(
+                "compiler work-root name no longer identifies the owned directory".to_owned(),
+            );
+        }
+        remove_directory_at(&ownership.parent, &ownership.name)
+            .map_err(|error| format!("failed to remove compiler work root: {error}"))
+    }
+}
+
+impl Drop for CompilerWorkRoot {
+    fn drop(&mut self) {
+        if self.ownership.is_some() && self.remove_owned_directory().is_ok() {
+            self.ownership.take();
+        }
+    }
+}
+
+fn compile_authenticated_source(
+    source_path: &str,
+    source: String,
+) -> Result<CheckedCompiledSource, String> {
+    let work_root = CompilerWorkRoot::create()?;
+    let compiled = compile_source_checked(source_path, source, work_root.path()).map_err(|error| {
+        error
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| diagnostic.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    });
+    work_root.cleanup()?;
+    compiled
+}
+
+fn fabrication_compiler_artifacts(
+    compiled: &CheckedCompiledSource,
+) -> FabricationCompilerArtifacts<'_> {
+    if compiled.elaborated.design.analyses.is_empty()
+        && compiled.elaborated.design.board.routing_requests.is_empty()
+    {
+        FabricationCompilerArtifacts::Static(compiled.artifacts.static_artifacts())
+    } else {
+        FabricationCompilerArtifacts::Checked(&compiled.artifacts)
+    }
+}
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -136,6 +307,16 @@ fn open_directory_at(parent: &File, name: &str) -> Result<File, String> {
         ));
     }
     Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+fn remove_directory_at(parent: &File, name: &CStr) -> std::io::Result<()> {
+    // SAFETY: `parent` is a live directory descriptor, `name` is
+    // NUL-terminated, and `AT_REMOVEDIR` restricts the operation to a directory.
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 fn open_anchored_directory(path: &Path) -> Result<File, String> {
@@ -482,14 +663,8 @@ fn run_prepare(arguments: &[String]) -> Result<(), String> {
     let snapshot = read_bounded(catalog_path, MAX_FILE_BYTES)?;
     let board = String::from_utf8(read_bounded(board_path, MAX_FILE_BYTES)?)
         .map_err(|error| format!("board is not UTF-8: {error}"))?;
-    let compiled = compile_source(source_path, source).map_err(|diagnostics| {
-        diagnostics
-            .into_iter()
-            .map(|diagnostic| diagnostic.to_string())
-            .collect::<Vec<_>>()
-            .join("\n")
-    })?;
-    if compiled.artifacts.kicad_pcb != board {
+    let compiled = compile_authenticated_source(source_path, source)?;
+    if compiled.artifacts.static_artifacts().kicad_pcb != board {
         return Err("authenticated board does not match source compilation".to_owned());
     }
     let product = compile_product_artifacts(&compiled.elaborated.design, &snapshot, variant_path)
@@ -504,7 +679,7 @@ fn run_prepare(arguments: &[String]) -> Result<(), String> {
         &compiled.elaborated.design,
         &snapshot,
         variant_path,
-        FabricationCompilerArtifacts::Static(&compiled.artifacts),
+        fabrication_compiler_artifacts(&compiled),
         &product,
         ANALYSIS_PATH,
         ASSERTION_PATH,
@@ -538,14 +713,8 @@ fn run_bind(arguments: &[String]) -> Result<(), String> {
     let board = String::from_utf8(board_bytes.clone())
         .map_err(|error| format!("board is not UTF-8: {error}"))?;
     let executable = read_bounded(kicad_cli, 512 * 1024 * 1024)?;
-    let compiled = compile_source(source_path, source).map_err(|diagnostics| {
-        diagnostics
-            .into_iter()
-            .map(|diagnostic| diagnostic.to_string())
-            .collect::<Vec<_>>()
-            .join("\n")
-    })?;
-    if compiled.artifacts.kicad_pcb != board {
+    let compiled = compile_authenticated_source(source_path, source)?;
+    if compiled.artifacts.static_artifacts().kicad_pcb != board {
         return Err("authenticated board does not match source compilation".to_owned());
     }
     let product = compile_product_artifacts(&compiled.elaborated.design, &snapshot, variant_path)
@@ -560,7 +729,7 @@ fn run_bind(arguments: &[String]) -> Result<(), String> {
         &compiled.elaborated.design,
         &snapshot,
         variant_path,
-        FabricationCompilerArtifacts::Static(&compiled.artifacts),
+        fabrication_compiler_artifacts(&compiled),
         &product,
         ANALYSIS_PATH,
         ASSERTION_PATH,
@@ -654,7 +823,7 @@ fn run_bind(arguments: &[String]) -> Result<(), String> {
         &compiled.elaborated.design,
         &snapshot,
         variant_path,
-        FabricationCompilerArtifacts::Static(&compiled.artifacts),
+        fabrication_compiler_artifacts(&compiled),
         &product,
         ANALYSIS_PATH,
         ASSERTION_PATH,
@@ -667,7 +836,7 @@ fn run_bind(arguments: &[String]) -> Result<(), String> {
         &compiled.elaborated.design,
         &snapshot,
         variant_path,
-        FabricationCompilerArtifacts::Static(&compiled.artifacts),
+        fabrication_compiler_artifacts(&compiled),
         &product,
         ANALYSIS_PATH,
         ASSERTION_PATH,
