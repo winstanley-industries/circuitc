@@ -2184,7 +2184,7 @@ mod tests {
     }
 
     impl PublicationHooks for MutatePublishedTree {
-        fn after_rename(&mut self, _final_directory: &Directory) -> io::Result<()> {
+        fn after_rename(&mut self, final_directory: &Directory) -> io::Result<()> {
             let request = self.visible.join("request.json");
             match self.kind {
                 PublishedTreeMutation::WritableFile => {
@@ -2201,6 +2201,9 @@ mod tests {
                     fs::set_permissions(&self.visible, fs::Permissions::from_mode(0o500))?;
                 }
                 PublishedTreeMutation::EqualFileReplacement => {
+                    // Keep the unlinked inode live so Linux cannot immediately
+                    // reuse its identity for the replacement test file.
+                    let _original_request = final_directory.open_file(c"request.json")?;
                     fs::set_permissions(&self.visible, fs::Permissions::from_mode(0o700))?;
                     fs::remove_file(&request)?;
                     fs::write(&request, b"{\"request\":true}\n")?;
@@ -2208,6 +2211,9 @@ mod tests {
                     fs::set_permissions(&self.visible, fs::Permissions::from_mode(0o500))?;
                 }
                 PublishedTreeMutation::EqualDirectoryReplacement => {
+                    // Keep the unlinked inode live so replacement-directory
+                    // identity is distinct on every supported filesystem.
+                    let _original_artifacts = final_directory.open_child(c"artifacts")?;
                     let artifacts = self.visible.join("artifacts");
                     fs::set_permissions(&self.visible, fs::Permissions::from_mode(0o700))?;
                     fs::set_permissions(&artifacts, fs::Permissions::from_mode(0o700))?;
@@ -2314,6 +2320,9 @@ mod tests {
                     return Ok(());
                 }
                 let request = c"request.json";
+                // Retaining the removed inode prevents immediate identity
+                // reuse when this mutation runs on Linux.
+                let _original_request = staging.open_file(request)?;
                 staging.remove_file(request)?;
                 let mut replacement = staging.create_file(request)?;
                 replacement.write_all(b"replacement-residue")?;
