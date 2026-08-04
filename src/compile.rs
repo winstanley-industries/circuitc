@@ -3,6 +3,7 @@ use std::fmt;
 use std::path::Path;
 
 use crate::design::{Design, Diagnostic};
+use crate::simulation::lower;
 use crate::spice::SpiceNameMap;
 use crate::{kicad, spice};
 
@@ -117,17 +118,15 @@ pub fn compile(design: &Design) -> Result<CompiledArtifacts, CompileError> {
     design
         .validate()
         .map_err(|diagnostics| CompileError { diagnostics })?;
-    if let Some(analysis) = design
-        .analyses
-        .iter()
-        .min_by(|left, right| left.path.cmp(&right.path))
-    {
+    let simulation_inputs =
+        lower::lower_inputs(design).map_err(|diagnostics| CompileError { diagnostics })?;
+    if let Some(input) = simulation_inputs.first() {
         return Err(CompileError {
             diagnostics: vec![Diagnostic {
                 code: "CC-SIM-PHASE-001",
-                path: format!("design.analyses.{}", analysis.path),
+                path: format!("design.analyses.{}", input.analysis_path),
                 related_path: None,
-                message: "declared simulation intent cannot be compiled until deterministic per-analysis lowering and checked execution are available"
+                message: "lowered simulation inputs cannot be compiled until checked execution is available"
                     .to_owned(),
             }],
         });
@@ -245,6 +244,10 @@ mod tests {
             assert_eq!(
                 error.diagnostics[0].path,
                 "design.analyses.divider.simulation.op"
+            );
+            assert_eq!(
+                error.diagnostics[0].message,
+                "lowered simulation inputs cannot be compiled until checked execution is available"
             );
         }
     }

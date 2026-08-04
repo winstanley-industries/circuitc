@@ -55,6 +55,17 @@ ephemeral. CircuitC parses them strictly, maps results only through the
 identity map, rejects non-finite or incomplete values, and emits normalized
 contracts. Successful exit status alone is not acceptance.
 
+The pinned linear AC grid has a deterministic backend operation order, so the
+adapter can lower an exact authored frequency to its generated backend row in
+advance. Ohmnivore's transient solver is adaptive even for the initial R/Vdc
+subset, so CircuitC does not reconstruct or authenticate a nominal repeated-
+addition time axis. A transient request instead binds the direct backend-parser
+conversion of each authored exact assertion time. The runner validates the
+axis actually emitted, including exact requested-row and declared-stop
+presence, and fails closed when adaptive integration does not provide them.
+Distinct exact transient controls or assertion samples that alias at the
+`f64` boundary are rejected during lowering.
+
 ngspice is an independent numerical authority for overlapping coverage. The
 initial differential gate requires ngspice 45.2 and remains a Bazel-owned
 `local`/`manual` host gate until that executable is provisioned hermetically in
