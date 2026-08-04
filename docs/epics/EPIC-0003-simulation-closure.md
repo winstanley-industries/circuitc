@@ -1,6 +1,6 @@
 # EPIC-0003: Simulation as a checked compiler phase
 
-- Status: Planned
+- Status: Complete
 - Architecture milestone: M2
 - Depends on: EPIC-0001; selected model bindings may depend on EPIC-0002
 
@@ -42,13 +42,37 @@ when an assertion is not satisfied.
 
 ## Completion evidence
 
-The dependency-ordered implementation stack provides versioned simulation
-contracts; typed DC, linear-AC, and transient intent; deterministic lowering;
-bounded Bazel-owned Ohmnivore CPU execution; authenticated normalized results;
-checked assertions; transactional publication; and the explicit
-`//:ngspice45_differential_test` host gate. ADR-0006 records the compared signal
-inventory, axis policy, and named numerical tolerances.
+The dependency-ordered implementation stack merged through pull requests #6,
+#7, #9, #10, #12, and #13. The atomic stack merge produced `main` commit
+`36ad7a03a928e55f748a14ffea3c5cbae0cbf28c`; its tree
+`f284a4c4351be16f6c353fd3132af8dcc9c301ef` exactly matches the reviewed top
+head `c5e871f5faaaaff240385b9ebfdbccbb836ae8f2`. The merged implementation
+provides versioned simulation contracts; typed DC, linear-AC, and transient
+intent; deterministic lowering; bounded Bazel-owned Ohmnivore CPU execution;
+authenticated normalized results; checked assertions; transactional
+publication; and the explicit `//:ngspice45_differential_test` host gate.
+ADR-0006 records the compared signal inventory, axis policy, and named
+numerical tolerances.
 
-The epic remains incomplete until the stack is merged and the final
-clean-checkout Bazel, strict-lockfile, exact ngspice 45.2 host, and integration
-audit evidence is recorded here.
+A clean detached checkout of that merged `main` commit passed the following
+completion gates on macOS arm64 with Bazel 9.2.0:
+
+- `bazel lint //...`
+- `bazel build //...`
+- `bazel build --lockfile_mode=error //...`
+- uncached ordinary and strict-lockfile `bazel test //...` runs, each with all
+  12 test targets passing
+- uncached `//:ngspice_differential_unit_test`,
+  `//:ngspice_differential_process_test`, `//:checked_simulation_cli_test`, and
+  `//:ohmnivore_cpu_test`
+- `bazel mod graph --lockfile_mode=error`
+- a download-disabled strict-lockfile `bazel build //...`
+- uncached `//:ngspice45_differential_test` against ngspice 45.2
+
+The first cold local full-test attempt encountered the configured handshake
+deadline in two full-runner unit tests while the suite was under concurrent
+load. The uncached focused rerun and subsequent complete ordinary and
+strict-lockfile matrices passed; no functional mismatch reproduced. GitHub
+Actions run `30877166300`, bound to the exact merged commit, independently
+passed the Linux and workflow-security jobs. All six merged pull requests have
+zero unresolved review conversations.
