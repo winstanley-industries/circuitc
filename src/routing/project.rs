@@ -2,9 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::compile::{
-    CompiledArtifacts, KicadIdentity, RelativeArtifactPath, compile_static_validated,
-};
+use crate::compile::{CompiledArtifacts, KicadIdentity, RelativeArtifactPath, compile};
 use crate::design::{CopperLayer, PointNm, RouteSegment};
 
 use super::contract::{
@@ -96,7 +94,7 @@ pub(crate) fn project_imported_route(
         ));
     }
     let candidate = selected_candidate(imported)?;
-    let static_artifacts = compile_static_validated(&imported.design).map_err(|error| {
+    let static_artifacts = compile(&imported.design).map_err(|error| {
         error.diagnostics.into_iter().next().map_or_else(
             || projection_error("design", "KiCad projection failed without a diagnostic"),
             |diagnostic| {
@@ -224,9 +222,16 @@ fn bind_segments(
             let line = candidate.geometry[index];
             let expected_start = point_nm(line.start);
             let expected_end = point_nm(line.end);
+            let expected_layer = copper_layer(line.layer).ok_or_else(|| {
+                projection_error(
+                    &route.path,
+                    "selected APGAR primitive names an unsupported copper layer",
+                )
+            })?;
             if route.start != expected_start
                 || route.end != expected_end
                 || route.width_nm != line.width_dbu / 2
+                || route.layer != expected_layer
             {
                 return Err(projection_error(
                     &route.path,
@@ -244,6 +249,14 @@ fn bind_segments(
             Ok(projected_segment(index, route, identity))
         })
         .collect()
+}
+
+const fn copper_layer(routing_id: u32) -> Option<CopperLayer> {
+    match routing_id {
+        0 => Some(CopperLayer::Front),
+        31 => Some(CopperLayer::Back),
+        _ => None,
+    }
 }
 
 fn unique_identity<'a>(
@@ -307,7 +320,7 @@ fn projection_error(path: impl Into<String>, message: impl Into<String>) -> Cont
 #[cfg(test)]
 mod tests {
     use crate::demo;
-    use crate::design::{CopperLayer, RoutingRequest};
+    use crate::design::{CopperLayer, RoutingRequest, SimulationAnalysis, SimulationAnalysisKind};
 
     use super::super::contract::{
         AdmittedCandidate, CONTRACT_SCHEMA_VERSION, CandidateBackendKind, CandidateGeneratorKind,
@@ -467,9 +480,43 @@ mod tests {
         geometry_drift.design.board.routes[0].start.x += 1;
         assert!(project_imported_route(&geometry_drift).is_err());
 
+        let mut layer_drift = imported();
+        layer_drift.design.board.routes[0].layer = CopperLayer::Back;
+        let error = project_imported_route(&layer_drift).unwrap_err();
+        assert!(error.message.contains("selected APGAR primitive"));
+
         let mut identity_drift = imported();
         identity_drift.selected_candidate_id = "ffffffffffffffffffffffffffffffff".to_owned();
         assert!(project_imported_route(&identity_drift).is_err());
+    }
+
+    #[test]
+    fn declared_simulation_analysis_fails_closed_before_projection() {
+        let mut imported = imported();
+        imported.design.analyses.push(SimulationAnalysis {
+            path: "divider.simulation.op".to_owned(),
+            kind: SimulationAnalysisKind::DcOperatingPoint,
+        });
+        imported.design.canonicalize();
+
+        let error = project_imported_route(&imported).unwrap_err();
+        assert_eq!(error.path, "design.analyses.divider.simulation.op");
+        assert!(error.message.contains("CC-SIM-PHASE-001"));
+    }
+
+    #[test]
+    fn segment_count_and_canonical_path_drift_are_rejected() {
+        let mut missing_segment = imported();
+        missing_segment.design.board.routes.clear();
+        let error = project_imported_route(&missing_segment).unwrap_err();
+        assert_eq!(error.path, "design.board.routes");
+        assert!(error.message.contains("segment count"));
+
+        let mut path_drift = imported();
+        path_drift.design.board.routes[0].path = "board.autoroute.vout.segment.00000001".to_owned();
+        let error = project_imported_route(&path_drift).unwrap_err();
+        assert_eq!(error.path, "board.autoroute.vout.segment.00000001");
+        assert!(error.message.contains("canonical candidate ordinal"));
     }
 
     #[test]

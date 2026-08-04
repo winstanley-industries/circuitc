@@ -185,7 +185,7 @@ pub fn compile(design: &Design) -> Result<CompiledArtifacts, CompileError> {
     compile_static_validated(design)
 }
 
-pub(crate) fn compile_static_validated(design: &Design) -> Result<CompiledArtifacts, CompileError> {
+fn compile_static_validated(design: &Design) -> Result<CompiledArtifacts, CompileError> {
     if let Some(request) = design.board.routing_requests.first() {
         return Err(CompileError {
             diagnostics: vec![Diagnostic {
