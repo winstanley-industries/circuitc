@@ -12,7 +12,7 @@ lists or implementation assignments.
 | [EPIC-0000](EPIC-0000-architecture-spine.md) | Complete | M0 and M0.1 | Validated Rust/Bazel compiler spine with deterministic KiCad and SPICE backends |
 | [EPIC-0001](EPIC-0001-language-frontend.md) | Complete | M1A | File-authored CircuitC design compiled through the existing backends |
 | [EPIC-0002](EPIC-0002-kicad-project-compiler.md) | Complete | M1B | Complete, reproducible KiCad schematic, PCB, and project generation |
-| [EPIC-0003](EPIC-0003-simulation-closure.md) | Planned | M2 | Simulation models, analyses, and assertions as checked compiler phases |
+| [EPIC-0003](EPIC-0003-simulation-closure.md) | Complete | M2 | Simulation models, analyses, and assertions as checked compiler phases |
 | [EPIC-0004](EPIC-0004-apgar-routing-integration.md) | Planned | M3 | APGAR route generation imported with exact validation and provenance |
 | [EPIC-0005](EPIC-0005-product-and-manufacturing.md) | Planned | M4 | Reproducible product, BOM, fabrication, assembly, and release outputs |
 
