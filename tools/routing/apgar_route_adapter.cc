@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "apgar/board_ir/board.h"
+#include "apgar/board_ir/stable_hash.h"
 #include "apgar/candidates/route_candidate.h"
 #include "apgar/geometry_compiler/compiled_board.h"
 #include "apgar/routing/candidate_policy.h"
@@ -34,6 +35,7 @@ using apgar::board_ir::Net;
 using apgar::board_ir::Obstacle;
 using apgar::board_ir::Point64;
 using apgar::board_ir::RoutingProfile;
+using apgar::board_ir::StableHashBuilder;
 using apgar::board_ir::Terminal;
 using apgar::candidates::AdmitRouteCandidate;
 using apgar::candidates::CandidateAdmissionContext;
@@ -64,6 +66,8 @@ constexpr std::string_view kContractIdentity =
 constexpr std::string_view kToolName = "circuitc-apgar-route";
 constexpr std::string_view kToolVersion = "1";
 constexpr std::string_view kDeviceClass = "cpu-reference-v1";
+constexpr std::string_view kCompanionLayerIdentityDomain =
+    "CIRCUITC-APGAR-COMPANION-LAYER-V1";
 
 struct Invocation {
   std::string request_sha256;
@@ -171,6 +175,16 @@ void RequireKeys(const Json& value, std::initializer_list<std::string_view> keys
   RequireKeys(value, {"id", "generation"}, path);
   return EntityRef{.id = U64(value.at("id"), path),
                    .generation = U32(value.at("generation"), path)};
+}
+
+[[nodiscard]] EntityRef CompanionLayerRef(const Layer& selected,
+                                          LayerId routing_id) noexcept {
+  StableHashBuilder hash;
+  hash.AddString(kCompanionLayerIdentityDomain);
+  hash.AddU64(selected.ref.id);
+  hash.AddU32(selected.ref.generation);
+  hash.AddU32(routing_id);
+  return EntityRef{.id = hash.Finish(), .generation = 0};
 }
 
 [[nodiscard]] Point64 Point(const Json& value, std::string_view path) {
@@ -281,6 +295,20 @@ void RequireKeys(const Json& value, std::initializer_list<std::string_view> keys
         .routable = true,
     });
   }
+  if (board.layers.size() != 1U ||
+      (board.layers.front().routing_id != 0U && board.layers.front().routing_id != 31U)) {
+    throw std::runtime_error("request v1 requires exactly one front or back routing layer");
+  }
+  const Layer selected = board.layers.front();
+  const LayerId companion_routing_id = selected.routing_id == 0U ? 31U : 0U;
+  board.layers.push_back(Layer{
+      .ref = CompanionLayerRef(selected, companion_routing_id),
+      .routing_id = companion_routing_id,
+      .name = companion_routing_id == 0U ? "F.Cu" : "B.Cu",
+      .physical_order = companion_routing_id == 0U ? 0 : 1,
+      .type = apgar::board_ir::LayerType::kSignal,
+      .routable = true,
+  });
   for (const Json& item : request.at("nets")) {
     RequireKeys(item, {"reference", "name", "terminals"}, "nets[]");
     Net net{.ref = Ref(item.at("reference"), "nets[].reference"),

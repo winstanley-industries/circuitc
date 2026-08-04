@@ -40,6 +40,14 @@ vertical, or 45-degree centreline segments. Vias, arcs, multipin routing,
 multiple simultaneous routing profiles, other headings, and approximations of
 unsupported geometry or rules are rejected with machine-readable diagnostics.
 
+The request carries only that selected layer. Because the pinned APGAR M1
+Board IR validates a complete two-signal-layer stack, the process adapter
+deterministically materializes the unselected front-or-back companion layer.
+Its identity derives from the selected layer under a versioned domain, it is
+excluded from the allowed routing layers, and it participates in the APGAR
+board-content fingerprint. This adapter-owned stack context cannot authorize
+copper on the companion layer or widen the one-layer CircuitC capability.
+
 CircuitC lowers nanometres to APGAR database units with checked multiplication
 by two. Import performs the inverse check: every returned coordinate and width
 must be exactly divisible by two and must fit the Design IR envelope. No

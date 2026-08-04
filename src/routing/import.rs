@@ -29,6 +29,7 @@ const IMPORT_DESIGN: &str = "CC-ROUTE-IMPORT-009";
 
 const GEOMETRY_COMPILER_VERSION: u32 = 1;
 const NO_INCOMING_DIRECTION: u8 = 8;
+const COMPANION_LAYER_IDENTITY_DOMAIN: &str = "CIRCUITC-APGAR-COMPANION-LAYER-V1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ImportedRoute {
@@ -612,16 +613,34 @@ fn board_content_hash(request: &RouteRequestContract) -> u64 {
     hash.u64(request.board_revision);
     hash.string(&request.adapter_name);
     hash.string(&request.adapter_version);
-    let mut layers: Vec<_> = request.layers.iter().collect();
-    layers.sort_by_key(|layer| layer.routing_id);
-    hash.u64(layers.len() as u64);
-    for layer in layers {
-        hash.entity(layer.reference);
-        hash.u32(layer.routing_id);
-        hash.string(&layer.name);
-        hash.i32(layer.physical_order);
+    let selected = &request.layers[0];
+    let companion_routing_id = if selected.routing_id == 0 { 31 } else { 0 };
+    let companion_reference = companion_layer_reference(selected.reference, companion_routing_id);
+    hash.u64(2);
+    for routing_id in [0, 31] {
+        let is_selected = routing_id == selected.routing_id;
+        hash.entity(if is_selected {
+            selected.reference
+        } else {
+            companion_reference
+        });
+        hash.u32(routing_id);
+        hash.string(if is_selected {
+            selected.name.as_str()
+        } else if routing_id == 0 {
+            "F.Cu"
+        } else {
+            "B.Cu"
+        });
+        hash.i32(if is_selected {
+            selected.physical_order
+        } else if routing_id == 0 {
+            0
+        } else {
+            1
+        });
         hash.byte(0);
-        hash.boolean(layer.routable);
+        hash.boolean(true);
     }
     let mut nets: Vec<_> = request.nets.iter().collect();
     nets.sort_by_key(|net| net.reference.id);
@@ -673,6 +692,17 @@ fn board_content_hash(request: &RouteRequestContract) -> u64 {
     }
     hash.byte(heading_mask(&request.routing_profile.allowed_headings));
     hash.finish()
+}
+
+fn companion_layer_reference(selected: EntityRef, routing_id: u32) -> EntityRef {
+    let mut hash = StableHash::new();
+    hash.string(COMPANION_LAYER_IDENTITY_DOMAIN);
+    hash.entity(selected);
+    hash.u32(routing_id);
+    EntityRef {
+        id: hash.finish(),
+        generation: 0,
+    }
 }
 
 fn compiler_profile_fingerprint(request: &RouteRequestContract) -> u64 {

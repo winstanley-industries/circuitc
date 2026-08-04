@@ -78,6 +78,20 @@ impl ApgarRunner {
         })
     }
 
+    #[cfg(test)]
+    fn from_paths(
+        executable: impl Into<PathBuf>,
+        provenance: impl Into<PathBuf>,
+        work_root: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            executable: executable.into(),
+            provenance: provenance.into(),
+            work_root: work_root.into().join("circuitc-apgar-route-work"),
+            verified: Arc::new(OnceLock::new()),
+        }
+    }
+
     pub(crate) fn execute(
         &self,
         bundle: &RouteInputBundle,
@@ -439,6 +453,7 @@ fn verify_private_directory(path: &Path) -> io::Result<()> {
     }
 }
 
+#[derive(Debug)]
 struct CapturedProcess {
     status: ExitStatus,
     stdout: Vec<u8>,
@@ -530,13 +545,16 @@ fn run_process(
             }
         }
     };
-    receive_writer(&input_writer)?;
+    let write_result = receive_writer(&input_writer);
     let stdout = receive_reader(&stdout_reader, &mut child)?;
     let stderr = receive_reader(&stderr_reader, &mut child)?;
     if overflow.load(Ordering::SeqCst) {
         return Err(resource_error(
             "APGAR exceeded a bounded process output limit",
         ));
+    }
+    if status.success() {
+        write_result?;
     }
     Ok(CapturedProcess {
         status,
@@ -701,18 +719,32 @@ fn process_error(
 #[cfg(test)]
 mod tests {
     use std::env;
-    use std::path::PathBuf;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
 
     use crate::demo;
     use crate::design::{CopperLayer, RoutingRequest};
 
-    use super::super::contract::RouteOutcome;
+    use super::super::contract::{
+        BoxDbu, LinePrimitive, PointDbu, RouteFailureStatus, RouteOutcome, parse_result,
+        render_request, sha256_hex,
+    };
     use super::super::import::import_result;
-    use super::super::lower::lower_request;
-    use super::ApgarRunner;
+    use super::super::lower::{RouteInputBundle, lower_request};
+    use super::{
+        APGAR_CONTRACT_IDENTITY, APGAR_CPU_DEVICE_CLASS, APGAR_TOOL_NAME, APGAR_TOOL_VERSION,
+        ApgarRunner, PINNED_APGAR_SOURCE_REVISION, PROCESS_EXIT, PROCESS_IDENTITY, PROCESS_OUTPUT,
+        PROCESS_RESOURCE, PROVENANCE_HEADER, ScopedWorkDirectory, WORK_SEQUENCE, run_process,
+    };
 
-    #[test]
-    fn pinned_real_cpu_adapter_repeats_and_imports_exactly() {
+    const MM_DBU: i64 = 2_000_000;
+
+    fn routing_design() -> crate::design::Design {
         let mut design = demo::voltage_divider();
         design.board.routes.clear();
         design.board.routing_requests.push(RoutingRequest {
@@ -724,11 +756,82 @@ mod tests {
             layer: CopperLayer::Front,
         });
         design.canonicalize();
-        let bundle = lower_request(&design).unwrap().unwrap();
-        let work_root = env::var_os("TEST_TMPDIR")
+        design
+    }
+
+    fn test_root(label: &str) -> PathBuf {
+        env::var_os("TEST_TMPDIR")
             .map(PathBuf::from)
             .unwrap_or_else(env::temp_dir)
-            .join("circuitc-apgar-real-gate");
+            .join(format!(
+                "circuitc-apgar-{label}-{}-{}",
+                std::process::id(),
+                WORK_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ))
+    }
+
+    fn geometric_bundle(
+        start: PointDbu,
+        goal: PointDbu,
+        obstacle: Option<BoxDbu>,
+    ) -> RouteInputBundle {
+        let mut bundle = lower_request(&routing_design()).unwrap().unwrap();
+        let request = &mut bundle.request;
+        let mut obstacle_template = request.obstacles[0].clone();
+        request.obstacles.clear();
+
+        let roi = BoxDbu {
+            min: PointDbu { x: 0, y: 0 },
+            max: PointDbu {
+                x: 20 * MM_DBU,
+                y: 20 * MM_DBU,
+            },
+        };
+        request.compiler_profile.lattice_origin = roi.min;
+        request.compiler_profile.lattice_step_dbu = MM_DBU;
+        request.compiler_profile.compilation_roi = roi;
+        request.compiler_profile.active_regions[0].bounds = roi;
+        request.planar_route.start = start;
+        request.planar_route.goal = goal;
+        for (terminal, center) in request.terminals.iter_mut().zip([start, goal]) {
+            terminal.center = center;
+            terminal.connection_region = BoxDbu {
+                min: PointDbu {
+                    x: center.x - 500_000,
+                    y: center.y - 500_000,
+                },
+                max: PointDbu {
+                    x: center.x + 500_000,
+                    y: center.y + 500_000,
+                },
+            };
+        }
+        if let Some(bounds) = obstacle {
+            obstacle_template.bounds = bounds;
+            obstacle_template.owner_net = None;
+            obstacle_template.provenance = "runner.real-adapter.obstacle".to_owned();
+            request.obstacles.push(obstacle_template);
+        }
+        request.validate().unwrap();
+        bundle.request_json = render_request(request).unwrap();
+        bundle.request_sha256 = sha256_hex(bundle.request_json.as_bytes());
+        bundle
+    }
+
+    fn completed_geometry(result_json: &str) -> Vec<LinePrimitive> {
+        let result = parse_result(result_json).unwrap();
+        let RouteOutcome::Completed { candidates, .. } = result.outcome else {
+            panic!("real APGAR CPU adapter returned a failure result")
+        };
+        assert_eq!(candidates.len(), 1);
+        candidates[0].geometry.clone()
+    }
+
+    #[test]
+    fn pinned_real_cpu_adapter_repeats_and_imports_exactly() {
+        let design = routing_design();
+        let bundle = lower_request(&design).unwrap().unwrap();
+        let work_root = test_root("real-repeat");
         let runner = ApgarRunner::from_bazel_runfiles(work_root).unwrap();
         let first = runner.execute(&bundle).unwrap();
         let second = runner.execute(&bundle).unwrap();
@@ -739,5 +842,182 @@ mod tests {
             panic!("real APGAR CPU adapter returned a failure result")
         };
         assert_eq!(candidates.len(), 1);
+    }
+
+    #[test]
+    fn pinned_real_cpu_adapter_covers_vertical_diagonal_detour_and_no_route() {
+        let runner = ApgarRunner::from_bazel_runfiles(test_root("real-shapes")).unwrap();
+
+        let vertical = geometric_bundle(
+            PointDbu {
+                x: 10 * MM_DBU,
+                y: 4 * MM_DBU,
+            },
+            PointDbu {
+                x: 10 * MM_DBU,
+                y: 16 * MM_DBU,
+            },
+            None,
+        );
+        let vertical = completed_geometry(&runner.execute(&vertical).unwrap().result_json);
+        assert_eq!(vertical.len(), 1);
+        assert_eq!(vertical[0].start.x, vertical[0].end.x);
+
+        let diagonal = geometric_bundle(
+            PointDbu {
+                x: 4 * MM_DBU,
+                y: 4 * MM_DBU,
+            },
+            PointDbu {
+                x: 16 * MM_DBU,
+                y: 16 * MM_DBU,
+            },
+            None,
+        );
+        let diagonal = completed_geometry(&runner.execute(&diagonal).unwrap().result_json);
+        assert_eq!(diagonal.len(), 1);
+        assert_eq!(
+            (diagonal[0].end.x - diagonal[0].start.x).unsigned_abs(),
+            (diagonal[0].end.y - diagonal[0].start.y).unsigned_abs()
+        );
+
+        let detour = geometric_bundle(
+            PointDbu {
+                x: 4 * MM_DBU,
+                y: 10 * MM_DBU,
+            },
+            PointDbu {
+                x: 16 * MM_DBU,
+                y: 10 * MM_DBU,
+            },
+            Some(BoxDbu {
+                min: PointDbu {
+                    x: 8 * MM_DBU,
+                    y: 8 * MM_DBU,
+                },
+                max: PointDbu {
+                    x: 12 * MM_DBU,
+                    y: 12 * MM_DBU,
+                },
+            }),
+        );
+        let detour = completed_geometry(&runner.execute(&detour).unwrap().result_json);
+        assert!(detour.len() > 1, "obstacle must force a multi-line route");
+
+        let blocked = geometric_bundle(
+            PointDbu {
+                x: 4 * MM_DBU,
+                y: 10 * MM_DBU,
+            },
+            PointDbu {
+                x: 16 * MM_DBU,
+                y: 10 * MM_DBU,
+            },
+            Some(BoxDbu {
+                min: PointDbu {
+                    x: 8 * MM_DBU,
+                    y: 0,
+                },
+                max: PointDbu {
+                    x: 12 * MM_DBU,
+                    y: 20 * MM_DBU,
+                },
+            }),
+        );
+        let blocked = parse_result(&runner.execute(&blocked).unwrap().result_json).unwrap();
+        let RouteOutcome::Failure { status, .. } = blocked.outcome else {
+            panic!("full-height obstacle unexpectedly admitted a route")
+        };
+        assert_eq!(status, RouteFailureStatus::RouteNotFound);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_capture_preserves_exit_and_enforces_timeout_and_output_bound() {
+        let root = test_root("process-capture");
+        let directory = ScopedWorkDirectory::create(&root).unwrap();
+        let large_input = vec![b'x'; 8 * 1024 * 1024];
+        let exited = run_process(
+            Path::new("/bin/sh"),
+            directory.path(),
+            &[OsString::from("-c"), OsString::from("exit 7")],
+            &large_input,
+            Duration::from_secs(2),
+            128,
+            128,
+        )
+        .unwrap();
+        assert_eq!(exited.status.code(), Some(7));
+
+        let timeout = run_process(
+            Path::new("/bin/sh"),
+            directory.path(),
+            &[OsString::from("-c"), OsString::from("/bin/sleep 2")],
+            b"",
+            Duration::from_millis(50),
+            128,
+            128,
+        )
+        .unwrap_err();
+        assert_eq!(timeout.code, PROCESS_RESOURCE);
+
+        let overflow = run_process(
+            Path::new("/bin/sh"),
+            directory.path(),
+            &[
+                OsString::from("-c"),
+                OsString::from("while :; do printf 12345678901234567890; done"),
+            ],
+            b"",
+            Duration::from_secs(2),
+            128,
+            128,
+        )
+        .unwrap_err();
+        assert_eq!(overflow.code, PROCESS_RESOURCE);
+        directory.cleanup().unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_runner_rejects_exit_malformed_output_and_provenance_drift() {
+        let bundle = lower_request(&routing_design()).unwrap().unwrap();
+        for (label, body, expected_code) in [
+            ("nonzero", "exit 7", PROCESS_EXIT),
+            ("malformed", "printf not-json", PROCESS_OUTPUT),
+        ] {
+            let (runner, root) = fake_runner(label, body, false);
+            let error = runner.execute(&bundle).unwrap_err();
+            assert_eq!(error.code, expected_code);
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        let (runner, root) = fake_runner("provenance", "exit 99", true);
+        let error = runner.execute(&bundle).unwrap_err();
+        assert_eq!(error.code, PROCESS_IDENTITY);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn fake_runner(label: &str, body: &str, corrupt_provenance: bool) -> (ApgarRunner, PathBuf) {
+        let root = test_root(label);
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("fake-apgar-route");
+        let provenance = root.join("provenance.txt");
+        fs::write(&executable, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let executable_sha256 = sha256_hex(&fs::read(&executable).unwrap());
+        let mut provenance_text = format!(
+            "{PROVENANCE_HEADER}\nname={APGAR_TOOL_NAME}\nversion={APGAR_TOOL_VERSION}\ncontract={APGAR_CONTRACT_IDENTITY}\nsource_revision={PINNED_APGAR_SOURCE_REVISION}\nexecutable_sha256={executable_sha256}\ndevice_class={APGAR_CPU_DEVICE_CLASS}\n"
+        );
+        if corrupt_provenance {
+            provenance_text.push_str("unexpected=true\n");
+        }
+        fs::write(&provenance, provenance_text).unwrap();
+        (
+            ApgarRunner::from_paths(&executable, &provenance, &root),
+            root,
+        )
     }
 }
