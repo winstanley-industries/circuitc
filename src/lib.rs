@@ -12,6 +12,7 @@ pub mod design;
 pub mod frontend;
 mod kicad;
 mod library;
+pub mod product;
 pub mod quantity;
 pub(crate) mod routing;
 pub mod simulation;

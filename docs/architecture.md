@@ -61,10 +61,12 @@ cannot represent; it may not silently discard or reinterpret them.
 8. CircuitC source and canonical Design IR own product policy, approved
    substitutions, variants, population state, configuration, and requested
    manufacturability assertions.
-9. A checksum-pinned catalog snapshot owns only its point-in-time remote
-   observations. It may prove or fail authored constraints, but it may not add
-   product intent, select an unapproved substitute, or become a build-time
-   network dependency.
+9. A strict checksum-pinned catalog snapshot owns only its point-in-time remote
+   observations and authored validity interval. The offline resolver
+   authenticates its exact canonical bytes, joins exact part identities, and
+   may prove or fail authored function, value, package, lifecycle, and sourcing
+   constraints. It may not add product intent, select an unapproved substitute,
+   consult the host clock, or become a build-time network dependency.
 
 Edits made only to generated KiCad files are not round-tripped. Code-authored
 placement and routing belong in CircuitC source. A future importer may help
@@ -225,6 +227,16 @@ Production builds are offline and hermetic:
 - remote catalog search may assist authoring, but a build consumes only an
   explicitly named checksum-pinned snapshot evaluated on an authored date.
 
+The v1 product-catalog snapshot is strict compact canonical JSON with an exact
+byte digest, observation and validity dates, raw-source traceability, exact
+typed values, lifecycle observations, and regional quantity/lead-time
+observations. Resolution is offline and all-or-nothing: every primary part and
+approved alternate must resolve exactly and satisfy the source-authored
+function, value, package, lifecycle, region, quantity, and lead-time policy.
+The snapshot URI and raw-source digest are traceability fields, not permission
+to fetch during a build and not independent proof of upstream truth when the
+raw bytes are absent.
+
 Virtual parts retain logical function and omit every physical product field.
 Every design containing a physical component carries one catalog-evidence
 reference and at least one explicit product variant. Variants assign exactly
@@ -239,6 +251,9 @@ evidence, and release-manifest closure remain separate compiled boundaries and
 require later accepted decisions before CircuitC can claim a release.
 The authority and initial field-level contract are recorded in
 [ADR-0008](adr/0008-product-intent-and-pinned-catalog-evidence.md).
+The strict snapshot and offline resolution contract are recorded in
+[ADR-0009](adr/0009-strict-offline-product-catalog-snapshot.md) and
+[`schemas/product_catalog_snapshot/v1.md`](../schemas/product_catalog_snapshot/v1.md).
 
 This directly avoids hosted-backend availability becoming a build dependency.
 

@@ -22,7 +22,7 @@ trace every artifact back to source, constraints, and toolchains.
 | `CC-REQ-PROD-006` | A release manifest binds source identity, Design IR identity, generated artifacts, backend versions, validation reports, and checksums. |
 | `CC-REQ-PROD-007` | Release generation fails on stale, inconsistent, unsupported, or unvalidated product and manufacturing intent. |
 
-## Initial capability boundary
+## Layer 1: authored product-intent boundary
 
 [ADR-0008](../adr/0008-product-intent-and-pinned-catalog-evidence.md) defines
 the first product-intent boundary while this epic remains Planned. The active
@@ -70,12 +70,44 @@ fail-closed preflight checks. Oversized intent is rejected before expanded
 membership, totality, per-entry semantic, or cross-entry validation and is
 never truncated or partially accepted.
 
-This capability boundary establishes authored intent only. Catalog snapshot
-bytes and verification, BOM/placement/assembly schemas, fabrication export,
-normalized KiCad manufacturing results and reports, release-manifest closure,
-and transactional release publication require later implementation layers and
-ADRs. Parsing, elaboration, and Design IR validation of these forms are not
-manufacturing execution or completion evidence for this epic.
+This capability boundary establishes authored intent only. Parsing,
+elaboration, and Design IR validation of these forms are not manufacturing
+execution or completion evidence for this epic.
+
+## Layer 2: strict offline catalog evidence
+
+[ADR-0009](../adr/0009-strict-offline-product-catalog-snapshot.md) and the
+[`circuitc.product_catalog_snapshot` v1 schema](../../schemas/product_catalog_snapshot/v1.md)
+define the catalog-evidence boundary:
+
+- The snapshot is strict canonical compact JSON plus one final LF, limited to
+  64 MiB, 10,000 sorted unique part records, and 10,000 aggregate sorted unique
+  regional observations. Unknown, missing, duplicate, reordered, or otherwise
+  non-canonical fields or bytes are invalid.
+- Its header binds snapshot identity, a real inclusive observation/validity
+  date interval, a narrow canonical ASCII HTTPS source URI, and a lowercase
+  raw-source SHA-256. URI and raw digest provide traceability only; resolution
+  neither fetches the URI nor claims upstream authenticity without separately
+  retained raw bytes.
+- Each record binds an exact logical function, manufacturer, manufacturer part
+  number, package, canonical typed resistance or DC-voltage value, observed
+  lifecycle, and exact regional quantity/lead-time observations.
+- The resolver authenticates the complete snapshot bytes and ID against Design
+  IR, checks the authored evaluation date inside the inclusive interval, and
+  resolves every primary and approved alternate exactly. Function, package,
+  value, lifecycle, required region, minimum quantity, and maximum lead time
+  must all satisfy authored intent.
+- Resolution preflights at most 10,000 aggregate primary and alternate
+  identities, indexes the validated snapshot once, and visits semantic
+  identities in canonical order rather than caller order.
+- Verification and resolution are offline, deterministic, fail with stable
+  diagnostics, and return no partial result.
+
+Layer 2 exposes verification and resolution only. BOM, placement, assembly,
+fabrication export, normalized KiCad manufacturing results and reports,
+release-manifest closure, and transactional release publication remain later
+implementation layers requiring their own accepted contracts. Layer-2 parsing
+or resolution is not manufacturing execution or completion evidence.
 
 ## Non-goals
 

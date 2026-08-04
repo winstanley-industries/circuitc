@@ -2067,7 +2067,7 @@ mod tests {
         );
         assert!(!compiled.artifacts.spice.contains("R1 "));
         assert!(compiled.artifacts.spice.contains("V1 TEST 0 DC 1"));
-        assert!(compiled.artifacts.spice.contains("R2 TEST 0 1e3"));
+        assert!(compiled.artifacts.spice.contains("R2 TEST 0 10e3"));
         assert_eq!(
             compiled
                 .artifacts

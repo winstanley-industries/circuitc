@@ -3196,7 +3196,7 @@ mod tests {
             .catalog
             .as_ref()
             .expect("physical reference design carries pinned catalog evidence");
-        assert_eq!(catalog.snapshot_id, "layer1-contract-fixture");
+        assert_eq!(catalog.snapshot_id, "reference-catalog-2026-08-04");
         assert_eq!(catalog.evaluated_on, "2026-08-04");
         assert_eq!(product.variants.len(), 2);
         let alternate = product
@@ -3382,7 +3382,7 @@ mod tests {
     #[test]
     fn design_product_validation_maps_back_to_authored_declarations() {
         let invalid_digest = REFERENCE.replacen(
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "1631bcee4da9ee39aa8af85f1f80c79331b22bff390a15d4e02b7e3decc2c69e",
             "ABC",
             1,
         );
@@ -5020,14 +5020,14 @@ i10-main.circuitc:67:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
                 "design.analyses.sim.ac.stop_frequency",
                 "9007199254740993 Hz",
                 "9007199254740992 Hz",
-                r###"schedule.circuitc:101:125: CC-SIM-LOWER-002 [design.analyses.sim.ac.stop_frequency]: distinct exact AC sweep endpoints collapse or reverse at the backend f64 boundary (bytes 3311..3330)
-  related schedule.circuitc:101:90: related entity `design.analyses.sim.ac.start_frequency` is here (bytes 3276..3295)"###,
+                r###"schedule.circuitc:101:125: CC-SIM-LOWER-002 [design.analyses.sim.ac.stop_frequency]: distinct exact AC sweep endpoints collapse or reverse at the backend f64 boundary (bytes 3316..3335)
+  related schedule.circuitc:101:90: related entity `design.analyses.sim.ac.start_frequency` is here (bytes 3281..3300)"###,
                 r###"[
   {
     "code": "CC-SIM-LOWER-002",
     "filename": "schedule.circuitc",
-    "start": 3311,
-    "end": 3330,
+    "start": 3316,
+    "end": 3335,
     "line": 101,
     "column": 125,
     "semantic_path": "design.analyses.sim.ac.stop_frequency",
@@ -5035,8 +5035,8 @@ i10-main.circuitc:67:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
     "related": [
       {
         "filename": "schedule.circuitc",
-        "start": 3276,
-        "end": 3295,
+        "start": 3281,
+        "end": 3300,
         "line": 101,
         "column": 90,
         "message": "related entity `design.analyses.sim.ac.start_frequency` is here"
@@ -5051,14 +5051,14 @@ i10-main.circuitc:67:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
                 "design.analyses.sim.tran.stop",
                 "9007199254740993 s",
                 "9007199254740992 s",
-                r###"schedule.circuitc:101:60: CC-SIM-LOWER-002 [design.analyses.sim.tran.stop]: distinct exact transient controls collapse to one value at the backend f64 boundary (bytes 3246..3264)
-  related schedule.circuitc:101:36: related entity `design.analyses.sim.tran.step` is here (bytes 3222..3240)"###,
+                r###"schedule.circuitc:101:60: CC-SIM-LOWER-002 [design.analyses.sim.tran.stop]: distinct exact transient controls collapse to one value at the backend f64 boundary (bytes 3251..3269)
+  related schedule.circuitc:101:36: related entity `design.analyses.sim.tran.step` is here (bytes 3227..3245)"###,
                 r###"[
   {
     "code": "CC-SIM-LOWER-002",
     "filename": "schedule.circuitc",
-    "start": 3246,
-    "end": 3264,
+    "start": 3251,
+    "end": 3269,
     "line": 101,
     "column": 60,
     "semantic_path": "design.analyses.sim.tran.stop",
@@ -5066,8 +5066,8 @@ i10-main.circuitc:67:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
     "related": [
       {
         "filename": "schedule.circuitc",
-        "start": 3222,
-        "end": 3240,
+        "start": 3227,
+        "end": 3245,
         "line": 101,
         "column": 36,
         "message": "related entity `design.analyses.sim.tran.step` is here"
@@ -5082,14 +5082,14 @@ i10-main.circuitc:67:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
                 "design.analyses.sim.ac.points",
                 "3",
                 "9007199254740992 Hz",
-                r###"schedule.circuitc:101:72: CC-SIM-LOWER-002 [design.analyses.sim.ac.points]: the pinned backend AC schedule is non-finite, duplicate, or non-increasing (bytes 3258..3259)
-  related schedule.circuitc:101:90: related entity `design.analyses.sim.ac.start_frequency` is here (bytes 3276..3295)"###,
+                r###"schedule.circuitc:101:72: CC-SIM-LOWER-002 [design.analyses.sim.ac.points]: the pinned backend AC schedule is non-finite, duplicate, or non-increasing (bytes 3263..3264)
+  related schedule.circuitc:101:90: related entity `design.analyses.sim.ac.start_frequency` is here (bytes 3281..3300)"###,
                 r###"[
   {
     "code": "CC-SIM-LOWER-002",
     "filename": "schedule.circuitc",
-    "start": 3258,
-    "end": 3259,
+    "start": 3263,
+    "end": 3264,
     "line": 101,
     "column": 72,
     "semantic_path": "design.analyses.sim.ac.points",
@@ -5097,8 +5097,8 @@ i10-main.circuitc:67:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
     "related": [
       {
         "filename": "schedule.circuitc",
-        "start": 3276,
-        "end": 3295,
+        "start": 3281,
+        "end": 3300,
         "line": 101,
         "column": 90,
         "message": "related entity `design.analyses.sim.ac.start_frequency` is here"
@@ -5155,8 +5155,8 @@ i10-main.circuitc:67:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
                 &diagnostics,
                 crate::frontend::DiagnosticFormat::Human,
             ),
-            r###"sample-collapse.circuitc:102:72: CC-SIM-LOWER-003 [design.assertions.checks.multiple.sample]: distinct exact transient assertion or control times collapse to one value at the backend f64 boundary (bytes 3357..3380)
-  related sample-collapse.circuitc:101:60: related entity `design.analyses.sim.tran.stop` is here (bytes 3246..3264)"###
+            r###"sample-collapse.circuitc:102:72: CC-SIM-LOWER-003 [design.assertions.checks.multiple.sample]: distinct exact transient assertion or control times collapse to one value at the backend f64 boundary (bytes 3362..3385)
+  related sample-collapse.circuitc:101:60: related entity `design.analyses.sim.tran.stop` is here (bytes 3251..3269)"###
         );
         assert_eq!(
             crate::frontend::render_diagnostics(
@@ -5167,8 +5167,8 @@ i10-main.circuitc:67:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
   {
     "code": "CC-SIM-LOWER-003",
     "filename": "sample-collapse.circuitc",
-    "start": 3357,
-    "end": 3380,
+    "start": 3362,
+    "end": 3385,
     "line": 102,
     "column": 72,
     "semantic_path": "design.assertions.checks.multiple.sample",
@@ -5176,8 +5176,8 @@ i10-main.circuitc:67:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
     "related": [
       {
         "filename": "sample-collapse.circuitc",
-        "start": 3246,
-        "end": 3264,
+        "start": 3251,
+        "end": 3269,
         "line": 101,
         "column": 60,
         "message": "related entity `design.analyses.sim.tran.stop` is here"
@@ -5211,7 +5211,7 @@ i10-main.circuitc:67:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
                 &diagnostics,
                 crate::frontend::DiagnosticFormat::Human,
             ),
-            r###"resource.circuitc:101:3: CC-SIM-LOWER-005 [design.analyses]: deterministic simulation inputs exceed the 0-byte aggregate generated-artifact budget (bytes 3189..3224)"###
+            r###"resource.circuitc:101:3: CC-SIM-LOWER-005 [design.analyses]: deterministic simulation inputs exceed the 0-byte aggregate generated-artifact budget (bytes 3194..3229)"###
         );
         assert_eq!(
             crate::frontend::render_diagnostics(
@@ -5222,8 +5222,8 @@ i10-main.circuitc:67:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
   {
     "code": "CC-SIM-LOWER-005",
     "filename": "resource.circuitc",
-    "start": 3189,
-    "end": 3224,
+    "start": 3194,
+    "end": 3229,
     "line": 101,
     "column": 3,
     "semantic_path": "design.analyses",

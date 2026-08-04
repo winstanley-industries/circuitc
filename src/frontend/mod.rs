@@ -306,7 +306,7 @@ mod tests {
     connect p N;
     connect n GND;
   }
-  catalog_snapshot "layer1-contract-fixture" sha256 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" evaluated_on "2026-08-04";
+  catalog_snapshot "reference-catalog-2026-08-04" sha256 "1631bcee4da9ee39aa8af85f1f80c79331b22bff390a15d4e02b7e3decc2c69e" evaluated_on "2026-08-04";
   variant production build_quantity 1 {
     fit root.x;
   }
@@ -362,7 +362,7 @@ mod tests {
                     "      bind 2 2;\n",
                     "    }\n",
                     "  }\n",
-                    "  catalog_snapshot \"layer1-contract-fixture\" sha256 \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\" evaluated_on \"2026-08-04\";\n",
+                    "  catalog_snapshot \"reference-catalog-2026-08-04\" sha256 \"1631bcee4da9ee39aa8af85f1f80c79331b22bff390a15d4e02b7e3decc2c69e\" evaluated_on \"2026-08-04\";\n",
                     "  variant production build_quantity 1 {\n",
                     "    fit root.r;\n",
                     "  }\n",

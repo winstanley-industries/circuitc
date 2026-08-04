@@ -160,6 +160,17 @@ is authored input: validation and future freshness policy may not consult the
 host clock. The snapshot declaration binds future pinned evidence but does not
 perform a network lookup or embed remote observations in Design IR.
 
+The declaration resolves only against a separately supplied strict
+`circuitc.product_catalog_snapshot` v1 artifact. CircuitC authenticates the
+artifact's exact canonical compact-JSON bytes, including its final LF, against
+the declared SHA-256 and requires the snapshot IDs to match. The authored
+`evaluated_on` date must fall within the snapshot's inclusive observation
+validity interval. Every primary physical part and approved alternate must
+then resolve exactly and satisfy the component's logical function, package,
+typed value, lifecycle requirement, required region, minimum quantity, and
+maximum lead time. Resolution is offline and all-or-nothing. It does not emit
+a BOM, manufacturing artifact, analysis result, release manifest, or release.
+
 Every variant path is unique and its build quantity is a positive `u64`.
 Exactly one `component` item names every physical component and no item names a
 virtual component. `fitted` selects the primary part, `not_fitted` excludes it,
