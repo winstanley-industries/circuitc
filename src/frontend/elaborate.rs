@@ -4107,10 +4107,16 @@ mod tests {
 
     #[test]
     fn reports_duplicate_catalog_snapshots_with_related_location() {
-        const CATALOG: &str = "catalog_snapshot \"layer1-contract-fixture\" sha256 \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\" evaluated_on \"2026-08-04\";";
-        let source = REFERENCE.replacen(CATALOG, &format!("{CATALOG}\n  {CATALOG}"), 1);
-        let first_start = source.find(CATALOG).expect("first catalog exists");
-        let duplicate_start = source.rfind(CATALOG).expect("duplicate catalog exists");
+        let first_start = REFERENCE
+            .find("catalog_snapshot ")
+            .expect("catalog declaration exists");
+        let declaration_end = REFERENCE[first_start..]
+            .find(';')
+            .map(|offset| first_start + offset + 1)
+            .expect("catalog declaration ends");
+        let declaration = &REFERENCE[first_start..declaration_end];
+        let source = REFERENCE.replacen(declaration, &format!("{declaration}\n  {declaration}"), 1);
+        let duplicate_start = source.rfind(declaration).expect("duplicate catalog exists");
         let diagnostics = elaborate_source(&source).expect_err("duplicate catalog must fail");
         let duplicate = diagnostics
             .iter()
@@ -4122,13 +4128,13 @@ mod tests {
             "catalog snapshot is declared more than once"
         );
         assert_eq!(duplicate.start, duplicate_start);
-        assert_eq!(&source[duplicate.start..duplicate.end], CATALOG);
+        assert_eq!(&source[duplicate.start..duplicate.end], declaration);
         assert_eq!(duplicate.related.len(), 1);
         assert_eq!(duplicate.related[0].start, first_start);
-        assert_eq!(duplicate.related[0].end, first_start + CATALOG.len());
+        assert_eq!(duplicate.related[0].end, declaration_end);
         assert_eq!(
             &source[duplicate.related[0].start..duplicate.related[0].end],
-            CATALOG
+            declaration
         );
         assert_eq!(duplicate.related[0].message, "first declaration is here");
     }
