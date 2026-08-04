@@ -498,10 +498,18 @@ void ValidateRequest(const Json& request, const std::string& input) {
 [[nodiscard]] Json Failure(const Json& request, const Invocation& invocation,
                            std::string_view status, std::string_view code,
                            std::string_view message) {
+  const std::string& path = request.at("request_path").get_ref<const std::string&>();
+  const std::uint64_t diagnostic_limit =
+      U64(request.at("resource_limits").at("diagnostic_bytes"),
+          "resource_limits.diagnostic_bytes");
+  if (code.size() > diagnostic_limit || path.size() > diagnostic_limit - code.size() ||
+      message.size() > diagnostic_limit - code.size() - path.size()) {
+    throw std::runtime_error("normalized diagnostic exceeds its authenticated byte limit");
+  }
   Json result = ResultRoot(request, invocation);
   Json diagnostic = Json::object();
   diagnostic["code"] = code;
-  diagnostic["path"] = request.at("request_path");
+  diagnostic["path"] = path;
   diagnostic["message"] = message;
   Json outcome = Json::object();
   outcome["kind"] = "failure";

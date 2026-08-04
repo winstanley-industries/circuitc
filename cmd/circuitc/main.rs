@@ -69,6 +69,22 @@ fn run(arguments: Vec<OsString>) -> Result<(), u8> {
                 &compiled.artifacts.static_artifacts,
                 &compiled.kicad_identity_map,
             );
+            if let Some(routing) = &compiled.artifacts.routing {
+                append_routing_output_chain(
+                    &mut outputs,
+                    [
+                        (
+                            routing.request_path.as_str(),
+                            routing.request_json.as_bytes(),
+                        ),
+                        (routing.result_path.as_str(), routing.result_json.as_bytes()),
+                        (
+                            routing.projection_path.as_str(),
+                            routing.projection_json.as_bytes(),
+                        ),
+                    ],
+                );
+            }
             for simulation in &compiled.artifacts.simulations {
                 append_simulation_output_chain(
                     &mut outputs,
@@ -198,6 +214,17 @@ fn append_static_outputs<'a>(
 fn append_simulation_output_chain<'a>(
     outputs: &mut Vec<(String, &'a [u8])>,
     chain: [(&str, &'a [u8]); 5],
+) {
+    outputs.extend(
+        chain
+            .into_iter()
+            .map(|(path, contents)| (path.to_owned(), contents)),
+    );
+}
+
+fn append_routing_output_chain<'a>(
+    outputs: &mut Vec<(String, &'a [u8])>,
+    chain: [(&str, &'a [u8]); 3],
 ) {
     outputs.extend(
         chain

@@ -19,7 +19,9 @@ use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt as _;
 
-use super::contract::{ContractDiagnostic, MAX_CONTRACT_BYTES, ToolIdentity, parse_result};
+use super::contract::{
+    ContractDiagnostic, MAX_CONTRACT_BYTES, RouteOutcome, ToolIdentity, parse_result,
+};
 use super::import::expected_cpu_tool;
 use super::lower::RouteInputBundle;
 use super::{
@@ -73,7 +75,7 @@ impl ApgarRunner {
         Ok(Self {
             executable: resolve_bazel_runfile(EXECUTABLE_RUNFILE)?,
             provenance: resolve_bazel_runfile(PROVENANCE_RUNFILE)?,
-            work_root: work_root.into().join("circuitc-apgar-route-work"),
+            work_root: work_root.into(),
             verified: Arc::new(OnceLock::new()),
         })
     }
@@ -178,6 +180,22 @@ impl ApgarRunner {
                 ),
             )
         })?;
+        if let RouteOutcome::Failure { diagnostic, .. } = &result.outcome {
+            let diagnostic_bytes = diagnostic
+                .code
+                .len()
+                .checked_add(diagnostic.path.len())
+                .and_then(|bytes| bytes.checked_add(diagnostic.message.len()));
+            let diagnostic_limit = usize::try_from(bundle.request.resource_limits.diagnostic_bytes)
+                .unwrap_or(usize::MAX);
+            if diagnostic_bytes.is_none_or(|bytes| bytes > diagnostic_limit) {
+                return Err(process_error(
+                    PROCESS_RESOURCE,
+                    &bundle.request.request_path,
+                    "APGAR normalized diagnostic exceeded its authenticated byte limit",
+                ));
+            }
+        }
         if result.tool != verified.tool {
             return Err(process_error(
                 PROCESS_IDENTITY,
@@ -744,16 +762,21 @@ mod tests {
 
     const MM_DBU: i64 = 2_000_000;
 
-    fn routing_design() -> crate::design::Design {
+    fn routing_design(layer: CopperLayer, clearance_nm: i64) -> crate::design::Design {
         let mut design = demo::voltage_divider();
         design.board.routes.clear();
+        for component in &mut design.components {
+            if let Some(physical) = &mut component.physical {
+                physical.placement.layer = layer;
+            }
+        }
         design.board.routing_requests.push(RoutingRequest {
             path: "board.autoroute.vout".to_owned(),
             net: "VOUT".to_owned(),
             width_nm: 250_000,
-            clearance_nm: 200_000,
+            clearance_nm,
             grid_step_nm: 1_000_000,
-            layer: CopperLayer::Front,
+            layer,
         });
         design.canonicalize();
         design
@@ -775,7 +798,10 @@ mod tests {
         goal: PointDbu,
         obstacle: Option<BoxDbu>,
     ) -> RouteInputBundle {
-        let mut bundle = lower_request(&routing_design()).unwrap().unwrap();
+        let mut bundle =
+            lower_request(&routing_design(CopperLayer::Front, 200_000))
+                .unwrap()
+                .unwrap();
         let request = &mut bundle.request;
         let mut obstacle_template = request.obstacles[0].clone();
         request.obstacles.clear();
@@ -828,20 +854,51 @@ mod tests {
     }
 
     #[test]
-    fn pinned_real_cpu_adapter_repeats_and_imports_exactly() {
-        let design = routing_design();
+    fn pinned_real_cpu_adapter_repeats_and_imports_front_and_back_exactly() {
+        for layer in [CopperLayer::Front, CopperLayer::Back] {
+            let design = routing_design(layer, 200_000);
+            let bundle = lower_request(&design).unwrap().unwrap();
+            let runner = ApgarRunner::from_bazel_runfiles(test_root(match layer {
+                CopperLayer::Front => "front",
+                CopperLayer::Back => "back",
+            }))
+            .unwrap();
+            let first = runner.execute(&bundle).unwrap();
+            let second = runner.execute(&bundle).unwrap();
+            assert_eq!(first, second);
+            let imported =
+                import_result(&design, &bundle, &first.result_json, &first.tool).unwrap();
+            assert!(imported.design.board.routing_requests.is_empty());
+            assert!(
+                imported
+                    .design
+                    .board
+                    .routes
+                    .iter()
+                    .all(|route| route.layer == layer)
+            );
+            let RouteOutcome::Completed { candidates, .. } = imported.result.outcome else {
+                panic!("real APGAR CPU adapter returned a failure result")
+            };
+            assert_eq!(candidates.len(), 1);
+        }
+    }
+
+    #[test]
+    fn pinned_real_cpu_adapter_returns_canonical_no_route_failure() {
+        let design = routing_design(CopperLayer::Front, 9_000_000);
         let bundle = lower_request(&design).unwrap().unwrap();
-        let work_root = test_root("real-repeat");
-        let runner = ApgarRunner::from_bazel_runfiles(work_root).unwrap();
-        let first = runner.execute(&bundle).unwrap();
-        let second = runner.execute(&bundle).unwrap();
-        assert_eq!(first, second);
-        let imported = import_result(&design, &bundle, &first.result_json, &first.tool).unwrap();
-        assert!(imported.design.board.routing_requests.is_empty());
-        let RouteOutcome::Completed { candidates, .. } = imported.result.outcome else {
-            panic!("real APGAR CPU adapter returned a failure result")
+        let execution = ApgarRunner::from_bazel_runfiles(test_root("no-route"))
+            .unwrap()
+            .execute(&bundle)
+            .unwrap();
+        let result = parse_result(&execution.result_json).unwrap();
+        let RouteOutcome::Failure { status, diagnostic } = result.outcome else {
+            panic!("blocked real APGAR request unexpectedly completed")
         };
-        assert_eq!(candidates.len(), 1);
+        assert_eq!(status, RouteFailureStatus::RouteNotFound);
+        assert_eq!(diagnostic.code, "CC-APGAR-ROUTE-001");
+        assert_eq!(diagnostic.path, "board.autoroute.vout");
     }
 
     #[test]
@@ -982,7 +1039,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn full_runner_rejects_exit_malformed_output_and_provenance_drift() {
-        let bundle = lower_request(&routing_design()).unwrap().unwrap();
+        let bundle = lower_request(&routing_design(CopperLayer::Front, 200_000))
+            .unwrap()
+            .unwrap();
         for (label, body, expected_code) in [
             ("nonzero", "exit 7", PROCESS_EXIT),
             (

@@ -206,11 +206,16 @@ being omitted; every declared analysis is still invoked within the runner's
 aggregate process deadline.
 
 The Rust `compile(design)` and `compile_source(...)` entry points remain the
-static-artifact APIs for designs with no declared analyses and fail closed with
-`CC-SIM-PHASE-001` when simulation intent is present. Rust callers with
-simulation intent use `compile_checked(design, work_root)` or
+static-artifact APIs for designs with neither declared analyses nor unresolved
+autoroute intent. They fail closed with `CC-SIM-PHASE-001` when simulation
+intent is present and `CC-AUTOROUTE-PHASE-001` when APGAR routing has not run.
+Rust callers with simulation or autoroute intent use
+`compile_checked(design, work_root)` or
 `compile_source_checked(..., work_root)`; the CLI always uses the checked
-source-compilation path.
+source-compilation path. Checked routing validates and lowers the exact
+request, executes the pinned CPU adapter, authenticates and imports the result,
+then projects the fresh accepted Design IR into static and simulation
+artifacts.
 
 Each component has exactly one part, symbol, schematic position, and
 kind-appropriate value, plus at most one footprint. `model` and `terminals` are
@@ -249,11 +254,21 @@ bazel run //cmd/circuitc -- compile INPUT \
 ```
 
 The command accepts exactly one input. It transactionally writes a complete
-KiCad project bundle, `<design>.kicad-map.json`, `<design>.spice`, and every
-five-file per-analysis simulation chain only after parsing, elaboration, Design
-validation, KiCad identity validation, lowering, checked execution, and
-assertion evaluation all succeed. These files are published in one
-failure-atomic transaction.
+KiCad project bundle, `<design>.kicad-map.json`, `<design>.spice`, every
+five-file per-analysis simulation chain, and, when autorouting was requested,
+the canonical routing request, authenticated result, and projection manifest.
+All files are published in one failure-atomic transaction only after parsing,
+elaboration, Design validation, route execution and authenticated import,
+KiCad identity validation, lowering, checked simulation execution, and
+assertion evaluation all succeed.
+
+Routing process, contract, authentication, import, or projection failure emits
+a machine-readable diagnostic and publishes neither accepted output nor a
+`<OUTPUT_DIRECTORY>.failed` tree. If routing succeeds but a later simulation
+fails, the routing chain and static artifacts are discarded because the route
+projection binds the exact KiCad board that was not accepted for publication.
+Only the existing complete per-analysis simulation evidence chains are then
+eligible for the failure directory.
 
 If checked execution produces a failed assertion, unsupported result, failed
 result, or unevaluated result, CircuitC publishes the complete five-file chain

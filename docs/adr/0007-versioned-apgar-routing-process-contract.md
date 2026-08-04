@@ -90,6 +90,15 @@ authorizes route search, the authenticated import supplies the selected exact
 geometry to the canonical Design IR for that build, and generated KiCad files
 remain deterministic outputs rather than an alternate editable source.
 
+Static compiler APIs reject unresolved autoroute intent. Checked compilation
+executes the complete route boundary before static and simulation lowering. On
+success, the canonical request, authenticated result, and projection manifest
+are published atomically with the exact generated board and all other accepted
+artifacts. A routing failure publishes no accepted or checked-failure tree. If
+routing succeeds but a later simulation fails, CircuitC discards routing and
+static artifacts and may publish only the complete simulation evidence chains:
+the projection is not meaningful without the exact board it binds.
+
 ## Consequences
 
 - Design IR v1 evolves in place because it is still unreleased; no schema bump,

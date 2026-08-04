@@ -791,6 +791,7 @@ pub(crate) fn parse_request(input: &str) -> Result<RouteRequestContract, Contrac
     parse_validated(input)
 }
 
+#[allow(dead_code)]
 pub(crate) fn render_result(result: &RouteResultContract) -> Result<String, ContractDiagnostic> {
     render_validated(result)
 }
@@ -2137,6 +2138,22 @@ mod tests {
             parse_request(request_json.trim_end()).unwrap_err().code,
             "CC-ROUTE-CONTRACT-006"
         );
+    }
+
+    #[test]
+    fn request_and_result_parsers_reject_schema_version_mismatches() {
+        let request_json = render_request(&request()).unwrap();
+        let future_request =
+            request_json.replacen("\"schema_version\":1", "\"schema_version\":2", 1);
+        let request_error = parse_request(&future_request).unwrap_err();
+        assert_eq!(request_error.code, "CC-ROUTE-CONTRACT-001");
+        assert_eq!(request_error.path, "schema_version");
+
+        let result_json = render_result(&result()).unwrap();
+        let future_result = result_json.replacen("\"schema_version\":1", "\"schema_version\":2", 1);
+        let result_error = parse_result(&future_result).unwrap_err();
+        assert_eq!(result_error.code, "CC-ROUTE-CONTRACT-001");
+        assert_eq!(result_error.path, "schema_version");
     }
 
     #[test]

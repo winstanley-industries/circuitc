@@ -8,7 +8,7 @@ use crate::design::{CopperLayer, PointNm, RouteSegment};
 use super::contract::{
     AdmittedCandidate, ContractDiagnostic, RouteOutcome, ToolIdentity, sha256_hex,
 };
-use super::import::ImportedRoute;
+use super::import::{ImportedRoute, dbu_to_nm, point_to_nm};
 
 const PROJECTION_SCHEMA_NAME: &str = "circuitc.apgar_route_projection";
 const PROJECTION_SCHEMA_VERSION: u32 = 1;
@@ -220,8 +220,18 @@ fn bind_segments(
                 ));
             }
             let line = candidate.geometry[index];
-            let expected_start = point_nm(line.start);
-            let expected_end = point_nm(line.end);
+            let expected_start = point_to_nm(
+                line.start,
+                &format!("result.outcome.candidate.geometry[{index}].start"),
+            )?;
+            let expected_end = point_to_nm(
+                line.end,
+                &format!("result.outcome.candidate.geometry[{index}].end"),
+            )?;
+            let expected_width = dbu_to_nm(
+                line.width_dbu,
+                &format!("result.outcome.candidate.geometry[{index}].width_dbu"),
+            )?;
             let expected_layer = copper_layer(line.layer).ok_or_else(|| {
                 projection_error(
                     &route.path,
@@ -230,7 +240,7 @@ fn bind_segments(
             })?;
             if route.start != expected_start
                 || route.end != expected_end
-                || route.width_nm != line.width_dbu / 2
+                || route.width_nm != expected_width
                 || route.layer != expected_layer
             {
                 return Err(projection_error(
@@ -296,10 +306,6 @@ fn projected_segment(
         end_nm: projection_point(route.end),
         width_nm: route.width_nm,
     }
-}
-
-const fn point_nm(point: super::contract::PointDbu) -> PointNm {
-    PointNm::new(point.x / 2, point.y / 2)
 }
 
 const fn projection_point(point: PointNm) -> ProjectionPoint {
@@ -500,6 +506,13 @@ mod tests {
         let mut identity_drift = imported();
         identity_drift.selected_candidate_id = "ffffffffffffffffffffffffffffffff".to_owned();
         assert!(project_imported_route(&identity_drift).is_err());
+
+        let mut odd_dbu_drift = imported();
+        let RouteOutcome::Completed { candidates, .. } = &mut odd_dbu_drift.result.outcome else {
+            panic!("fixture must contain a completed candidate")
+        };
+        candidates[0].geometry[0].start.x += 1;
+        assert!(project_imported_route(&odd_dbu_drift).is_err());
     }
 
     #[test]

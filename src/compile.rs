@@ -3,6 +3,13 @@ use std::fmt;
 use std::path::Path;
 
 use crate::design::{Design, Diagnostic};
+use crate::routing::contract::{
+    ContractDiagnostic as RouteContractDiagnostic, sha256_hex as route_sha256_hex,
+};
+use crate::routing::import::import_result;
+use crate::routing::lower::lower_request;
+use crate::routing::project::project_imported_route;
+use crate::routing::runner::ApgarRunner;
 use crate::simulation::assert::evaluate_assertions;
 use crate::simulation::lower::{self, SimulationInputBundle};
 use crate::simulation::{
@@ -117,8 +124,24 @@ pub struct CompiledSimulation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompiledRouting {
+    pub request_path: RelativeArtifactPath,
+    pub result_path: RelativeArtifactPath,
+    pub projection_path: RelativeArtifactPath,
+    pub request_identity_sha256: String,
+    pub request_json: String,
+    pub request_sha256: String,
+    pub result_json: String,
+    pub result_sha256: String,
+    pub selected_candidate_id: String,
+    pub projection_json: String,
+    pub projection_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CheckedCompiledArtifacts {
     pub static_artifacts: CompiledArtifacts,
+    pub routing: Option<CompiledRouting>,
     pub simulations: Vec<CompiledSimulation>,
 }
 
@@ -235,15 +258,16 @@ pub fn compile_checked(
     design: &Design,
     work_root: &Path,
 ) -> Result<CheckedCompiledArtifacts, CheckedCompileError> {
-    let (static_artifacts, bundles) = prepare_checked(design)?;
+    let (static_artifacts, bundles, routing) = prepare_checked_routing(design, work_root)?;
     if bundles.is_empty() {
         return Ok(CheckedCompiledArtifacts {
             static_artifacts,
+            routing,
             simulations: Vec::new(),
         });
     }
 
-    match OhmnivoreRunner::from_bazel_runfiles(work_root) {
+    let checked = match OhmnivoreRunner::from_bazel_runfiles(work_root) {
         Ok(runner) => execute_checked(static_artifacts, bundles, |bundle| {
             runner.execute(
                 bundle.netlist.as_bytes(),
@@ -252,6 +276,132 @@ pub fn compile_checked(
             )
         }),
         Err(error) => execute_checked(static_artifacts, bundles, |_| Err(error.clone())),
+    };
+    checked.map(|mut artifacts| {
+        artifacts.routing = routing;
+        artifacts
+    })
+}
+
+fn prepare_checked_routing(
+    design: &Design,
+    work_root: &Path,
+) -> Result<
+    (
+        CompiledArtifacts,
+        Vec<SimulationInputBundle>,
+        Option<CompiledRouting>,
+    ),
+    CheckedCompileError,
+> {
+    if design.board.routing_requests.is_empty() {
+        let (static_artifacts, bundles) = prepare_checked(design)?;
+        return Ok((static_artifacts, bundles, None));
+    }
+    design
+        .validate()
+        .map_err(|diagnostics| CheckedCompileError {
+            diagnostics,
+            simulations: Vec::new(),
+        })?;
+    let Some(bundle) = lower_request(design).map_err(|diagnostics| CheckedCompileError {
+        diagnostics,
+        simulations: Vec::new(),
+    })?
+    else {
+        return Err(CheckedCompileError {
+            diagnostics: vec![Diagnostic {
+                code: "CC-ROUTE-CHECK-001",
+                path: "design.board.routing_requests".to_owned(),
+                related_path: None,
+                message: "validated routed compilation lost its routing request".to_owned(),
+            }],
+            simulations: Vec::new(),
+        });
+    };
+
+    let runner = ApgarRunner::from_bazel_runfiles(work_root)
+        .map_err(|error| checked_routing_error(&bundle.request.request_path, "execution", error))?;
+    let executed = runner
+        .execute(&bundle)
+        .map_err(|error| checked_routing_error(&bundle.request.request_path, "execution", error))?;
+    let imported = import_result(design, &bundle, &executed.result_json, &executed.tool)
+        .map_err(|error| checked_routing_error(&bundle.request.request_path, "import", error))?;
+    let projected = project_imported_route(&imported).map_err(|error| {
+        checked_routing_error(&bundle.request.request_path, "projection", error)
+    })?;
+    let result_sha256 = route_sha256_hex(imported.result_json.as_bytes());
+    let routing = CompiledRouting {
+        request_path: imported.request_path.clone(),
+        result_path: imported.result_path.clone(),
+        projection_path: projected.projection_path.clone(),
+        request_identity_sha256: bundle.request.request_identity_sha256.clone(),
+        request_json: imported.request_json.clone(),
+        request_sha256: imported.request_sha256.clone(),
+        result_json: imported.result_json.clone(),
+        result_sha256,
+        selected_candidate_id: imported.selected_candidate_id.clone(),
+        projection_json: projected.projection_json.clone(),
+        projection_sha256: projected.projection_sha256.clone(),
+    };
+    let bundles =
+        lower::lower_inputs(&imported.design).map_err(|diagnostics| CheckedCompileError {
+            diagnostics,
+            simulations: Vec::new(),
+        })?;
+    Ok((projected.static_artifacts, bundles, Some(routing)))
+}
+
+fn checked_routing_error(
+    request_path: &str,
+    stage: &str,
+    error: RouteContractDiagnostic,
+) -> CheckedCompileError {
+    CheckedCompileError {
+        diagnostics: vec![Diagnostic {
+            code: checked_routing_diagnostic_code(&error.code),
+            path: format!("design.board.routing_requests.{request_path}"),
+            related_path: Some(error.path),
+            message: format!(
+                "checked APGAR routing {stage} failed: {}: {}",
+                error.code, error.message
+            ),
+        }],
+        simulations: Vec::new(),
+    }
+}
+
+fn checked_routing_diagnostic_code(code: &str) -> &'static str {
+    match code {
+        "CC-ROUTE-CONTRACT-001" => "CC-ROUTE-CONTRACT-001",
+        "CC-ROUTE-CONTRACT-002" => "CC-ROUTE-CONTRACT-002",
+        "CC-ROUTE-CONTRACT-003" => "CC-ROUTE-CONTRACT-003",
+        "CC-ROUTE-CONTRACT-004" => "CC-ROUTE-CONTRACT-004",
+        "CC-ROUTE-CONTRACT-006" => "CC-ROUTE-CONTRACT-006",
+        "CC-ROUTE-SEARCH-001" => "CC-ROUTE-SEARCH-001",
+        "CC-ROUTE-HOST-001" => "CC-ROUTE-HOST-001",
+        "CC-ROUTE-HOST-002" => "CC-ROUTE-HOST-002",
+        "CC-ROUTE-HOST-003" => "CC-ROUTE-HOST-003",
+        "CC-ROUTE-HOST-004" => "CC-ROUTE-HOST-004",
+        "CC-ROUTE-LOWER-001" => "CC-ROUTE-LOWER-001",
+        "CC-ROUTE-LOWER-002" => "CC-ROUTE-LOWER-002",
+        "CC-ROUTE-LOWER-003" => "CC-ROUTE-LOWER-003",
+        "CC-ROUTE-PROCESS-001" => "CC-ROUTE-PROCESS-001",
+        "CC-ROUTE-PROCESS-002" => "CC-ROUTE-PROCESS-002",
+        "CC-ROUTE-PROCESS-003" => "CC-ROUTE-PROCESS-003",
+        "CC-ROUTE-PROCESS-004" => "CC-ROUTE-PROCESS-004",
+        "CC-ROUTE-PROCESS-005" => "CC-ROUTE-PROCESS-005",
+        "CC-ROUTE-IMPORT-001" => "CC-ROUTE-IMPORT-001",
+        "CC-ROUTE-IMPORT-002" => "CC-ROUTE-IMPORT-002",
+        "CC-ROUTE-IMPORT-003" => "CC-ROUTE-IMPORT-003",
+        "CC-ROUTE-IMPORT-004" => "CC-ROUTE-IMPORT-004",
+        "CC-ROUTE-IMPORT-005" => "CC-ROUTE-IMPORT-005",
+        "CC-ROUTE-IMPORT-006" => "CC-ROUTE-IMPORT-006",
+        "CC-ROUTE-IMPORT-007" => "CC-ROUTE-IMPORT-007",
+        "CC-ROUTE-IMPORT-008" => "CC-ROUTE-IMPORT-008",
+        "CC-ROUTE-IMPORT-009" => "CC-ROUTE-IMPORT-009",
+        "CC-ROUTE-PROJECTION-001" => "CC-ROUTE-PROJECTION-001",
+        _ => "CC-ROUTE-CHECK-001",
     }
 }
 
@@ -388,6 +538,7 @@ where
     if all_checked && diagnostics.is_empty() {
         Ok(CheckedCompiledArtifacts {
             static_artifacts,
+            routing: None,
             simulations,
         })
     } else {
@@ -583,12 +734,14 @@ fn kicad_library_files(design: &Design) -> Vec<KicadLibraryFile> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::env;
     use std::panic::catch_unwind;
+    use std::path::PathBuf;
 
     use crate::demo::voltage_divider;
     use crate::design::{
-        ComponentValue, ConnectionState, CopperLayer, ModuleInstance, SimulationAnalysis,
-        SimulationAnalysisKind, SimulationAssertion, SimulationSample,
+        ComponentValue, ConnectionState, CopperLayer, ModuleInstance, RoutingRequest,
+        SimulationAnalysis, SimulationAnalysisKind, SimulationAssertion, SimulationSample,
     };
     use crate::quantity::{Quantity, Unit};
     use crate::simulation::{
@@ -600,8 +753,8 @@ mod tests {
     use super::{
         CHECK_EXECUTION, CHECK_FAILURE, CHECK_INTERNAL, CHECK_INTERNAL_RESULT_MESSAGE,
         CHECK_RESOURCE, CHECK_RESOURCE_MESSAGE, CompiledArtifacts, SimulationInputBundle,
-        axis_kind, canonical_failure_result, compile, execute_checked,
-        execute_checked_with_result_limit, prepare_checked,
+        axis_kind, canonical_failure_result, compile, compile_checked, execute_checked,
+        execute_checked_with_result_limit, prepare_checked, route_sha256_hex,
     };
 
     fn checked_dc_design(paths: &[&str], assertions: bool) -> crate::design::Design {
@@ -692,6 +845,47 @@ mod tests {
         ];
         design.canonicalize();
         design
+    }
+
+    #[test]
+    fn checked_routing_precedes_kicad_and_composes_with_simulation() {
+        let mut design = checked_dc_design(&["simulation.dc"], false);
+        design.board.routes.clear();
+        design.board.routing_requests.push(RoutingRequest {
+            path: "board.autoroute.vout".to_owned(),
+            net: "VOUT".to_owned(),
+            width_nm: 250_000,
+            clearance_nm: 200_000,
+            grid_step_nm: 1_000_000,
+            layer: CopperLayer::Front,
+        });
+        design.canonicalize();
+        let root = env::var_os("TEST_TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(env::temp_dir)
+            .join("circuitc-checked-routing");
+        let first = compile_checked(&design, &root.join("first")).unwrap();
+        let second = compile_checked(&design, &root.join("second")).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.simulations.len(), 1);
+        let routing = first.routing.as_ref().unwrap();
+        assert_eq!(
+            routing.request_path.as_str(),
+            format!("routing/{}/request.json", routing.request_identity_sha256)
+        );
+        assert!(routing.result_json.contains(&routing.selected_candidate_id));
+        assert!(routing.projection_json.contains(&routing.request_sha256));
+        assert!(routing.projection_json.contains(&routing.result_sha256));
+        assert!(
+            routing
+                .projection_json
+                .contains(&routing.selected_candidate_id)
+        );
+        assert!(routing.projection_json.contains(&route_sha256_hex(
+            first.static_artifacts.kicad_pcb.as_bytes()
+        )));
+        assert!(first.static_artifacts.kicad_pcb.contains("(segment"));
     }
 
     fn completed_dc_result(bundle: &SimulationInputBundle, actual: f64) -> SimulationResult {
