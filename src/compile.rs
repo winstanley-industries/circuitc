@@ -124,6 +124,10 @@ pub struct CompiledSimulation {
     pub spice_identity_map_json: String,
     pub result_json: String,
     pub report_json: String,
+    /// Digest of the exact Bazel-authenticated Ohmnivore executable used for
+    /// this checked result. Test-only injected executors leave this absent and
+    /// therefore cannot satisfy release closure.
+    pub tool_executable_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -455,13 +459,21 @@ pub fn compile_checked(
     }
 
     let checked = match OhmnivoreRunner::from_bazel_runfiles(work_root) {
-        Ok(runner) => execute_checked(static_artifacts, bundles, |bundle| {
-            runner.execute(
-                bundle.netlist.as_bytes(),
-                bundle.request_json.as_bytes(),
-                bundle.spice_identity_map_json.as_bytes(),
-            )
-        }),
+        Ok(runner) => match runner.authenticated_executable_sha256() {
+            Ok(executable_sha256) => execute_checked_with_tool(
+                static_artifacts,
+                bundles,
+                Some(&executable_sha256),
+                |bundle| {
+                    runner.execute(
+                        bundle.netlist.as_bytes(),
+                        bundle.request_json.as_bytes(),
+                        bundle.spice_identity_map_json.as_bytes(),
+                    )
+                },
+            ),
+            Err(error) => execute_checked(static_artifacts, bundles, |_| Err(error.clone())),
+        },
         Err(error) => execute_checked(static_artifacts, bundles, |_| Err(error.clone())),
     };
     checked.map(|mut artifacts| {
@@ -633,6 +645,25 @@ where
         static_artifacts,
         bundles,
         MAX_AGGREGATE_RESULT_BYTES,
+        None,
+        execute,
+    )
+}
+
+fn execute_checked_with_tool<F>(
+    static_artifacts: CompiledArtifacts,
+    bundles: Vec<SimulationInputBundle>,
+    tool_executable_sha256: Option<&str>,
+    execute: F,
+) -> Result<CheckedCompiledArtifacts, CheckedCompileError>
+where
+    F: FnMut(&SimulationInputBundle) -> Result<SimulationResult, ContractDiagnostic>,
+{
+    execute_checked_with_result_limit(
+        static_artifacts,
+        bundles,
+        MAX_AGGREGATE_RESULT_BYTES,
+        tool_executable_sha256,
         execute,
     )
 }
@@ -641,6 +672,7 @@ fn execute_checked_with_result_limit<F>(
     static_artifacts: CompiledArtifacts,
     bundles: Vec<SimulationInputBundle>,
     result_byte_limit: usize,
+    tool_executable_sha256: Option<&str>,
     mut execute: F,
 ) -> Result<CheckedCompiledArtifacts, CheckedCompileError>
 where
@@ -727,6 +759,7 @@ where
             spice_identity_map_json: bundle.spice_identity_map_json.clone(),
             result_json,
             report_json: evaluation.report_json,
+            tool_executable_sha256: tool_executable_sha256.map(ToOwned::to_owned),
         });
     }
 
@@ -1545,12 +1578,17 @@ mod tests {
             "the boundary must fit the current result alone but not reserved future evidence"
         );
         let executions = Cell::new(0_usize);
-        let error =
-            execute_checked_with_result_limit(static_artifacts, bundles, result_limit, |bundle| {
+        let error = execute_checked_with_result_limit(
+            static_artifacts,
+            bundles,
+            result_limit,
+            None,
+            |bundle| {
                 executions.set(executions.get() + 1);
                 Ok(completed_dc_result(bundle, 5.0))
-            })
-            .unwrap_err();
+            },
+        )
+        .unwrap_err();
 
         assert_eq!(executions.get(), 2);
         assert_eq!(error.simulations.len(), 2);
@@ -1590,7 +1628,7 @@ mod tests {
         );
 
         let error =
-            execute_checked_with_result_limit(static_artifacts, bundles, stale_bytes, |_| {
+            execute_checked_with_result_limit(static_artifacts, bundles, stale_bytes, None, |_| {
                 Ok(stale.clone())
             })
             .unwrap_err();
@@ -1634,15 +1672,20 @@ mod tests {
             })
             .expect("construct a stale result that distinguishes fallback accounting");
 
-        let error =
-            execute_checked_with_result_limit(static_artifacts, bundles, result_limit, |bundle| {
+        let error = execute_checked_with_result_limit(
+            static_artifacts,
+            bundles,
+            result_limit,
+            None,
+            |bundle| {
                 if bundle.analysis_path == "simulation.a" {
                     Ok(stale.clone())
                 } else {
                     Ok(completed_dc_result(bundle, 5.0))
                 }
-            })
-            .unwrap_err();
+            },
+        )
+        .unwrap_err();
 
         assert_eq!(error.simulations.len(), 2);
         assert_eq!(

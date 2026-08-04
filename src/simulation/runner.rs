@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
-#[cfg(all(unix, test))]
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
@@ -95,7 +95,14 @@ pub struct OhmnivoreRunner {
     work_root: PathBuf,
     limits: OhmnivoreLimits,
     compilation_deadline: Instant,
-    verified_executable: Arc<OnceLock<Result<PathBuf, ProcessFailure>>>,
+    verified_executable: Arc<OnceLock<Result<VerifiedExecutable, ProcessFailure>>>,
+}
+
+#[derive(Clone, Debug)]
+struct VerifiedExecutable {
+    path: PathBuf,
+    sha256: String,
+    length: u64,
 }
 
 impl OhmnivoreRunner {
@@ -141,6 +148,20 @@ impl OhmnivoreRunner {
         map_json: &[u8],
     ) -> Result<SimulationResult, ContractDiagnostic> {
         self.execute_with_pre_netlist_hook(netlist, request_json, map_json, |_| Ok(()))
+    }
+
+    pub(crate) fn authenticated_executable_sha256(&self) -> Result<String, ContractDiagnostic> {
+        match self
+            .verified_executable
+            .get_or_init(|| self.resolve_verified_executable())
+        {
+            Ok(executable) => Ok(executable.sha256.clone()),
+            Err(failure) => Err(ContractDiagnostic {
+                code: failure.code,
+                path: "runner.executable".to_owned(),
+                message: failure.message.to_owned(),
+            }),
+        }
     }
 
     fn execute_with_pre_netlist_hook<F>(
@@ -226,18 +247,49 @@ impl OhmnivoreRunner {
                 return Ok(failed(failure));
             }
         };
-        let version = run_process(
+        let handshake_executable = match stage_verified_executable(
             &executable,
+            handshake_directory.path(),
+            self.compilation_deadline,
+        ) {
+            Ok(path) => path,
+            Err(failure) => {
+                let _ = handshake_directory.cleanup();
+                return Ok(failed(failure));
+            }
+        };
+        let version = run_process(
+            &handshake_executable,
             handshake_directory.path(),
             [OsStr::new("--version")],
             handshake_limit,
             &self.limits,
+        );
+        let handshake_identity = sha256_bounded_regular_file(
+            &handshake_executable,
+            MAX_EXECUTABLE_BYTES,
+            Instant::now()
+                .checked_add(DEFAULT_IDENTITY_WALL)
+                .unwrap_or_else(Instant::now)
+                .min(self.compilation_deadline),
         );
         if handshake_directory.cleanup().is_err() {
             return Ok(failed(ProcessFailure::failed(
                 PROCESS_IO,
                 "could not clean the private Ohmnivore handshake directory",
             )));
+        }
+        match handshake_identity {
+            Ok(digest) if digest == executable.sha256 => {}
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                return Ok(failed(resource_failure()));
+            }
+            _ => {
+                return Ok(failed(ProcessFailure::unsupported(
+                    PROCESS_IDENTITY,
+                    "private Ohmnivore executable changed during version handshake",
+                )));
+            }
         }
         let version = match version {
             Ok(output) => output,
@@ -264,6 +316,17 @@ impl OhmnivoreRunner {
         };
         let netlist_name = "analysis.spice";
         let netlist_path = work_directory.path().join(netlist_name);
+        let analysis_executable = match stage_verified_executable(
+            &executable,
+            work_directory.path(),
+            self.compilation_deadline,
+        ) {
+            Ok(path) => path,
+            Err(failure) => {
+                let _ = work_directory.cleanup();
+                return Ok(failed(failure));
+            }
+        };
         let mut result = (|| {
             if pre_netlist_hook(&netlist_path)
                 .and_then(|()| write_private_file(&netlist_path, netlist))
@@ -279,7 +342,7 @@ impl OhmnivoreRunner {
                 Err(failure) => return failed(failure),
             };
             let output = match run_process(
-                &executable,
+                &analysis_executable,
                 work_directory.path(),
                 [OsStr::new(netlist_name), OsStr::new("--cpu")],
                 analysis_limit,
@@ -327,6 +390,26 @@ impl OhmnivoreRunner {
             }
             result
         })();
+        let analysis_identity = sha256_bounded_regular_file(
+            &analysis_executable,
+            MAX_EXECUTABLE_BYTES,
+            Instant::now()
+                .checked_add(DEFAULT_IDENTITY_WALL)
+                .unwrap_or_else(Instant::now)
+                .min(self.compilation_deadline),
+        );
+        match analysis_identity {
+            Ok(digest) if digest == executable.sha256 => {}
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                result = failed(resource_failure());
+            }
+            _ => {
+                result = failed(ProcessFailure::unsupported(
+                    PROCESS_IDENTITY,
+                    "private Ohmnivore executable changed during analysis",
+                ));
+            }
+        }
         if work_directory.cleanup().is_err() {
             result = failed(ProcessFailure::failed(
                 PROCESS_IO,
@@ -349,7 +432,7 @@ impl OhmnivoreRunner {
         }
     }
 
-    fn resolve_verified_executable(&self) -> Result<PathBuf, ProcessFailure> {
+    fn resolve_verified_executable(&self) -> Result<VerifiedExecutable, ProcessFailure> {
         let executable = self.executable.canonicalize().map_err(|_| {
             ProcessFailure::failed(PROCESS_IO, "could not resolve the Ohmnivore executable")
         })?;
@@ -357,8 +440,12 @@ impl OhmnivoreRunner {
         let identity_deadline = Instant::now()
             .checked_add(identity_limit)
             .unwrap_or_else(Instant::now);
-        verify_provenance(&executable, &self.provenance, identity_deadline)?;
-        Ok(executable)
+        let (sha256, length) = verify_provenance(&executable, &self.provenance, identity_deadline)?;
+        Ok(VerifiedExecutable {
+            path: executable,
+            sha256,
+            length,
+        })
     }
 }
 
@@ -511,7 +598,7 @@ fn verify_provenance(
     executable: &Path,
     provenance: &Path,
     deadline: Instant,
-) -> Result<(), ProcessFailure> {
+) -> Result<(String, u64), ProcessFailure> {
     let provenance = read_bounded_regular_file(provenance, MAX_PROVENANCE_BYTES, deadline)
         .map_err(|_| {
             ProcessFailure::unsupported(
@@ -525,6 +612,15 @@ fn verify_provenance(
             "Bazel-owned Ohmnivore provenance is not UTF-8",
         )
     })?;
+    let metadata = fs::metadata(executable).map_err(|_| {
+        ProcessFailure::unsupported(PROCESS_IDENTITY, "could not stat the Ohmnivore executable")
+    })?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_EXECUTABLE_BYTES {
+        return Err(ProcessFailure::unsupported(
+            PROCESS_IDENTITY,
+            "Ohmnivore executable is not a bounded regular file",
+        ));
+    }
     let executable_sha256 = sha256_bounded_regular_file(executable, MAX_EXECUTABLE_BYTES, deadline)
         .map_err(|_| {
             ProcessFailure::unsupported(PROCESS_IDENTITY, "could not hash the Ohmnivore executable")
@@ -539,7 +635,115 @@ fn verify_provenance(
             "Ohmnivore executable provenance does not match the pinned backend contract",
         ));
     }
-    Ok(())
+    Ok((executable_sha256, metadata.len()))
+}
+
+fn stage_verified_executable(
+    verified: &VerifiedExecutable,
+    directory: &Path,
+    compilation_deadline: Instant,
+) -> Result<PathBuf, ProcessFailure> {
+    let deadline = Instant::now()
+        .checked_add(DEFAULT_IDENTITY_WALL)
+        .unwrap_or_else(Instant::now)
+        .min(compilation_deadline);
+    let mut source = fs::File::open(&verified.path).map_err(|_| {
+        ProcessFailure::unsupported(
+            PROCESS_IDENTITY,
+            "could not reopen the verified Ohmnivore executable",
+        )
+    })?;
+    let metadata = source.metadata().map_err(|_| {
+        ProcessFailure::unsupported(
+            PROCESS_IDENTITY,
+            "could not identify the verified Ohmnivore executable",
+        )
+    })?;
+    if !metadata.is_file() || metadata.len() != verified.length {
+        return Err(ProcessFailure::unsupported(
+            PROCESS_IDENTITY,
+            "Ohmnivore executable identity changed before staging",
+        ));
+    }
+    let path = directory.join("ohmnivore");
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o500).custom_flags(libc::O_NOFOLLOW);
+    let mut output = options.open(&path).map_err(|_| {
+        ProcessFailure::failed(
+            PROCESS_IO,
+            "could not create the private Ohmnivore executable",
+        )
+    })?;
+    let mut digest = Sha256::new();
+    let mut total = 0_u64;
+    let mut chunk = [0_u8; READ_CHUNK_BYTES];
+    loop {
+        if Instant::now() >= deadline {
+            return Err(resource_failure());
+        }
+        let count = source.read(&mut chunk).map_err(|_| {
+            ProcessFailure::unsupported(
+                PROCESS_IDENTITY,
+                "could not read the verified Ohmnivore executable",
+            )
+        })?;
+        if count == 0 {
+            break;
+        }
+        total = total
+            .checked_add(count as u64)
+            .ok_or_else(resource_failure)?;
+        if total > verified.length {
+            return Err(ProcessFailure::unsupported(
+                PROCESS_IDENTITY,
+                "Ohmnivore executable changed while staging",
+            ));
+        }
+        digest.update(&chunk[..count]);
+        output.write_all(&chunk[..count]).map_err(|_| {
+            ProcessFailure::failed(
+                PROCESS_IO,
+                "could not stage the private Ohmnivore executable",
+            )
+        })?;
+    }
+    let staged_sha256 = format!("{:x}", digest.finalize());
+    if total != verified.length || staged_sha256 != verified.sha256 {
+        return Err(ProcessFailure::unsupported(
+            PROCESS_IDENTITY,
+            "staged Ohmnivore executable does not match authenticated bytes",
+        ));
+    }
+    output.sync_all().map_err(|_| {
+        ProcessFailure::failed(
+            PROCESS_IO,
+            "could not persist the private Ohmnivore executable",
+        )
+    })?;
+    drop(output);
+    #[cfg(unix)]
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o500)).map_err(|_| {
+        ProcessFailure::failed(
+            PROCESS_IO,
+            "could not restrict the private Ohmnivore executable",
+        )
+    })?;
+    let staged_sha256 = sha256_bounded_regular_file(&path, MAX_EXECUTABLE_BYTES, deadline)
+        .map_err(|_| {
+            ProcessFailure::unsupported(
+                PROCESS_IDENTITY,
+                "could not authenticate the private Ohmnivore executable",
+            )
+        })?;
+    if staged_sha256 != verified.sha256 {
+        return Err(ProcessFailure::unsupported(
+            PROCESS_IDENTITY,
+            "private Ohmnivore executable does not match authenticated bytes",
+        ));
+    }
+    Ok(path)
 }
 
 fn read_bounded_regular_file(path: &Path, limit: u64, deadline: Instant) -> io::Result<Vec<u8>> {
@@ -2121,6 +2325,31 @@ mod tests {
             .code,
             PROCESS_IDENTITY
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_replacement_after_cached_verification_fails_closed() {
+        let fixture = fixture(AnalysisKind::DcOperatingPoint, ".OP", AxisKind::Scalar, 0.0);
+        let valid = "if [ \"$1\" = --version ]; then printf 'ohmnivore 0.1.0\\n'; exit 0; fi; printf 'Variable,Value\\nV(VIN),10\\nV(VOUT),5\\nI(V1),-0.0005\\n'";
+        let (runner, root) = fake_runner("replace-after-auth", valid, None);
+        runner.authenticated_executable_sha256().unwrap();
+        fs::write(
+            &runner.executable,
+            "#!/bin/sh\nprintf 'ohmnivore 0.1.0\\n'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&runner.executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let result = runner
+            .execute(
+                fixture.netlist.as_bytes(),
+                fixture.request.as_bytes(),
+                fixture.map.as_bytes(),
+            )
+            .unwrap();
+        assert_ne!(result.status, ExecutionStatus::Completed);
+        assert_eq!(result.diagnostics[0].code, PROCESS_IDENTITY);
         fs::remove_dir_all(root).unwrap();
     }
 

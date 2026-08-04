@@ -225,7 +225,45 @@ gate executes KiCad ERC and DRC twice on separately compiled projects and
 requires byte-identical normalized reports and five-outcome analysis reports.
 Layer 5 does not bind the complete release inventory,
 simulation or route acceptance applicability, source identity, or transactional
-publication. Those remain Layer 6.
+closure. Release closure remains Layer 6 and filesystem publication remains
+Layer 7.
+
+## Layer 6: verified content-addressed release closure
+
+[ADR-0013](../adr/0013-content-addressed-release-closure.md), the
+[`release_request`](../../schemas/release_request/v1.md), and
+[`release_manifest`](../../schemas/release_manifest/v1.md) v1 contracts define
+the distributable release boundary:
+
+- exact CircuitC source is re-elaborated and joined to a separately bound,
+  complete canonical Design identity;
+- the binder independently reverifies current catalog, product, fabrication,
+  and five-capability board-analysis evidence rather than trusting caller
+  checksums or `all_pass` fields;
+- checked simulation and APGAR routing artifacts and exact external tool
+  provenance are required exactly when the Design declares those capabilities,
+  while ordinary authored route segments do not imply APGAR applicability;
+- the complete artifact and tool inventory is derived from typed predecessor
+  bundles with strict safe paths, count, per-file, path, and checked aggregate
+  limits; and
+- the independently verified request, manifest, and exact payload bytes form
+  one opaque in-memory content-addressed closure with no caller-authored
+  inventory or host path.
+
+Layer 6 closes `CC-REQ-PROD-006` and `CC-REQ-PROD-007`. It does not make a
+network service, mutable release channel, package registry, or filesystem
+transaction authoritative.
+
+## Layer 7: immutable transactional materialization
+
+Layer 7 consumes only an independently verified Layer-6 closure and writes its
+exact tree into a private sibling staging directory. It writes the manifest
+completion sentinel last, synchronizes every file and directory, and exposes
+the complete content-addressed root with one atomic no-replace rename. Existing
+destinations of any type are immutable. Namespace ownership, mode, ACL,
+no-follow traversal, held identity, rollback, concurrency, and post-rename
+durability-warning behavior follow the hardened CircuitC publication boundary;
+packaging, signing, upload, and registries remain future separate authorities.
 
 ## Non-goals
 

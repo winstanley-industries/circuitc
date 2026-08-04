@@ -150,6 +150,23 @@ fn render_kicad_identity_map(
     output
 }
 
+pub(crate) fn elaborate_source_with_kicad_identity_map(
+    filename: impl Into<String>,
+    source: impl Into<String>,
+    identities: &[crate::KicadIdentity],
+) -> Result<(ElaboratedDesign, String), Vec<SourceDiagnostic>> {
+    let syntax = parse_source(filename, source)?;
+    let elaborated = elaborate_syntax(&syntax)?;
+    let logical_source_name = format!("{}.circuitc", elaborated.design.name);
+    let identity_map = render_kicad_identity_map(
+        &syntax.source,
+        &logical_source_name,
+        &elaborated.provenance,
+        identities,
+    );
+    Ok((elaborated, identity_map))
+}
+
 pub(crate) fn write_json_string(output: &mut String, value: &str) {
     output.push('"');
     for character in value.chars() {

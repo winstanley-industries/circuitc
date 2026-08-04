@@ -16,6 +16,7 @@ pub mod manufacturing;
 pub mod product;
 pub mod product_analysis;
 pub mod quantity;
+pub mod release;
 pub(crate) mod routing;
 pub mod simulation;
 mod spice;
