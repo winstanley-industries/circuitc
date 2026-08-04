@@ -2,6 +2,7 @@
 
 pub mod contract;
 pub(crate) mod lower;
+pub mod runner;
 
 pub use contract::{
     AnalysisKind, AssertionOutcome, AssertionStatus, AxisKind, BackendIdentity,
@@ -14,3 +15,4 @@ pub use contract::{
     SimulationRequest, SimulationResult, SpiceDeviceIdentity, SpiceIdentityMap, SpiceNetIdentity,
     canonical_f64, parse_report, parse_request, parse_result, parse_spice_identity_map, sha256_hex,
 };
+pub use runner::OhmnivoreRunner;

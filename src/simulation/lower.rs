@@ -5,7 +5,7 @@ use crate::design::{
     Design, Diagnostic, SimulationAnalysis, SimulationAnalysisKind, SimulationAssertion,
     SimulationSample, ac_grid_index, transient_grid_location,
 };
-use crate::quantity::Quantity;
+use crate::quantity::{Quantity, Unit};
 use crate::spice::{SpiceNameMap, lower_analysis_netlist};
 
 use super::{
@@ -76,24 +76,7 @@ impl SimulationInputBundle {
             ));
         }
 
-        let expected_comments = identity_comment_lines(&map);
-        let actual_comments: Vec<_> = self
-            .netlist
-            .lines()
-            .filter(|line| {
-                line.starts_with("* @circuitc-net ") || line.starts_with("* @circuitc-device ")
-            })
-            .map(str::to_owned)
-            .collect();
-        if actual_comments != expected_comments {
-            return Err(lower_diagnostic(
-                LOWER_CONTRACT,
-                format!("design.analyses.{}", self.analysis_path),
-                None,
-                "SPICE identity comments do not exactly match the standalone identity map",
-            ));
-        }
-        verify_netlist_identity_coverage(&self.netlist, &map, self.analysis_kind).map_err(
+        verify_spice_identity_binding(&self.netlist, &map, self.analysis_kind).map_err(
             |message| {
                 lower_diagnostic(
                     LOWER_CONTRACT,
@@ -614,25 +597,72 @@ fn artifact_path_stem(design: &str, analysis: &str) -> String {
     sha256_hex(source.as_bytes())
 }
 
-fn identity_comment_lines(map: &SpiceIdentityMap) -> Vec<String> {
-    map.nets
-        .iter()
-        .map(|net| {
-            format!(
-                "* @circuitc-net {} {}",
-                hex_encode(net.canonical.as_bytes()),
-                net.backend
-            )
-        })
-        .chain(map.devices.iter().map(|device| {
-            format!(
-                "* @circuitc-device {} {} {}",
-                hex_encode(device.semantic_path.as_bytes()),
-                hex_encode(device.reference.as_bytes()),
-                device.backend
-            )
-        }))
-        .collect()
+pub(crate) fn verify_spice_identity_binding(
+    netlist: &str,
+    map: &SpiceIdentityMap,
+    analysis_kind: AnalysisKind,
+) -> Result<(), &'static str> {
+    let mut actual_comments = netlist.lines().filter(|line| {
+        line.starts_with("* @circuitc-net ") || line.starts_with("* @circuitc-device ")
+    });
+    for net in &map.nets {
+        let mut fields = actual_comments
+            .next()
+            .unwrap_or_default()
+            .split_ascii_whitespace();
+        if fields.next() != Some("*")
+            || fields.next() != Some("@circuitc-net")
+            || !fields
+                .next()
+                .is_some_and(|hex| exact_upper_hex(hex, net.canonical.as_bytes()))
+            || fields.next() != Some(net.backend.as_str())
+            || fields.next().is_some()
+        {
+            return Err("SPICE identity comments do not exactly match the standalone identity map");
+        }
+    }
+    for device in &map.devices {
+        let mut fields = actual_comments
+            .next()
+            .unwrap_or_default()
+            .split_ascii_whitespace();
+        if fields.next() != Some("*")
+            || fields.next() != Some("@circuitc-device")
+            || !fields
+                .next()
+                .is_some_and(|hex| exact_upper_hex(hex, device.semantic_path.as_bytes()))
+            || !fields
+                .next()
+                .is_some_and(|hex| exact_upper_hex(hex, device.reference.as_bytes()))
+            || fields.next() != Some(device.backend.as_str())
+            || fields.next().is_some()
+        {
+            return Err("SPICE identity comments do not exactly match the standalone identity map");
+        }
+    }
+    if actual_comments.next().is_some() {
+        return Err("SPICE identity comments do not exactly match the standalone identity map");
+    }
+    verify_netlist_identity_coverage(netlist, map, analysis_kind)
+}
+
+fn exact_upper_hex(encoded: &str, bytes: &[u8]) -> bool {
+    encoded.len() == bytes.len().saturating_mul(2)
+        && encoded
+            .as_bytes()
+            .chunks_exact(2)
+            .zip(bytes)
+            .all(|(encoded, byte)| {
+                encoded[0] == upper_hex_digit(byte >> 4)
+                    && encoded[1] == upper_hex_digit(byte & 0x0f)
+            })
+}
+
+const fn upper_hex_digit(nibble: u8) -> u8 {
+    match nibble {
+        0..=9 => b'0' + nibble,
+        _ => b'A' + (nibble - 10),
+    }
 }
 
 fn verify_netlist_identity_coverage(
@@ -649,6 +679,7 @@ fn verify_netlist_identity_coverage(
     let mut used_nets = BTreeSet::new();
     let mut used_devices = BTreeSet::new();
     let mut directives = Vec::new();
+    let mut ac_excitation_count = 0_usize;
 
     for line in netlist.lines() {
         if line.is_empty() || line.starts_with('*') {
@@ -660,24 +691,27 @@ fn verify_netlist_identity_coverage(
             }
             continue;
         }
-        let fields: Vec<_> = line.split_ascii_whitespace().collect();
-        if fields.len() < 3 {
+        let mut fields = line.split_ascii_whitespace();
+        let (Some(device), Some(first_node), Some(second_node)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
             return Err("SPICE device lines must contain one mapped device and two mapped nodes");
-        }
-        let device = fields[0];
+        };
         if !mapped_devices.contains(&device) || !used_devices.insert(device) {
             return Err(
                 "SPICE device tokens must map exactly once through the standalone identity map",
             );
         }
-        for node in &fields[1..=2] {
-            let node = *node;
+        for node in [first_node, second_node] {
             if !mapped_nets.contains(&node) {
                 return Err(
                     "every emitted SPICE node token must resolve through the standalone identity map",
                 );
             }
             used_nets.insert(node);
+        }
+        if verify_supported_device_line(device, fields, analysis_kind)? {
+            ac_excitation_count += 1;
         }
     }
 
@@ -691,6 +725,13 @@ fn verify_netlist_identity_coverage(
     {
         return Err(
             "the standalone identity map may not contain a non-ground net absent from emitted SPICE device lines",
+        );
+    }
+    if (analysis_kind == AnalysisKind::AcLinearSweep && ac_excitation_count != 1)
+        || (analysis_kind != AnalysisKind::AcLinearSweep && ac_excitation_count != 0)
+    {
+        return Err(
+            "SPICE device lines must contain exactly one AC excitation only for an AC analysis",
         );
     }
     let matching_directive = directives.first().is_some_and(|directive| {
@@ -710,14 +751,88 @@ fn verify_netlist_identity_coverage(
     Ok(())
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        write!(encoded, "{byte:02X}").unwrap();
+fn verify_supported_device_line(
+    device: &str,
+    mut fields: std::str::SplitAsciiWhitespace<'_>,
+    analysis_kind: AnalysisKind,
+) -> Result<bool, &'static str> {
+    let failure = || "SPICE device lines must exactly use the supported resistor or independent voltage-source grammar";
+    match device.as_bytes().first().map(u8::to_ascii_uppercase) {
+        Some(b'R') => {
+            let value = fields.next().and_then(parse_exact_spice_quantity);
+            if value.is_none_or(|value| value <= 0.0) || fields.next().is_some() {
+                return Err(failure());
+            }
+            Ok(false)
+        }
+        Some(b'V') => {
+            if fields.next() != Some("DC") {
+                return Err(failure());
+            }
+            if fields.next().and_then(parse_exact_spice_quantity).is_none() {
+                return Err(failure());
+            }
+            match fields.next() {
+                None => Ok(false),
+                Some("AC") if analysis_kind == AnalysisKind::AcLinearSweep => {
+                    let magnitude = fields.next().and_then(parse_exact_spice_quantity);
+                    let phase = fields.next().and_then(parse_exact_spice_quantity);
+                    if magnitude.is_none_or(|magnitude| magnitude < 0.0)
+                        || phase.is_none()
+                        || fields.next().is_some()
+                    {
+                        return Err(failure());
+                    }
+                    Ok(true)
+                }
+                _ => Err(failure()),
+            }
+        }
+        _ => Err(failure()),
     }
-    encoded
+}
+
+fn parse_exact_spice_quantity(value: &str) -> Option<f64> {
+    let (coefficient, engineering_exponent) = match value.split_once('e') {
+        Some((coefficient, exponent_text)) => {
+            let exponent = exponent_text.parse::<i8>().ok()?;
+            if exponent == 0
+                || exponent % 3 != 0
+                || !(Quantity::MIN_EXPONENT..=Quantity::MAX_EXPONENT).contains(&exponent)
+                || exponent.to_string() != exponent_text
+            {
+                return None;
+            }
+            (coefficient, exponent)
+        }
+        None => (value, 0),
+    };
+    let coefficient = coefficient.parse::<i128>().ok()?;
+    let coefficient_text = value
+        .split_once('e')
+        .map_or(value, |(coefficient, _)| coefficient);
+    if coefficient.to_string() != coefficient_text {
+        return None;
+    }
+
+    for (shift, divisor) in [(0_i8, 1_i128), (1, 10), (2, 100)] {
+        let source_exponent = engineering_exponent.checked_add(shift)?;
+        if source_exponent > Quantity::MAX_EXPONENT {
+            continue;
+        }
+        if coefficient % divisor != 0 {
+            continue;
+        }
+        let Ok(source_coefficient) = i64::try_from(coefficient / divisor) else {
+            continue;
+        };
+        let quantity = Quantity::new(source_coefficient, source_exponent, Unit::Dimensionless);
+        if quantity.spice_literal() == value {
+            let parsed = value.parse::<f64>().ok()?;
+            return parsed.is_finite().then_some(parsed);
+        }
+    }
+    None
 }
 
 fn contract_diagnostic(
@@ -760,7 +875,7 @@ mod tests {
 
     use super::{
         LOWER_AXIS, LOWER_RESOURCE, LOWER_SAMPLE, bundle_size_upper_bound, lower_inputs,
-        lower_inputs_with_limit, quantity_to_f64,
+        lower_inputs_with_limit, parse_exact_spice_quantity, quantity_to_f64,
     };
 
     #[test]
@@ -1009,6 +1124,99 @@ R1 VIN VOUT 10e3
             assert_eq!(
                 directive_drift.verify().unwrap_err().code,
                 "CC-SIM-LOWER-004"
+            );
+        }
+    }
+
+    #[test]
+    fn bundle_verifier_enforces_the_exact_declared_device_subset() {
+        let device_grammar = "SPICE device lines must exactly use the supported resistor or independent voltage-source grammar";
+        for (bundle_index, from, to) in [
+            (1, "R1 VIN VOUT 10e3", "R1 VIN VOUT 10e3 TEMP=27"),
+            (1, "R1 VIN VOUT 10e3", "R1 VIN VOUT 10k"),
+            (1, "V1 VIN 0 DC 10", "V1 VIN 0 dc 10"),
+            (1, "V1 VIN 0 DC 10", "V1 VIN 0 DC 10.0"),
+            (1, "V1 VIN 0 DC 10", "V1 VIN 0 DC 10 AC 1 0"),
+            (0, "V1 VIN 0 DC 10 AC 1 0", "V1 VIN 0 DC 10 ac 1 0"),
+            (0, "V1 VIN 0 DC 10 AC 1 0", "V1 VIN 0 DC 10 AC -1 0"),
+            (0, "V1 VIN 0 DC 10 AC 1 0", "V1 VIN 0 DC 10 AC 1e0 0"),
+        ] {
+            let mut mutant = lower_inputs(&simulation_design())
+                .unwrap()
+                .remove(bundle_index);
+            mutant.netlist = mutant.netlist.replacen(from, to, 1);
+            rebind_bundle(&mut mutant);
+            let diagnostic = mutant.verify().unwrap_err();
+            assert_eq!(diagnostic.code, "CC-SIM-LOWER-004");
+            assert_eq!(diagnostic.message, device_grammar, "accepted {to}");
+        }
+
+        let mut unsupported = lower_inputs(&simulation_design()).unwrap().remove(1);
+        unsupported.netlist = unsupported
+            .netlist
+            .replacen(
+                "* @circuitc-device 646976696465722E725F746F70 5231 R1",
+                "* @circuitc-device 646976696465722E725F746F70 5231 L1",
+                1,
+            )
+            .replacen("R1 VIN VOUT 10e3", "L1 VIN VOUT 1e-3", 1);
+        let mut map = parse_spice_identity_map(&unsupported.spice_identity_map_json).unwrap();
+        map.devices
+            .iter_mut()
+            .find(|device| device.semantic_path == "divider.r_top")
+            .unwrap()
+            .backend = "L1".to_owned();
+        unsupported.spice_identity_map_json = map.to_canonical_json().unwrap();
+        rebind_bundle(&mut unsupported);
+        let diagnostic = unsupported.verify().unwrap_err();
+        assert_eq!(diagnostic.code, "CC-SIM-LOWER-004");
+        assert_eq!(diagnostic.message, device_grammar);
+
+        let mut missing_ac = lower_inputs(&simulation_design()).unwrap().remove(0);
+        missing_ac.netlist = missing_ac.netlist.replacen(" AC 1 0", "", 1);
+        rebind_bundle(&mut missing_ac);
+        assert_eq!(
+            missing_ac.verify().unwrap_err().message,
+            "SPICE device lines must contain exactly one AC excitation only for an AC analysis"
+        );
+
+        let mut duplicate_ac = lower_inputs(&simulation_design()).unwrap().remove(0);
+        duplicate_ac.netlist = duplicate_ac
+            .netlist
+            .replacen(
+                "* @circuitc-device 646976696465722E725F746F70 5231 R1",
+                "* @circuitc-device 646976696465722E725F746F70 5231 V2",
+                1,
+            )
+            .replacen("R1 VIN VOUT 10e3", "V2 VIN VOUT DC 10 AC 1 0", 1);
+        let mut map = parse_spice_identity_map(&duplicate_ac.spice_identity_map_json).unwrap();
+        map.devices
+            .iter_mut()
+            .find(|device| device.semantic_path == "divider.r_top")
+            .unwrap()
+            .backend = "V2".to_owned();
+        duplicate_ac.spice_identity_map_json = map.to_canonical_json().unwrap();
+        rebind_bundle(&mut duplicate_ac);
+        assert_eq!(
+            duplicate_ac.verify().unwrap_err().message,
+            "SPICE device lines must contain exactly one AC excitation only for an AC analysis"
+        );
+    }
+
+    #[test]
+    fn device_quantity_tokens_are_exact_circuitc_spice_literals() {
+        for value in ["0", "-10", "10e3", "1e-18", "1000e18"] {
+            assert!(
+                parse_exact_spice_quantity(value).is_some(),
+                "rejected {value}"
+            );
+        }
+        for value in [
+            "+1", "01", "-0", "1.0", "1E3", "1e0", "1e1", "1m", "NaN", "inf", "1e21", "1000e3",
+        ] {
+            assert!(
+                parse_exact_spice_quantity(value).is_none(),
+                "accepted {value}"
             );
         }
     }
