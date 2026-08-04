@@ -2,7 +2,7 @@
 set -euo pipefail
 
 generator="$1"
-normalizer="$2"
+normalizer_source="$2"
 frontend="$3"
 source_fixture="$4"
 project_validator="$5"
@@ -12,6 +12,10 @@ route_acceptance_binder="$8"
 route_evidence_verifier="$9"
 apgar_route_provenance="${10}"
 host_runner="${11}"
+
+normalizer="${TEST_TMPDIR}/normalize_drc.py"
+cp "${normalizer_source}" "${normalizer}"
+chmod 0700 "${normalizer}"
 
 if [[ -n "${CIRCUITC_KICAD_CLI:-}" ]]; then
   kicad_cli="${CIRCUITC_KICAD_CLI}"
@@ -195,6 +199,19 @@ for directory in "${routed_first_dir}" "${routed_second_dir}"; do
     --expected-filename routed_voltage_divider.kicad_pro \
     --normalized "${directory}/project.normalized.json"
 
+  project_artifact_args=()
+  for artifact in \
+    routed_voltage_divider.kicad_sch \
+    routed_voltage_divider.kicad_pcb \
+    routed_voltage_divider.kicad-map.json \
+    routed_voltage_divider.kicad_pro \
+    CircuitC.kicad_sym \
+    CircuitC.pretty/R_0603_1608Metric.kicad_mod \
+    sym-lib-table \
+    fp-lib-table; do
+    project_artifact_args+=(--project-artifact "${directory}/${artifact}")
+  done
+
   python3 "${host_runner}" \
     --kicad-cli "${kicad_cli}" \
     --normalizer "${normalizer}" \
@@ -205,6 +222,7 @@ for directory in "${routed_first_dir}" "${routed_second_dir}"; do
     --normalized-output "${directory}/erc.normalized.json" \
     --work-dir "${routed_host_work}" \
     --expected-major 10 \
+    "${project_artifact_args[@]}" \
     --allow-ignored-check single_global_label \
     --allow-ignored-check four_way_junction \
     --allow-ignored-check simulation_model_issue \
@@ -220,6 +238,7 @@ for directory in "${routed_first_dir}" "${routed_second_dir}"; do
     --normalized-output "${directory}/drc.normalized.json" \
     --work-dir "${routed_host_work}" \
     --expected-major 10 \
+    "${project_artifact_args[@]}" \
     --allow-ignored-check missing_courtyard \
     --allow-ignored-check track_not_centered_on_via \
     --allow-ignored-check tuning_profile_track_geometries \

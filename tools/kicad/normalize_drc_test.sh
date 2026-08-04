@@ -172,6 +172,18 @@ second["type"] = "second_clearance"
 multiple["violations"] = [finding, second]
 (target / "drc-multiple.json").write_text(json.dumps(multiple), encoding="utf-8")
 
+unicode_order = copy.deepcopy(report)
+ascii_finding = copy.deepcopy(finding)
+ascii_finding["description"] = "z finding"
+ascii_finding["items"][0]["description"] = "z item"
+unicode_finding = copy.deepcopy(finding)
+unicode_finding["description"] = "é finding"
+unicode_finding["items"][0]["description"] = "é item"
+unicode_order["violations"] = [unicode_finding, ascii_finding]
+(target / "drc-unicode-order.json").write_text(
+    json.dumps(unicode_order, ensure_ascii=False), encoding="utf-8"
+)
+
 finding_not_object = copy.deepcopy(report)
 finding_not_object["violations"] = []
 finding_not_object["unconnected_items"] = ["not-an-object"]
@@ -228,6 +240,24 @@ expect_failure unexpected-drc-multiple 'Track has insufficient clearance' \
   --identity-map "${identity_map}"
 grep -F 'Second DRC failure' "${TEST_TMPDIR}/unexpected-drc-multiple.stderr"
 
+python3 "${normalizer}" \
+  --raw "${TEST_TMPDIR}/drc-unicode-order.json" \
+  --normalized "${TEST_TMPDIR}/retained-drc-unicode-order.normalized.json" \
+  --expected-major 10 \
+  --identity-map "${identity_map}" \
+  --retain-findings
+python3 - "${TEST_TMPDIR}/retained-drc-unicode-order.normalized.json" <<'PY'
+import json
+import pathlib
+import sys
+
+report = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert [finding["description"] for finding in report["violations"]] == [
+    "z finding",
+    "é finding",
+]
+PY
+
 expect_failure unexpected-unconnected board.routes.vout_bridge \
   --raw "${TEST_TMPDIR}/drc-unconnected.json" \
   --normalized "${TEST_TMPDIR}/drc-unconnected.normalized.json" \
@@ -241,6 +271,29 @@ expect_failure unexpected-parity board.routes.vout_bridge \
   --expected-major 10 \
   --identity-map "${identity_map}"
 grep -F 'schematic_parity' "${TEST_TMPDIR}/unexpected-parity.stderr"
+
+for category in violations unconnected_items schematic_parity; do
+  raw="${unexpected_raw}"
+  if [[ "${category}" == unconnected_items ]]; then
+    raw="${TEST_TMPDIR}/drc-unconnected.json"
+  elif [[ "${category}" == schematic_parity ]]; then
+    raw="${TEST_TMPDIR}/drc-parity.json"
+  fi
+  python3 "${normalizer}" \
+    --raw "${raw}" \
+    --normalized "${TEST_TMPDIR}/retained-${category}.normalized.json" \
+    --expected-major 10 \
+    --identity-map "${identity_map}" \
+    --retain-findings
+  python3 - "${TEST_TMPDIR}/retained-${category}.normalized.json" "${category}" <<'PY'
+import json
+import pathlib
+import sys
+
+report = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert report[sys.argv[2]], f"retained finding inventory {sys.argv[2]} is empty"
+PY
+done
 
 python3 - "${erc_raw}" "${TEST_TMPDIR}" <<'PY'
 import copy
@@ -337,6 +390,23 @@ expect_failure unexpected-erc 'First ERC failure' \
   --identity-map "${identity_map}"
 grep -F 'Second ERC failure' "${TEST_TMPDIR}/unexpected-erc.stderr"
 grep -F 'board.routes.vout_bridge' "${TEST_TMPDIR}/unexpected-erc.stderr"
+
+python3 "${normalizer}" \
+  --raw "${TEST_TMPDIR}/erc-multiple.json" \
+  --normalized "${TEST_TMPDIR}/retained-erc.normalized.json" \
+  --expected-major 10 \
+  --allow-ignored-check simulation_model_issue \
+  --identity-map "${identity_map}" \
+  --retain-findings
+python3 - "${TEST_TMPDIR}/retained-erc.normalized.json" <<'PY'
+import json
+import pathlib
+import sys
+
+report = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert len(report["sheets"]) == 1
+assert len(report["sheets"][0]["violations"]) == 2
+PY
 
 python3 - "${erc_raw}" "${TEST_TMPDIR}/wrong-severities.json" <<'PY'
 import json

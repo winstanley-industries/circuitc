@@ -192,6 +192,41 @@ define the first fabrication-host boundary:
 Layer 4 does not evaluate ERC, DRC, unconnected, or schematic-parity assertions
 and does not close or publish a release. Those remain later layers.
 
+## Layer 5: capability-declared KiCad board analysis
+
+[ADR-0012](../adr/0012-capability-declared-kicad-board-analysis.md) and the
+[`board_analysis_request`](../../schemas/board_analysis_request/v1.md),
+[`board_analysis_result`](../../schemas/board_analysis_result/v1.md), and
+[`board_analysis_report`](../../schemas/board_analysis_report/v1.md) v1
+contracts define the first structured product-analysis adapter:
+
+- one domain-separated request binds the exact generated schematic, PCB,
+  identity map, expected ERC sheet inventory, complete compiler-emitted KiCad
+  project support inventory, current-input-authenticated Layer-4 fabrication
+  predecessor, fixed KiCad 10.0.5 policy, resource limits, and exactly one
+  authored assertion for each of the five initial capabilities;
+- immutable host execution produces separately bound normalized ERC and DRC
+  reports plus a receipt for the exact request, inputs, executable,
+  normalizer, host runner, and report bytes;
+- ERC violations, DRC findings, unconnected items, schematic-parity findings,
+  and fabrication completeness remain separate evidence checks and separate
+  assertion outcomes;
+- completed results contain one indivisible ERC/DRC/fabrication evidence set
+  and independently report `pass` or `fail` for every capability, while failed
+  or unsupported results contain no partial tool or evidence object and make
+  every assertion explicitly unevaluated or unsupported; and
+- an independent verifier recomputes the complete request, result, report, and
+  evidence bundle from current Design, product, compiler, fabrication, host,
+  and normalizer inputs.
+
+The host gate stages only request-authenticated project bytes and executes
+authenticated tool snapshots under bounded, isolated processes. The live Bazel
+gate executes KiCad ERC and DRC twice on separately compiled projects and
+requires byte-identical normalized reports and five-outcome analysis reports.
+Layer 5 does not bind the complete release inventory,
+simulation or route acceptance applicability, source identity, or transactional
+publication. Those remain Layer 6.
+
 ## Non-goals
 
 - Operating a live procurement marketplace.

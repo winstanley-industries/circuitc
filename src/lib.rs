@@ -14,6 +14,7 @@ mod kicad;
 mod library;
 pub mod manufacturing;
 pub mod product;
+pub mod product_analysis;
 pub mod quantity;
 pub(crate) mod routing;
 pub mod simulation;
