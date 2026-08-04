@@ -2445,6 +2445,8 @@ mod tests {
 
     const REFERENCE: &str = include_str!("../../examples/voltage_divider.circuitc");
     const PHYSICAL_NO_CONNECT: &str = include_str!("../../examples/physical_no_connect.circuitc");
+    const AUTHORED_ROUTE: &str = "route board.routes.vout_bridge net VOUT from (16 mm, 10 mm) to (24 mm, 10 mm) width 0.25 mm layer front;";
+    const AUTOROUTE: &str = "autoroute board.autoroute.vout net VOUT width 0.25 mm clearance 0.2 mm grid 0.25 mm layer front;";
 
     fn elaborate_source(
         source: &str,
@@ -2458,6 +2460,10 @@ mod tests {
         let mut result = source.to_owned();
         result.insert_str(closing, intent);
         result
+    }
+
+    fn autoroute_source() -> String {
+        REFERENCE.replacen(AUTHORED_ROUTE, AUTOROUTE, 1)
     }
 
     fn valid_simulation_source() -> String {
@@ -3284,6 +3290,49 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.code == "CC-LANG-QUANTITY-004")
         );
+    }
+
+    #[test]
+    fn reports_every_autoroute_elaboration_diagnostic() {
+        let reference = autoroute_source();
+        let duplicate = reference.replacen(AUTOROUTE, &format!("{AUTOROUTE}\n    {AUTOROUTE}"), 1);
+        let mutants = [
+            (
+                reference.replacen("autoroute board.autoroute.vout", "autoroute .invalid", 1),
+                "CC-LANG-AUTOROUTE-001",
+            ),
+            (duplicate, "CC-LANG-AUTOROUTE-002"),
+            (
+                reference.replacen(
+                    "autoroute board.autoroute.vout net VOUT",
+                    "autoroute board.autoroute.vout net UNKNOWN",
+                    1,
+                ),
+                "CC-LANG-AUTOROUTE-003",
+            ),
+            (
+                reference.replacen("width 0.25 mm", "width 0 mm", 1),
+                "CC-LANG-AUTOROUTE-004",
+            ),
+            (
+                reference.replacen("clearance 0.2 mm", "clearance 0 mm", 1),
+                "CC-LANG-AUTOROUTE-005",
+            ),
+            (
+                reference.replacen("grid 0.25 mm", "grid 0 mm", 1),
+                "CC-LANG-AUTOROUTE-006",
+            ),
+        ];
+        for (source, code) in mutants {
+            let diagnostics = match elaborate_source(&source) {
+                Ok(_) => panic!("mutant {code} unexpectedly elaborated"),
+                Err(diagnostics) => diagnostics,
+            };
+            assert!(
+                diagnostics.iter().any(|diagnostic| diagnostic.code == code),
+                "missing {code}: {diagnostics:#?}"
+            );
+        }
     }
 
     #[test]

@@ -880,9 +880,15 @@ impl Design {
                     );
                 }
                 if request.grid_step_nm > 0 {
-                    let delta_x = center.x - self.board.outline.origin.x;
-                    let delta_y = center.y - self.board.outline.origin.y;
-                    if delta_x % request.grid_step_nm != 0 || delta_y % request.grid_step_nm != 0 {
+                    let on_grid = center
+                        .x
+                        .checked_sub(self.board.outline.origin.x)
+                        .zip(center.y.checked_sub(self.board.outline.origin.y))
+                        .is_some_and(|(delta_x, delta_y)| {
+                            delta_x % request.grid_step_nm == 0
+                                && delta_y % request.grid_step_nm == 0
+                        });
+                    if !on_grid {
                         push(
                             &mut diagnostics,
                             "CC-AUTOROUTE-014",
@@ -3858,6 +3864,11 @@ mod tests {
         let mut request = vout_routing_request();
         request.grid_step_nm = 300_000;
         design.board.routing_requests.push(request);
+        assert_rejected(design, "CC-AUTOROUTE-014");
+
+        let mut design = voltage_divider();
+        design.board.outline.origin.x = i64::MIN;
+        design.board.routing_requests.push(vout_routing_request());
         assert_rejected(design, "CC-AUTOROUTE-014");
     }
 
