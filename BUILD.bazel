@@ -460,11 +460,13 @@ sh_test(
         "$(location tools/routing/bind_route_acceptance.py)",
         "$(location :route_evidence_verifier)",
         "$(location :apgar_route_provenance)",
+        "$(location tools/kicad/run_host_validation.py)",
     ],
     data = [
         "examples/physical_no_connect.circuitc",
         "examples/voltage_divider.circuitc",
         "tools/kicad/normalize_drc.py",
+        "tools/kicad/run_host_validation.py",
         "tools/kicad/validate_project.py",
         "tools/routing/bind_route_acceptance.py",
         "tools/routing/fixtures/routed_voltage_divider.circuitc",

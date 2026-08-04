@@ -227,3 +227,46 @@ fn evidence_error(path: impl Into<String>, message: impl Into<String>) -> Contra
         message: message.into(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        APGAR_CONTRACT_IDENTITY, APGAR_CPU_DEVICE_CLASS, APGAR_TOOL_NAME, APGAR_TOOL_VERSION,
+        EVIDENCE_ERROR, PINNED_APGAR_SOURCE_REVISION, authenticated_provenance,
+    };
+
+    fn provenance(executable_sha256: &str) -> String {
+        format!(
+            "circuitc-apgar-route-provenance-v1\nname={APGAR_TOOL_NAME}\nversion={APGAR_TOOL_VERSION}\ncontract={APGAR_CONTRACT_IDENTITY}\nsource_revision={PINNED_APGAR_SOURCE_REVISION}\nexecutable_sha256={executable_sha256}\ndevice_class={APGAR_CPU_DEVICE_CLASS}\n"
+        )
+    }
+
+    #[test]
+    fn provenance_rejects_identity_prefix_or_suffix_changes() {
+        for mutant in [
+            provenance(&"0".repeat(64)).replacen(APGAR_TOOL_NAME, "mutant-route-tool", 1),
+            provenance(&"0".repeat(64)).replacen(APGAR_CPU_DEVICE_CLASS, "mutant-device", 1),
+        ] {
+            let error = authenticated_provenance(&mutant).unwrap_err();
+            assert_eq!(error.code, EVIDENCE_ERROR);
+            assert_eq!(error.path, "provenance");
+            assert_eq!(
+                error.message,
+                "APGAR provenance does not match the pinned CPU tool identity"
+            );
+        }
+    }
+
+    #[test]
+    fn provenance_rejects_noncanonical_executable_digests() {
+        for digest in ["0".repeat(63), "G".repeat(64)] {
+            let error = authenticated_provenance(&provenance(&digest)).unwrap_err();
+            assert_eq!(error.code, EVIDENCE_ERROR);
+            assert_eq!(error.path, "provenance.executable_sha256");
+            assert_eq!(
+                error.message,
+                "APGAR provenance executable digest is not canonical SHA-256"
+            );
+        }
+    }
+}

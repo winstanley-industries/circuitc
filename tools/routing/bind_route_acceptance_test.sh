@@ -162,6 +162,21 @@ forged_projection["result_sha256"] = hashlib.sha256(forged_bytes).hexdigest()
 (root_path / "forged-projection.json").write_text(
     json.dumps(forged_projection, separators=(",", ":")) + "\n", encoding="utf-8"
 )
+
+reordered_projection = {key: projection[key] for key in reversed(projection)}
+(root_path / "reordered-projection.json").write_text(
+    json.dumps(reordered_projection, separators=(",", ":")) + "\n", encoding="utf-8"
+)
+
+reordered_segment_projection = copy.deepcopy(projection)
+segment = reordered_segment_projection["segments"][0]
+reordered_segment_projection["segments"][0] = {
+    key: segment[key] for key in reversed(segment)
+}
+(root_path / "reordered-segment-projection.json").write_text(
+    json.dumps(reordered_segment_projection, separators=(",", ":")) + "\n",
+    encoding="utf-8",
+)
 PY
 
 common_args=(
@@ -174,6 +189,42 @@ common_args=(
   --provenance "${provenance}"
   --route-verifier "${route_verifier}"
 )
+dangling_target="${root}/redirected-output.json"
+ln -s "${dangling_target}" "${root}/dangling-output.acceptance.json"
+expect_failure dangling-output 'acceptance output already exists' "${common_args[@]}" \
+  --result "${result}"
+test ! -e "${dangling_target}"
+
+redirected_dir="${root}/redirected-directory"
+mkdir -p "${redirected_dir}"
+ln -s "${redirected_dir}" "${root}/symlink-output-parent"
+if python3 "${binder}" \
+  "${common_args[@]}" \
+  --result "${result}" \
+  --output "${root}/symlink-output-parent/redirected.json" \
+  >"${root}/symlink-output-parent.stdout" \
+  2>"${root}/symlink-output-parent.stderr"; then
+  echo "route acceptance binder followed a symlinked output parent" >&2
+  exit 1
+fi
+grep -F 'acceptance output path is not a secure directory chain' \
+  "${root}/symlink-output-parent.stderr"
+test ! -e "${redirected_dir}/redirected.json"
+
+mutant_provenance="${root}/wrong-identity-provenance.txt"
+sed 's/name=circuitc-apgar-route/name=mutant-route-tool/' \
+  "${provenance}" >"${mutant_provenance}"
+expect_failure wrong-provenance-identity \
+  'APGAR provenance does not match the pinned CPU tool identity' \
+  --request "${request}" \
+  --result "${result}" \
+  --projection "${projection}" \
+  --pcb "${pcb}" \
+  --schematic "${schematic}" \
+  --drc "${drc}" \
+  --erc "${erc}" \
+  --provenance "${mutant_provenance}" \
+  --route-verifier "${route_verifier}"
 expect_failure stale-result 'strict APGAR evidence verifier rejected input' \
   "${common_args[@]}" --result "${root}/stale-result.json"
 expect_failure unadmitted-result 'strict APGAR evidence verifier rejected input' \
@@ -200,6 +251,27 @@ expect_failure forged-signature 'strict APGAR evidence verifier rejected input' 
   --request "${request}" \
   --result "${root}/forged-result.json" \
   --projection "${root}/forged-projection.json" \
+  --pcb "${pcb}" \
+  --schematic "${schematic}" \
+  --drc "${drc}" \
+  --erc "${erc}" \
+  --provenance "${provenance}" \
+  --route-verifier "${route_verifier}"
+expect_failure reordered-projection 'projection does not use canonical field order' \
+  --request "${request}" \
+  --result "${result}" \
+  --projection "${root}/reordered-projection.json" \
+  --pcb "${pcb}" \
+  --schematic "${schematic}" \
+  --drc "${drc}" \
+  --erc "${erc}" \
+  --provenance "${provenance}" \
+  --route-verifier "${route_verifier}"
+expect_failure reordered-segment \
+  'projection.segments[0] does not use canonical field order' \
+  --request "${request}" \
+  --result "${result}" \
+  --projection "${root}/reordered-segment-projection.json" \
   --pcb "${pcb}" \
   --schematic "${schematic}" \
   --drc "${drc}" \
@@ -301,6 +373,172 @@ expect_failure coordinated-uuid 'projection geometry disagrees with strict APGAR
   --pcb "${uuid_pcb}" \
   --schematic "${schematic}" \
   --drc "${drc}" \
+  --erc "${erc}" \
+  --provenance "${provenance}" \
+  --route-verifier "${route_verifier}"
+
+extra_dir="${root}/coordinated-extra-segment"
+mkdir -p "${extra_dir}"
+extra_pcb="${extra_dir}/routed_voltage_divider.kicad_pcb"
+extra_projection="${extra_dir}/projection.json"
+extra_drc="${extra_dir}/drc.normalized.json"
+python3 - \
+  "${pcb}" "${projection}" "${drc}" \
+  "${extra_pcb}" "${extra_projection}" "${extra_drc}" <<'PY'
+import hashlib
+import json
+import pathlib
+import re
+import sys
+
+pcb_source, projection_source, drc_source, pcb_target, projection_target, drc_target = map(
+    pathlib.Path, sys.argv[1:]
+)
+pcb_text = pcb_source.read_text(encoding="utf-8")
+match = re.search(r"^  \(segment\n.*?^  \)$", pcb_text, re.MULTILINE | re.DOTALL)
+if match is None:
+    raise SystemExit("expected a KiCad segment in coordinated extra-segment source")
+extra_uuid = "00000000-0000-8000-8000-000000000001"
+if extra_uuid in pcb_text:
+    raise SystemExit("coordinated extra-segment UUID unexpectedly collides")
+extra = re.sub(
+    r'    \(uuid "[0-9a-f-]+"\)',
+    f'    (uuid "{extra_uuid}")',
+    match.group(0),
+    count=1,
+)
+closing = pcb_text.rfind("\n)")
+if closing < 0:
+    raise SystemExit("expected final KiCad PCB close")
+mutant_pcb = (pcb_text[:closing] + "\n" + extra + pcb_text[closing:]).encode()
+pcb_target.write_bytes(mutant_pcb)
+
+projection = json.loads(projection_source.read_text(encoding="utf-8"))
+projection["kicad_pcb_sha256"] = hashlib.sha256(mutant_pcb).hexdigest()
+projection_target.write_text(
+    json.dumps(projection, separators=(",", ":")) + "\n", encoding="utf-8"
+)
+
+drc = json.loads(drc_source.read_text(encoding="utf-8"))
+drc["source_sha256"] = hashlib.sha256(mutant_pcb).hexdigest()
+drc_target.write_text(
+    json.dumps(drc, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+PY
+expect_failure coordinated-extra-segment \
+  'exact KiCad segment set does not match authenticated APGAR projection' \
+  --request "${request}" \
+  --result "${result}" \
+  --projection "${extra_projection}" \
+  --pcb "${extra_pcb}" \
+  --schematic "${schematic}" \
+  --drc "${extra_drc}" \
+  --erc "${erc}" \
+  --provenance "${provenance}" \
+  --route-verifier "${route_verifier}"
+
+alternate_dir="${root}/coordinated-alternate-segment"
+mkdir -p "${alternate_dir}"
+alternate_pcb="${alternate_dir}/routed_voltage_divider.kicad_pcb"
+alternate_projection="${alternate_dir}/projection.json"
+alternate_drc="${alternate_dir}/drc.normalized.json"
+python3 - \
+  "${extra_pcb}" "${extra_projection}" "${extra_drc}" \
+  "${alternate_pcb}" "${alternate_projection}" "${alternate_drc}" <<'PY'
+import hashlib
+import json
+import pathlib
+import re
+import sys
+
+pcb_source, projection_source, drc_source, pcb_target, projection_target, drc_target = map(
+    pathlib.Path, sys.argv[1:]
+)
+pcb_text = pcb_source.read_text(encoding="utf-8")
+matches = list(re.finditer(r"^  \(segment\n.*?^  \)$", pcb_text, re.MULTILINE | re.DOTALL))
+if len(matches) != 2:
+    raise SystemExit("expected two canonical segments in alternate-whitespace mutant source")
+extra = matches[1]
+indented = "\n".join(f" {line}" for line in extra.group(0).splitlines())
+mutant_pcb = (pcb_text[: extra.start()] + indented + pcb_text[extra.end() :]).encode()
+pcb_target.write_bytes(mutant_pcb)
+
+projection = json.loads(projection_source.read_text(encoding="utf-8"))
+projection["kicad_pcb_sha256"] = hashlib.sha256(mutant_pcb).hexdigest()
+projection_target.write_text(
+    json.dumps(projection, separators=(",", ":")) + "\n", encoding="utf-8"
+)
+
+drc = json.loads(drc_source.read_text(encoding="utf-8"))
+drc["source_sha256"] = hashlib.sha256(mutant_pcb).hexdigest()
+drc_target.write_text(
+    json.dumps(drc, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+PY
+expect_failure coordinated-alternate-segment \
+  'emitted KiCad PCB contains an unsupported segment encoding' \
+  --request "${request}" \
+  --result "${result}" \
+  --projection "${alternate_projection}" \
+  --pcb "${alternate_pcb}" \
+  --schematic "${schematic}" \
+  --drc "${alternate_drc}" \
+  --erc "${erc}" \
+  --provenance "${provenance}" \
+  --route-verifier "${route_verifier}"
+
+arc_dir="${root}/coordinated-extra-arc"
+mkdir -p "${arc_dir}"
+arc_pcb="${arc_dir}/routed_voltage_divider.kicad_pcb"
+arc_projection="${arc_dir}/projection.json"
+arc_drc="${arc_dir}/drc.normalized.json"
+python3 - \
+  "${pcb}" "${projection}" "${drc}" \
+  "${arc_pcb}" "${arc_projection}" "${arc_drc}" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+pcb_source, projection_source, drc_source, pcb_target, projection_target, drc_target = map(
+    pathlib.Path, sys.argv[1:]
+)
+pcb_text = pcb_source.read_text(encoding="utf-8")
+marker = "  (embedded_fonts no)\n)\n"
+if pcb_text.count(marker) != 1:
+    raise SystemExit("expected one KiCad board close marker")
+arc = """  (arc
+    (start 16 10)
+    (mid 20 14)
+    (end 24 10)
+    (width 0.25)
+    (layer \"F.Cu\")
+    (net \"VOUT\")
+    (uuid \"00000000-0000-8000-8000-000000000003\")
+  )
+"""
+mutant_pcb = pcb_text.replace(marker, arc + marker, 1).encode()
+pcb_target.write_bytes(mutant_pcb)
+
+projection = json.loads(projection_source.read_text(encoding="utf-8"))
+projection["kicad_pcb_sha256"] = hashlib.sha256(mutant_pcb).hexdigest()
+projection_target.write_text(
+    json.dumps(projection, separators=(",", ":")) + "\n", encoding="utf-8"
+)
+
+drc = json.loads(drc_source.read_text(encoding="utf-8"))
+drc["source_sha256"] = hashlib.sha256(mutant_pcb).hexdigest()
+drc_target.write_text(
+    json.dumps(drc, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+PY
+expect_failure coordinated-extra-arc 'emitted KiCad PCB contains unsupported routed copper' \
+  --request "${request}" \
+  --result "${result}" \
+  --projection "${arc_projection}" \
+  --pcb "${arc_pcb}" \
+  --schematic "${schematic}" \
+  --drc "${arc_drc}" \
   --erc "${erc}" \
   --provenance "${provenance}" \
   --route-verifier "${route_verifier}"

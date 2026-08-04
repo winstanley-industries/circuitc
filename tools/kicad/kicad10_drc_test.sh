@@ -11,6 +11,7 @@ routed_source_fixture="$7"
 route_acceptance_binder="$8"
 route_evidence_verifier="$9"
 apgar_route_provenance="${10}"
+host_runner="${11}"
 
 if [[ -n "${CIRCUITC_KICAD_CLI:-}" ]]; then
   kicad_cli="${CIRCUITC_KICAD_CLI}"
@@ -178,10 +179,11 @@ sed -n '1,240p' "${physical_first_dir}/erc.normalized.json"
 sed -n '1,240p' "${physical_first_dir}/drc.normalized.json"
 
 # Close the imported-route acceptance chain on the supported KiCad host. The
-# binder re-reads and hashes the exact route contracts and board after KiCad has
-# parsed them, so host acceptance cannot be attached to stale projection bytes.
+# host runner snapshots the project and binds the normalized reports to the
+# immutable source bytes KiCad parsed before the binder joins that evidence.
 routed_first_dir="${TEST_TMPDIR}/routed-first"
 routed_second_dir="${TEST_TMPDIR}/routed-second"
+routed_host_work="${TEST_TMPDIR}/routed-host-work"
 for directory in "${routed_first_dir}" "${routed_second_dir}"; do
   "${frontend}" compile "${routed_source_fixture}" --output-dir "${directory}"
 done
@@ -193,41 +195,36 @@ for directory in "${routed_first_dir}" "${routed_second_dir}"; do
     --expected-filename routed_voltage_divider.kicad_pro \
     --normalized "${directory}/project.normalized.json"
 
-  config_directory="${directory}/isolated-kicad-config"
-  mkdir -p "${config_directory}"
-  KICAD_CONFIG_HOME="${config_directory}" "${kicad_cli}" sch erc \
-    --format json \
-    --severity-all \
-    --output "${directory}/erc.raw.json" \
-    "${directory}/routed_voltage_divider.kicad_sch"
-  python3 "${normalizer}" \
-    --raw "${directory}/erc.raw.json" \
-    --normalized "${directory}/erc.normalized.json" \
+  python3 "${host_runner}" \
+    --kicad-cli "${kicad_cli}" \
+    --normalizer "${normalizer}" \
+    --kind erc \
+    --source-artifact "${directory}/routed_voltage_divider.kicad_sch" \
+    --identity-map "${directory}/routed_voltage_divider.kicad-map.json" \
+    --raw-output "${directory}/erc.raw.json" \
+    --normalized-output "${directory}/erc.normalized.json" \
+    --work-dir "${routed_host_work}" \
     --expected-major 10 \
     --allow-ignored-check single_global_label \
     --allow-ignored-check four_way_junction \
     --allow-ignored-check simulation_model_issue \
-    --allow-ignored-check footprint_filter \
-    --identity-map "${directory}/routed_voltage_divider.kicad-map.json" \
-    --source-artifact "${directory}/routed_voltage_divider.kicad_sch"
+    --allow-ignored-check footprint_filter
 
-  KICAD_CONFIG_HOME="${config_directory}" "${kicad_cli}" pcb drc \
-    --format json \
-    --severity-all \
-    --schematic-parity \
-    --output "${directory}/drc.raw.json" \
-    "${directory}/routed_voltage_divider.kicad_pcb"
-  python3 "${normalizer}" \
-    --raw "${directory}/drc.raw.json" \
-    --normalized "${directory}/drc.normalized.json" \
+  python3 "${host_runner}" \
+    --kicad-cli "${kicad_cli}" \
+    --normalizer "${normalizer}" \
+    --kind drc \
+    --source-artifact "${directory}/routed_voltage_divider.kicad_pcb" \
+    --identity-map "${directory}/routed_voltage_divider.kicad-map.json" \
+    --raw-output "${directory}/drc.raw.json" \
+    --normalized-output "${directory}/drc.normalized.json" \
+    --work-dir "${routed_host_work}" \
     --expected-major 10 \
     --allow-ignored-check missing_courtyard \
     --allow-ignored-check track_not_centered_on_via \
     --allow-ignored-check tuning_profile_track_geometries \
     --allow-ignored-check footprint_filters_mismatch \
-    --allow-ignored-check footprint_type_mismatch \
-    --identity-map "${directory}/routed_voltage_divider.kicad-map.json" \
-    --source-artifact "${directory}/routed_voltage_divider.kicad_pcb"
+    --allow-ignored-check footprint_type_mismatch
 
   route_directory="$(find "${directory}/routing" -mindepth 1 -maxdepth 1 -type d)"
   test "$(printf '%s\n' "${route_directory}" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
@@ -243,6 +240,47 @@ for directory in "${routed_first_dir}" "${routed_second_dir}"; do
     --route-verifier "${route_evidence_verifier}" \
     --output "${directory}/route-acceptance.json"
 done
+
+# A board mutation after KiCad returned must not be attached to the stale clean
+# report, even when a coordinated projection digest is recomputed.
+stale_host_dir="${TEST_TMPDIR}/routed-stale-host"
+cp -R "${routed_first_dir}" "${stale_host_dir}"
+stale_pcb="${stale_host_dir}/routed_voltage_divider.kicad_pcb"
+sed 's/(at 25 10 0)/(at 30 10 0)/' "${stale_pcb}" >"${stale_pcb}.mutant"
+mv "${stale_pcb}.mutant" "${stale_pcb}"
+stale_route_directory="$(find "${stale_host_dir}/routing" -mindepth 1 -maxdepth 1 -type d)"
+python3 - "${stale_route_directory}/projection.json" "${stale_pcb}" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+projection_path, pcb_path = map(pathlib.Path, sys.argv[1:])
+projection = json.loads(projection_path.read_text(encoding="utf-8"))
+projection["kicad_pcb_sha256"] = hashlib.sha256(pcb_path.read_bytes()).hexdigest()
+projection_path.write_text(
+    json.dumps(projection, separators=(",", ":")) + "\n", encoding="utf-8"
+)
+PY
+if python3 "${route_acceptance_binder}" \
+  --request "${stale_route_directory}/request.json" \
+  --result "${stale_route_directory}/result.json" \
+  --projection "${stale_route_directory}/projection.json" \
+  --pcb "${stale_pcb}" \
+  --schematic "${stale_host_dir}/routed_voltage_divider.kicad_sch" \
+  --drc "${stale_host_dir}/drc.normalized.json" \
+  --erc "${stale_host_dir}/erc.normalized.json" \
+  --provenance "${apgar_route_provenance}" \
+  --route-verifier "${route_evidence_verifier}" \
+  --output "${stale_host_dir}/stale-route-acceptance.json" \
+  >"${stale_host_dir}/stale-host.stdout" \
+  2>"${stale_host_dir}/stale-host.stderr"; then
+  echo "route acceptance binder attached stale KiCad host evidence" >&2
+  exit 1
+fi
+grep -F 'drc report does not bind the exact source artifact bytes' \
+  "${stale_host_dir}/stale-host.stderr"
+test ! -e "${stale_host_dir}/stale-route-acceptance.json"
 
 for artifact in \
   routed_voltage_divider.kicad_sch \

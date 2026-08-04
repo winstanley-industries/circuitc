@@ -7,6 +7,7 @@ import argparse
 import decimal
 import hashlib
 import json
+import os
 import pathlib
 import re
 import stat
@@ -108,6 +109,12 @@ def _require_keys(value: Any, keys: set[str], path: str) -> dict[str, Any]:
     return value
 
 
+def _require_ordered_keys(value: Any, keys: tuple[str, ...], path: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or tuple(value) != keys:
+        raise AcceptanceError(f"{path} does not use canonical field order {list(keys)!r}")
+    return value
+
+
 def _require_list(value: Any, path: str) -> list[Any]:
     if not isinstance(value, list):
         raise AcceptanceError(f"{path} must be a list")
@@ -194,6 +201,22 @@ PROJECTION_KEYS = {
     "segments",
     "kicad_pcb_sha256",
 }
+PROJECTION_KEY_ORDER = (
+    "schema_name",
+    "schema_version",
+    "design_name",
+    "request_path",
+    "request_identity_sha256",
+    "request_sha256",
+    "result_sha256",
+    "selected_candidate_id",
+    "candidate_geometry_signature",
+    "candidate_resource_signature",
+    "candidate_payload_checksum",
+    "tool",
+    "segments",
+    "kicad_pcb_sha256",
+)
 TOOL_KEYS = {
     "name",
     "version",
@@ -202,6 +225,25 @@ TOOL_KEYS = {
     "executable_sha256",
     "device_class",
 }
+TOOL_KEY_ORDER = (
+    "name",
+    "version",
+    "contract_identity",
+    "source_revision",
+    "executable_sha256",
+    "device_class",
+)
+PROJECTED_SEGMENT_KEY_ORDER = (
+    "ordinal",
+    "semantic_path",
+    "kicad_uuid",
+    "net",
+    "layer",
+    "start_nm",
+    "end_nm",
+    "width_nm",
+)
+POINT_KEY_ORDER = ("x", "y")
 CANDIDATE_KEYS = {
     "schema_major",
     "schema_minor",
@@ -388,6 +430,7 @@ def _validate_apgar_join(
     _require_keys(request, REQUEST_KEYS, "request")
     _require_keys(result, RESULT_KEYS, "result")
     _require_keys(projection, PROJECTION_KEYS, "projection")
+    _require_ordered_keys(projection, PROJECTION_KEY_ORDER, "projection")
     _require_schema(request, "circuitc.apgar_route_request", "request")
     _require_schema(result, "circuitc.apgar_route_result", "result")
     _require_schema(projection, "circuitc.apgar_route_projection", "projection")
@@ -458,6 +501,7 @@ def _validate_apgar_join(
         raise AcceptanceError("APGAR replay identity does not match the request")
 
     tool = _require_keys(result["tool"], TOOL_KEYS, "result.tool")
+    _require_ordered_keys(projection["tool"], TOOL_KEY_ORDER, "projection.tool")
     _require_digest(tool["executable_sha256"], SHA256_PATTERN, "result.tool.executable_sha256")
     if (
         tool["contract_identity"] != request["expected_apgar_contract_identity"]
@@ -573,19 +617,14 @@ def _validate_projection_geometry(
         primitive = _require_keys(
             primitive, {"layer", "start", "end", "width_dbu"}, f"candidate.geometry[{index}]"
         )
-        segment = _require_keys(
-            segment,
-            {
-                "ordinal",
-                "semantic_path",
-                "kicad_uuid",
-                "net",
-                "layer",
-                "start_nm",
-                "end_nm",
-                "width_nm",
-            },
-            f"projection.segments[{index}]",
+        segment = _require_ordered_keys(
+            segment, PROJECTED_SEGMENT_KEY_ORDER, f"projection.segments[{index}]"
+        )
+        _require_ordered_keys(
+            segment["start_nm"], POINT_KEY_ORDER, f"projection.segments[{index}].start_nm"
+        )
+        _require_ordered_keys(
+            segment["end_nm"], POINT_KEY_ORDER, f"projection.segments[{index}].end_nm"
         )
         start = _require_keys(primitive["start"], {"x", "y"}, f"candidate.geometry[{index}].start")
         end = _require_keys(primitive["end"], {"x", "y"}, f"candidate.geometry[{index}].end")
@@ -627,13 +666,66 @@ def _millimeters_to_nm(value: str, path: str) -> int:
     return int(nanometers)
 
 
+def _top_level_form_heads(pcb: str) -> list[str]:
+    roots: list[str] = []
+    children: list[str] = []
+    depth = 0
+    in_string = False
+    escaped = False
+    for index, character in enumerate(pcb):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+            continue
+        if character == "(":
+            cursor = index + 1
+            while cursor < len(pcb) and pcb[cursor].isspace():
+                cursor += 1
+            end = cursor
+            while end < len(pcb) and not pcb[end].isspace() and pcb[end] not in '()"':
+                end += 1
+            if end == cursor:
+                raise AcceptanceError("emitted KiCad PCB contains a headless s-expression")
+            head = pcb[cursor:end]
+            if depth == 0:
+                roots.append(head)
+            elif depth == 1:
+                children.append(head)
+            depth += 1
+        elif character == ")":
+            if depth == 0:
+                raise AcceptanceError("emitted KiCad PCB has unbalanced s-expressions")
+            depth -= 1
+        elif depth == 0 and not character.isspace():
+            raise AcceptanceError("emitted KiCad PCB has data outside its root s-expression")
+    if in_string or depth != 0:
+        raise AcceptanceError("emitted KiCad PCB has unterminated s-expressions")
+    if roots != ["kicad_pcb"]:
+        raise AcceptanceError("emitted KiCad PCB must contain one kicad_pcb root")
+    return children
+
+
 def _validate_exact_pcb_segments(projection: dict[str, Any], pcb_data: bytes) -> None:
     try:
         pcb = pcb_data.decode("utf-8")
     except UnicodeDecodeError as error:
         raise AcceptanceError("emitted KiCad PCB is not UTF-8") from error
+    top_level_heads = _top_level_form_heads(pcb)
+    unsupported_copper = sorted({"arc", "via", "zone"}.intersection(top_level_heads))
+    if unsupported_copper:
+        raise AcceptanceError(
+            f"emitted KiCad PCB contains unsupported routed copper {unsupported_copper!r}"
+        )
+    segment_form_count = top_level_heads.count("segment")
     matches = list(PCB_SEGMENT_PATTERN.finditer(pcb))
-    if len(matches) != pcb.count("  (segment\n"):
+    if len(matches) != segment_form_count:
         raise AcceptanceError("emitted KiCad PCB contains an unsupported segment encoding")
     by_uuid: dict[str, list[dict[str, Any]]] = {}
     for index, match in enumerate(matches):
@@ -652,6 +744,11 @@ def _validate_exact_pcb_segments(projection: dict[str, Any], pcb_data: bytes) ->
             "net": net,
         }
         by_uuid.setdefault(uuid, []).append(record)
+    projected_uuids = [segment["kicad_uuid"] for segment in projection["segments"]]
+    if len(matches) != len(projected_uuids) or set(by_uuid) != set(projected_uuids):
+        raise AcceptanceError(
+            "exact KiCad segment set does not match authenticated APGAR projection"
+        )
     for index, segment in enumerate(projection["segments"]):
         uuid = segment["kicad_uuid"]
         expected = {
@@ -762,6 +859,52 @@ def bind(args: argparse.Namespace) -> bytes:
     ).encode()
 
 
+def _write_new_output(path: pathlib.Path, data: bytes) -> None:
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    if nofollow == 0 or directory == 0:
+        raise AcceptanceError("host cannot securely create route acceptance output")
+    absolute = pathlib.Path(os.path.abspath(path))
+    if absolute.name in {"", ".", ".."}:
+        raise AcceptanceError("acceptance output must name a file")
+    directory_flags = os.O_RDONLY | directory | nofollow | getattr(os, "O_CLOEXEC", 0)
+    parent_fd = os.open("/", directory_flags)
+    try:
+        for component in absolute.parts[1:-1]:
+            try:
+                next_fd = os.open(component, directory_flags, dir_fd=parent_fd)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=parent_fd)
+                except FileExistsError:
+                    pass
+                next_fd = os.open(component, directory_flags, dir_fd=parent_fd)
+            os.close(parent_fd)
+            parent_fd = next_fd
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow | getattr(os, "O_CLOEXEC", 0)
+        try:
+            output_fd = os.open(absolute.name, flags, 0o600, dir_fd=parent_fd)
+        except FileExistsError as error:
+            raise AcceptanceError("acceptance output already exists") from error
+        try:
+            with os.fdopen(output_fd, "wb") as output:
+                output.write(data)
+                output.flush()
+                os.fsync(output.fileno())
+        except Exception:
+            try:
+                os.unlink(absolute.name, dir_fd=parent_fd)
+            except OSError:
+                pass
+            raise
+    except AcceptanceError:
+        raise
+    except OSError as error:
+        raise AcceptanceError("acceptance output path is not a secure directory chain") from error
+    finally:
+        os.close(parent_fd)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--request", required=True, type=pathlib.Path)
@@ -777,10 +920,7 @@ def main() -> int:
     args = parser.parse_args()
     try:
         evidence = bind(args)
-        if args.output.exists():
-            raise AcceptanceError("acceptance output already exists")
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_bytes(evidence)
+        _write_new_output(args.output, evidence)
     except (OSError, AcceptanceError) as error:
         print(f"CircuitC route acceptance failed: {error}", file=sys.stderr)
         return 1

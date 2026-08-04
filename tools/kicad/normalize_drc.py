@@ -455,9 +455,18 @@ def main() -> int:
     parser.add_argument("--allow-ignored-check", action="append", default=[])
     parser.add_argument("--identity-map", type=pathlib.Path)
     parser.add_argument("--source-artifact", type=pathlib.Path)
+    parser.add_argument("--expected-source-sha256")
     args = parser.parse_args()
 
     try:
+        if (args.source_artifact is None) != (args.expected_source_sha256 is None):
+            raise ValidationError(
+                "source artifact and pre-execution SHA-256 must be provided together"
+            )
+        if args.expected_source_sha256 is not None and not re.fullmatch(
+            r"[0-9a-f]{64}", args.expected_source_sha256
+        ):
+            raise ValidationError("pre-execution source SHA-256 is not canonical")
         with args.raw.open(encoding="utf-8") as source:
             report = json.load(source)
         if not isinstance(report, dict):
@@ -482,7 +491,12 @@ def main() -> int:
                 identity_map,
             )
         if args.source_artifact is not None:
-            normalized["source_sha256"] = source_artifact_sha256(report, args.source_artifact)
+            source_sha256 = source_artifact_sha256(report, args.source_artifact)
+            if source_sha256 != args.expected_source_sha256:
+                raise ValidationError(
+                    "KiCad source artifact changed after the host execution snapshot"
+                )
+            normalized["source_sha256"] = source_sha256
     except (OSError, json.JSONDecodeError, ValidationError) as error:
         print(f"CircuitC KiCad validation failed: {error}", file=sys.stderr)
         return 1
