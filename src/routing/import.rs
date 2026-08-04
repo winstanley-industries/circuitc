@@ -1692,8 +1692,60 @@ mod tests {
     #[test]
     fn geometry_exceeding_authenticated_edge_bound_fails_before_expansion() {
         let mut bundle = bundle();
-        let candidate = completed_candidate(&bundle);
+        let mut candidate = completed_candidate(&bundle);
+        bundle.request.compiler_profile.lattice_step_dbu = 1;
         bundle.request.resource_limits.expanded_resource_edges = 1;
+        bundle.request.validate().unwrap();
+
+        let start = candidate.geometry[0].start;
+        let goal = candidate.geometry[0].end;
+        let detour_y = if goal.y != start.y + 2 {
+            start.y + 2
+        } else {
+            start.y + 4
+        };
+        let far_start = super::PointDbu {
+            x: 1_000_000_000_000,
+            y: start.y,
+        };
+        let far_end = super::PointDbu {
+            x: far_start.x,
+            y: detour_y,
+        };
+        let layer = candidate.geometry[0].layer;
+        let width_dbu = candidate.geometry[0].width_dbu;
+        candidate.geometry = vec![
+            LinePrimitive {
+                layer,
+                start,
+                end: far_start,
+                width_dbu,
+            },
+            LinePrimitive {
+                layer,
+                start: far_start,
+                end: far_end,
+                width_dbu,
+            },
+            LinePrimitive {
+                layer,
+                start: far_end,
+                end: super::PointDbu {
+                    x: goal.x,
+                    y: detour_y,
+                },
+                width_dbu,
+            },
+            LinePrimitive {
+                layer,
+                start: super::PointDbu {
+                    x: goal.x,
+                    y: detour_y,
+                },
+                end: goal,
+                width_dbu,
+            },
+        ];
         let error = match derive_candidate_fields(&bundle.request, &candidate) {
             Err(error) => error,
             Ok(_) => panic!("over-bound candidate expansion unexpectedly succeeded"),
