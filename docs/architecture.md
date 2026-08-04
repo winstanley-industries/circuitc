@@ -67,6 +67,10 @@ cannot represent; it may not silently discard or reinterpret them.
    may prove or fail authored function, value, package, lifecycle, and sourcing
    constraints. It may not add product intent, select an unapproved substitute,
    consult the host clock, or become a build-time network dependency.
+10. Product resolution, BOM, placement, and assembly JSON are deterministic
+    compiled projections of Design IR, one exact variant, and authenticated
+    catalog evidence. They may not redefine component identity, population,
+    placement, configuration, or quantity.
 
 Edits made only to generated KiCad files are not round-tripped. Code-authored
 placement and routing belong in CircuitC source. A future importer may help
@@ -243,6 +247,16 @@ reference and at least one explicit product variant. Variants assign exactly
 one fitted, not-fitted, or approved-alternate state to every physical
 component; no generated BOM or board edit may redefine that state.
 
+For one exact variant, the Layer-3 compiler re-authenticates the pinned catalog
+and emits one strict four-artifact resolution/BOM/placement/assembly bundle.
+Every root binds a domain-separated variant identity and a common canonical
+`product_input_sha256` covering catalog reference, variant, configuration, and
+all product-relevant physical-component identity, value, lifecycle, sourcing,
+substitution, placement, and population inputs. Paths use only the variant
+identity digest, never the raw variant path. An independent verifier rederives
+the complete expected bundle from Design and snapshot inputs; cross-file
+agreement cannot legitimize an extra or stale row.
+
 The initial manufacturability intent is limited to KiCad major version 10 and
 stable assertions for clean ERC, clean DRC, clean unconnected and
 schematic-parity results, and a complete fabrication inventory. This is
@@ -254,6 +268,12 @@ The authority and initial field-level contract are recorded in
 The strict snapshot and offline resolution contract are recorded in
 [ADR-0009](adr/0009-strict-offline-product-catalog-snapshot.md) and
 [`schemas/product_catalog_snapshot/v1.md`](../schemas/product_catalog_snapshot/v1.md).
+The deterministic product bundle and its strict schemas are recorded in
+[ADR-0010](adr/0010-deterministic-product-artifact-bundle.md),
+[`product_resolution/v1`](../schemas/product_resolution/v1.md),
+[`bom/v1`](../schemas/bom/v1.md),
+[`placement/v1`](../schemas/placement/v1.md), and
+[`assembly/v1`](../schemas/assembly/v1.md).
 
 This directly avoids hosted-backend availability becoming a build dependency.
 
