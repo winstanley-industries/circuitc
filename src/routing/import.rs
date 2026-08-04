@@ -176,7 +176,7 @@ fn authenticate_current_request(
     Ok(())
 }
 
-fn authenticate_result_root(
+pub(super) fn authenticate_result_root(
     bundle: &RouteInputBundle,
     result: &RouteResultContract,
     expected_tool: &ToolIdentity,
@@ -225,7 +225,7 @@ fn authenticate_result_root(
     Ok(())
 }
 
-fn authenticate_candidate(
+pub(super) fn authenticate_candidate(
     request: &RouteRequestContract,
     candidate: &AdmittedCandidate,
 ) -> Result<(), ContractDiagnostic> {

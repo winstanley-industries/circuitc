@@ -62,10 +62,12 @@ pub(crate) struct ApgarRunner {
     verified: Arc<OnceLock<Result<VerifiedExecutable, ContractDiagnostic>>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct VerifiedExecutable {
     path: PathBuf,
     tool: ToolIdentity,
+    device: u64,
+    inode: u64,
 }
 
 impl ApgarRunner {
@@ -107,10 +109,18 @@ impl ApgarRunner {
                 "routing request bytes do not satisfy their authenticated bound",
             ));
         }
-        let verified = self
+        let cached = self
             .verified
             .get_or_init(|| self.verify_executable())
             .clone()?;
+        let verified = self.verify_executable()?;
+        if verified != cached {
+            return Err(process_error(
+                PROCESS_IDENTITY,
+                "runner.executable",
+                "APGAR executable identity changed before process execution",
+            ));
+        }
         let directory = ScopedWorkDirectory::create(&self.work_root).map_err(|_| {
             process_error(
                 PROCESS_IO,
@@ -129,10 +139,10 @@ impl ApgarRunner {
             OsString::from("--request-sha256"),
             OsString::from(&bundle.request_sha256),
             OsString::from("--executable-sha256"),
-            OsString::from(&verified.tool.executable_sha256),
+            OsString::from(&cached.tool.executable_sha256),
         ];
         let process = run_process(
-            &verified.path,
+            &cached.path,
             directory.path(),
             &arguments,
             bundle.request_json.as_bytes(),
@@ -140,12 +150,20 @@ impl ApgarRunner {
             stdout_limit,
             stderr_limit,
         );
+        let post_execution = self.verify_executable();
         let cleanup = directory.cleanup();
         if cleanup.is_err() {
             return Err(process_error(
                 PROCESS_IO,
                 "runner.work_directory",
                 "could not clean the private APGAR working directory",
+            ));
+        }
+        if post_execution.as_ref() != Ok(&cached) {
+            return Err(process_error(
+                PROCESS_IDENTITY,
+                "runner.executable",
+                "APGAR executable identity changed during process execution",
             ));
         }
         let process = process?;
@@ -196,7 +214,7 @@ impl ApgarRunner {
                 ));
             }
         }
-        if result.tool != verified.tool {
+        if result.tool != cached.tool {
             return Err(process_error(
                 PROCESS_IDENTITY,
                 "result.tool",
@@ -205,7 +223,7 @@ impl ApgarRunner {
         }
         Ok(ExecutedRoute {
             result_json,
-            tool: verified.tool,
+            tool: cached.tool,
         })
     }
 
@@ -220,6 +238,13 @@ impl ApgarRunner {
         let deadline = Instant::now()
             .checked_add(IDENTITY_WALL)
             .unwrap_or_else(Instant::now);
+        let metadata = executable.metadata().map_err(|_| {
+            process_error(
+                PROCESS_IDENTITY,
+                "runner.executable",
+                "could not inspect the Bazel-owned APGAR executable",
+            )
+        })?;
         let executable_sha256 =
             sha256_bounded_regular_file(&executable, MAX_EXECUTABLE_BYTES, deadline).map_err(
                 |_| {
@@ -260,6 +285,8 @@ impl ApgarRunner {
         Ok(VerifiedExecutable {
             path: executable,
             tool: expected_cpu_tool(executable_sha256),
+            device: metadata.dev(),
+            inode: metadata.ino(),
         })
     }
 }
@@ -738,7 +765,8 @@ fn process_error(
 mod tests {
     use std::env;
     use std::ffi::OsString;
-    use std::fs;
+    use std::fs::{self, OpenOptions};
+    use std::io::Write as _;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
@@ -746,7 +774,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
 
     use crate::demo;
-    use crate::design::{CopperLayer, RoutingRequest};
+    use crate::design::{CopperLayer, PointNm, RouteSegment, RoutingRequest};
 
     use super::super::contract::{
         BoxDbu, LinePrimitive, PointDbu, RouteFailureStatus, RouteOutcome, parse_result,
@@ -761,6 +789,8 @@ mod tests {
     };
 
     const MM_DBU: i64 = 2_000_000;
+
+    const MM: i64 = 1_000_000;
 
     fn routing_design(layer: CopperLayer, clearance_nm: i64) -> crate::design::Design {
         let mut design = demo::voltage_divider();
@@ -1082,5 +1112,97 @@ mod tests {
             ApgarRunner::from_paths(&executable, &provenance, &root),
             root,
         )
+    }
+
+    #[test]
+    fn pinned_real_cpu_adapter_routes_vertical_diagonal_and_obstacle_detour() {
+        let mut vertical = routing_design(CopperLayer::Front, 200_000);
+        move_component(&mut vertical, "divider.r_bottom", 17 * MM, 18 * MM);
+        vertical.canonicalize();
+
+        let mut diagonal = routing_design(CopperLayer::Front, 200_000);
+        move_component(&mut diagonal, "divider.r_bottom", 21 * MM, 14 * MM);
+        diagonal.canonicalize();
+
+        let mut detour = routing_design(CopperLayer::Front, 200_000);
+        detour.board.routes.push(RouteSegment {
+            path: "board.routes.vin_barrier".to_owned(),
+            net: "VIN".to_owned(),
+            start: PointNm::new(20 * MM, 7 * MM),
+            end: PointNm::new(20 * MM, 13 * MM),
+            width_nm: 500_000,
+            layer: CopperLayer::Front,
+        });
+        detour.canonicalize();
+
+        for (label, design) in [
+            ("vertical", vertical),
+            ("diagonal", diagonal),
+            ("detour", detour),
+        ] {
+            design.validate().unwrap();
+            let bundle = lower_request(&design).unwrap().unwrap();
+            let runner = ApgarRunner::from_bazel_runfiles(test_root(label)).unwrap();
+            let first = runner.execute(&bundle).unwrap();
+            let second = runner.execute(&bundle).unwrap();
+            assert_eq!(first, second);
+            let imported =
+                import_result(&design, &bundle, &first.result_json, &first.tool).unwrap();
+            let RouteOutcome::Completed { candidates, .. } = imported.result.outcome else {
+                panic!("real APGAR {label} request returned a failure")
+            };
+            let candidate = &candidates[0];
+            match label {
+                "vertical" => {
+                    assert!(candidate.metrics.orthogonal_step_count > 0);
+                    assert_eq!(candidate.metrics.diagonal_step_count, 0);
+                }
+                "diagonal" => {
+                    assert!(candidate.metrics.diagonal_step_count > 0);
+                    assert_eq!(candidate.metrics.orthogonal_step_count, 0);
+                }
+                "detour" => {
+                    assert!(candidate.geometry.len() > 1);
+                    assert!(candidate.metrics.bend_count > 0);
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_replacement_after_cached_verification_fails_closed() {
+        let design = routing_design(CopperLayer::Front, 200_000);
+        let bundle = lower_request(&design).unwrap().unwrap();
+        let root = test_root("replacement");
+        fs::create_dir_all(&root).unwrap();
+        let mut runner = ApgarRunner::from_bazel_runfiles(root.join("work")).unwrap();
+        let replacement = root.join("adapter-copy");
+        fs::copy(&runner.executable, &replacement).unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o700)).unwrap();
+        runner.executable = replacement.clone();
+        runner.execute(&bundle).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(replacement)
+            .unwrap()
+            .write_all(b"mutant")
+            .unwrap();
+        let error = runner.execute(&bundle).unwrap_err();
+        assert_eq!(error.code, super::PROCESS_IDENTITY);
+        assert_eq!(error.path, "runner.provenance");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn move_component(design: &mut crate::design::Design, path: &str, x: i64, y: i64) {
+        design
+            .components
+            .iter_mut()
+            .find(|component| component.path == path)
+            .and_then(|component| component.physical.as_mut())
+            .unwrap()
+            .placement
+            .position = PointNm::new(x, y);
     }
 }
