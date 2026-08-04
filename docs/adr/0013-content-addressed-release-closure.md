@@ -146,6 +146,68 @@ atomic no-replace publication, cleanup, post-publication verification, and any
 future archive, signing, upload, or registry boundary. Existing destinations
 remain immutable, including byte-identical releases.
 
+## Transactional materialization
+
+The Layer-7 API separates destination authority from release authority. A
+`ReleaseDestination` is acquired only by descriptor-relative, no-follow
+walking of an absolute path. Namespace ancestors must be root- or
+caller-owned and may not be non-sticky group/world-writable or grant a
+permissive Darwin extended ACL. The retained final descriptor must be
+caller-owned, mode 0700, and free of extended ACLs. Publication never resolves
+that pathname again.
+
+The effective UID that owns this private destination is the publication
+authority and the security-principal boundary. The transaction excludes other
+UIDs and remains correct under cooperating concurrent publisher calls. POSIX
+ownership and mode bits cannot isolate malicious code running with the same
+effective UID: that code can chmod, rename, or replace caller-owned files both
+before and after any syscall boundary. Such code is therefore outside this
+filesystem threat model; callers that require isolation from it must publish
+under a separate service account or stronger operating-system sandbox. The
+publisher still rechecks names, device/inode identities, metadata, inventory,
+and bytes at the last available pre-rename point and after visibility, but does
+not misrepresent those observations as protection from its own owner.
+
+`publish_release` accepts that descriptor capability and only an opaque
+`VerifiedReleaseBundle`. Beneath a private mode-0700 `release` container it
+creates a random private sibling transaction on the same filesystem. Files
+are created with no-follow and exclusive-create semantics, changed to mode
+0400, and synchronized individually. Directories are changed to mode 0500 and
+synchronized bottom-up. `request.json` is first and `manifest.json` is the
+last file. Immediately before visibility, the publisher reacquires the staging
+root through the held parent, rechecks its device/inode identity, and verifies
+the complete tree and exact bytes.
+
+Visibility is one operating-system no-replace rename of the transaction root
+to the lowercase release SHA-256. A pre-existing destination of any type,
+including a byte-identical directory, is never opened for repair or replaced.
+Because some network filesystems can report a transport failure after the
+server committed a rename, every rename error is reconciled against the held
+staging device/inode and both source and destination names. If the staging
+identity is already visible and its old name is absent, publication continues
+through sync and exact verification with an explicit ambiguous-rename warning;
+it may not return a pre-visibility error for an already visible root.
+If neither the visible name nor the staging name can be conclusively joined to
+the retained identity, the API returns `VisibilityIndeterminate`, preserves all
+possible residue, synchronizes the parent, and attempts visible-tree
+verification. Callers must reconcile that explicit state; it is neither a
+publication success nor authority to retry destructively.
+A staging-name identity match authorizes cleanup only when a successful
+no-follow metadata probe observes a different visible-name inode, or the
+rename syscall itself was rejected as unsupported before filesystem execution.
+Any visible-name lookup error, including a possibly cached negative `ENOENT`,
+wins over a possibly stale positive source lookup and produces the
+indeterminate state. Cleanup through the retained descriptor could otherwise
+hollow out a release that the server already made visible.
+Before that rename, failure cleanup atomically renames each known entry to a
+random private cleanup claim and removes it only if the claimed device/inode
+identity still matches; changed or unknown residue is restored or preserved
+and reported for recovery. After the rename, the parent directory is
+synchronized and the visible name, root identity, complete inventory, modes,
+link counts, lengths, and bytes are reverified. A post-rename failure returns
+`PublishedWithWarnings`; because visibility already occurred, it never rolls
+back or rewrites the immutable root.
+
 ## Consequences
 
 - One release identity proves one exact source and complete verified artifact
@@ -156,5 +218,8 @@ remain immutable, including byte-identical releases.
   the result of rerunning it.
 - Layer 6 is host-path-free; Layer 7 can give publication one visibility point
   without changing release identity semantics.
+- The release SHA-256 is an immutable namespace key, not an idempotent update
+  key. Retrying an already visible identity returns an existing-destination
+  error even when every byte is equal.
 - The Design identity encoder must be updated whenever Design v1 gains a field;
   mutation coverage makes omissions a release-contract failure.

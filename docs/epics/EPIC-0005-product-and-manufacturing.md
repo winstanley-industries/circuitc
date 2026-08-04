@@ -265,6 +265,15 @@ no-follow traversal, held identity, rollback, concurrency, and post-rename
 durability-warning behavior follow the hardened CircuitC publication boundary;
 packaging, signing, upload, and registries remain future separate authorities.
 
+The implemented boundary retains a descriptor capability for an absolute,
+caller-owned mode-0700 destination and never re-resolves its pathname. It
+creates each release in a private sibling transaction, writes and synchronizes
+the verified bytes with `manifest.json` last, seals the exact tree read-only,
+reverifies the held staging identity and inventory, and performs one atomic
+no-replace rename. Cleanup is identity-scoped and fail-safe; post-rename sync
+or verification failures report a published-with-warning state without
+deleting the visible release.
+
 ## Non-goals
 
 - Operating a live procurement marketplace.
