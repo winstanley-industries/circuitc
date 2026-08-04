@@ -1,0 +1,35 @@
+diff --git a/MODULE.bazel b/MODULE.bazel
+index 9b1eb2f..c0968dc 100644
+--- a/MODULE.bazel
++++ b/MODULE.bazel
+@@ -17,7 +17,7 @@ bazel_dep(name = "llvm", version = "0.8.11")
+ 
+ bazel_dep(name = "buildifier_prebuilt", version = "8.5.1.3", dev_dependency = True)
+ bazel_dep(name = "ruff_prebuilt", version = "0.15.19.1", dev_dependency = True, repo_name = "ruff")
+-bazel_dep(name = "rules_python", version = "2.2.0", dev_dependency = True)
++bazel_dep(name = "rules_python", version = "2.2.0")
+ bazel_dep(name = "rules_shellcheck", version = "0.6.3", dev_dependency = True)
+ 
+ python = use_extension(
+@@ -53,21 +53,2 @@
+ use_repo(cuda, "cuda")
+ 
+-# nvcc host compilation uses a checksum-pinned GCC 15.2.0 distribution and
+-# its bundled glibc/sysroot. This repository is selected only by --config=cuda.
+-cuda_gcc = use_extension("@gcc_toolchain//toolchain:module_extensions.bzl", "gcc_toolchains")
+-cuda_gcc.toolchain(
+-    name = "apgar_cuda_gcc15",
+-    enable_fortran = False,
+-    # The extension links with gcc rather than g++, so name libstdc++
+-    # explicitly and keep it inside a static linker-state bracket. The CUDA
+-    # config also selects static libgcc; neither GCC runtime may resolve from
+-    # the host at execution time.
+-    extra_ldflags = [
+-        "-Wl,-Bstatic",
+-        "-lstdc++",
+-        "-Wl,-Bdynamic",
+-    ],
+-    gcc_version = "15.2.0",
+-    target_arch = "x86_64",
+-)
+-use_repo(cuda_gcc, "apgar_cuda_gcc15")

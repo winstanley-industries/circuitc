@@ -389,6 +389,22 @@ pub(super) fn derive_candidate_fields(
     let profile = &request.compiler_profile;
     let selected_layer = request.routing_profile.allowed_layers[0];
     let width = request.routing_profile.nominal_width_dbu;
+    let endpoint = |reference: EntityRef| {
+        request
+            .terminals
+            .iter()
+            .find(|terminal| terminal.reference == reference)
+            .map(|terminal| terminal.center)
+            .ok_or_else(|| {
+                import_error(
+                    IMPORT_ASSOCIATION,
+                    "outcome.candidate.intended_terminals",
+                    "candidate intended-terminal reference is absent from the authenticated request",
+                )
+            })
+    };
+    let expected_start = endpoint(candidate.intended_terminals[0])?;
+    let expected_goal = endpoint(candidate.intended_terminals[1])?;
     let mut atomic_resources = Vec::new();
     let mut incoming = NO_INCOMING_DIRECTION;
     let mut orthogonal_steps = 0_u64;
@@ -407,14 +423,14 @@ pub(super) fn derive_candidate_fields(
                 "candidate line layer or width differs from the exact request",
             ));
         }
-        if index == 0 && line.start != request.planar_route.start {
+        if index == 0 && line.start != expected_start {
             return Err(import_error(
                 IMPORT_GEOMETRY,
                 path,
                 "candidate chain does not start at the first authenticated terminal",
             ));
         }
-        if index + 1 == candidate.geometry.len() && line.end != request.planar_route.goal {
+        if index + 1 == candidate.geometry.len() && line.end != expected_goal {
             return Err(import_error(
                 IMPORT_GEOMETRY,
                 path,
@@ -1436,6 +1452,18 @@ mod tests {
             .iter()
             .find(|net| net.reference == request.routing_profile.net)
             .unwrap();
+        let canonical_start = request
+            .terminals
+            .iter()
+            .find(|terminal| terminal.reference == target.terminals[0])
+            .unwrap()
+            .center;
+        let canonical_goal = request
+            .terminals
+            .iter()
+            .find(|terminal| terminal.reference == target.terminals[1])
+            .unwrap()
+            .center;
         let mut candidate = AdmittedCandidate {
             schema_major: 1,
             schema_minor: 0,
@@ -1459,8 +1487,8 @@ mod tests {
             },
             geometry: vec![LinePrimitive {
                 layer: request.routing_profile.allowed_layers[0],
-                start: request.planar_route.start,
-                end: request.planar_route.goal,
+                start: canonical_start,
+                end: canonical_goal,
                 width_dbu: request.routing_profile.nominal_width_dbu,
             }],
             resources: Vec::new(),
@@ -1555,8 +1583,8 @@ mod tests {
             imported.design.board.routes[0].path,
             "board.autoroute.vout.segment.00000000"
         );
-        assert_eq!(imported.design.board.routes[0].start.x, 24 * MM);
-        assert_eq!(imported.design.board.routes[0].end.x, 16 * MM);
+        assert_eq!(imported.design.board.routes[0].start.x, 16 * MM);
+        assert_eq!(imported.design.board.routes[0].end.x, 24 * MM);
         assert_eq!(imported.selected_candidate_id, candidate.id);
         assert!(imported.result_json.ends_with('\n'));
     }

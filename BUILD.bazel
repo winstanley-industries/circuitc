@@ -1,3 +1,4 @@
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load(
     "@rules_rust//rust:defs.bzl",
     "rust_binary",
@@ -7,11 +8,34 @@ load(
     "rustfmt_test",
 )
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
+load("//bazel:apgar_pin.bzl", "APGAR_SOURCE_REVISION")
 load("//bazel:ohmnivore_pin.bzl", "OHMNIVORE_SOURCE_REVISION")
 
 package(default_visibility = ["//visibility:private"])
 
 RUSTC_FLAGS = ["-Dwarnings"]
+
+cc_binary(
+    name = "apgar_route_adapter",
+    srcs = ["tools/routing/apgar_route_adapter.cc"],
+    copts = [
+        "-std=c++20",
+        "-Wall",
+        "-Werror",
+        "-Wextra",
+        "-Wpedantic",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@apgar//:board_ir",
+        "@apgar//:candidate_contract",
+        "@apgar//:candidate_policy",
+        "@apgar//:cpu_astar",
+        "@apgar//:geometry_compiler",
+        "@apgar//:planar_route",
+        "@nlohmann_json//:json",
+    ],
+)
 
 rust_library(
     name = "circuitc",
@@ -23,6 +47,8 @@ rust_library(
     crate_name = "circuitc",
     crate_root = "src/lib.rs",
     data = [
+        ":apgar_route_adapter",
+        ":apgar_route_provenance",
         ":ohmnivore_executable",
         ":ohmnivore_provenance",
     ],
@@ -38,6 +64,26 @@ rust_library(
         "@crates//serde_json",
         "@crates//sha2",
     ],
+)
+
+rust_binary(
+    name = "apgar_route_provenance_writer",
+    srcs = ["tools/routing/provenance_writer.rs"],
+    crate_name = "apgar_route_provenance_writer",
+    edition = "2024",
+    rustc_env = {
+        "CIRCUITC_APGAR_SOURCE_REVISION": APGAR_SOURCE_REVISION,
+    },
+    rustc_flags = RUSTC_FLAGS,
+    deps = ["@crates//sha2"],
+)
+
+genrule(
+    name = "apgar_route_provenance",
+    srcs = [":apgar_route_adapter"],
+    outs = ["apgar-route-provenance.txt"],
+    cmd = "$(location :apgar_route_provenance_writer) $(location :apgar_route_adapter) $@",
+    tools = [":apgar_route_provenance_writer"],
 )
 
 rust_binary(
@@ -123,6 +169,22 @@ rust_test(
         "@crates//libc",
         "@crates//serde",
         "@crates//serde_json",
+    ],
+)
+
+sh_test(
+    name = "apgar_pin_test",
+    srcs = ["tools/routing/apgar_pin_test.sh"],
+    args = [
+        APGAR_SOURCE_REVISION,
+        "$(location MODULE.bazel)",
+        "$(location src/routing/mod.rs)",
+        "$(location tools/routing/apgar_route_adapter.cc)",
+    ],
+    data = [
+        "MODULE.bazel",
+        "src/routing/mod.rs",
+        "tools/routing/apgar_route_adapter.cc",
     ],
 )
 
@@ -229,6 +291,7 @@ rustfmt_test(
         ":ngspice_differential_gate",
         ":ngspice_differential_hang_fake",
         ":ohmnivore_provenance_writer",
+        ":apgar_route_provenance_writer",
         ":simulation_runner_gate",
         ":voltage_divider",
         "//cmd/circuitc",
@@ -239,6 +302,7 @@ rust_clippy(
     name = "clippy",
     testonly = True,
     deps = [
+        ":apgar_route_provenance_writer",
         ":circuitc",
         ":frontend_equivalence",
         ":ngspice_differential_fake",

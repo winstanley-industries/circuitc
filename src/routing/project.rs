@@ -360,6 +360,18 @@ mod tests {
             .iter()
             .find(|net| net.reference == request.routing_profile.net)
             .unwrap();
+        let canonical_start = request
+            .terminals
+            .iter()
+            .find(|terminal| terminal.reference == target.terminals[0])
+            .unwrap()
+            .center;
+        let canonical_goal = request
+            .terminals
+            .iter()
+            .find(|terminal| terminal.reference == target.terminals[1])
+            .unwrap()
+            .center;
         let mut candidate = AdmittedCandidate {
             schema_major: 1,
             schema_minor: 0,
@@ -383,8 +395,8 @@ mod tests {
             },
             geometry: vec![LinePrimitive {
                 layer: request.routing_profile.allowed_layers[0],
-                start: request.planar_route.start,
-                end: request.planar_route.goal,
+                start: canonical_start,
+                end: canonical_goal,
                 width_dbu: request.routing_profile.nominal_width_dbu,
             }],
             resources: Vec::new(),

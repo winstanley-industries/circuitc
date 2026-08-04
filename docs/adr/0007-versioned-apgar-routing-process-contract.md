@@ -53,6 +53,15 @@ toolchain provenance, deterministic failure states, and bounded parsing. They
 must not serialize APGAR implementation layouts. Identical canonical input to
 the pinned CPU implementation must produce byte-identical contract artifacts.
 
+Bazel pins the adapter to one immutable APGAR commit and checks that the build,
+Rust verifier, and C++ adapter declare the same source identity. The CPU-only
+consumer patch changes only APGAR module evaluation: it makes the unconditionally
+loaded Python rules a regular dependency and omits the unused CUDA GCC module
+extension that cannot be evaluated on the supported Darwin host. It does not
+change APGAR routing source, public APIs, candidate evidence, or exact
+admission. CUDA execution is outside this initial boundary and is not implied
+to be validated by the CPU adapter.
+
 A result remains untrusted routing evidence until CircuitC strictly parses it,
 authenticates it against the exact request and toolchain, verifies the selected
 candidate and APGAR exact-admission status, and losslessly imports only the
