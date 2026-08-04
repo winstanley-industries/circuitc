@@ -104,7 +104,7 @@ pub(crate) fn lower_netlist(design: &Design) -> LoweredSpice {
         )
         .unwrap();
     }
-    output.push_str(".OP\n.END\n");
+    output.push_str(".END\n");
     LoweredSpice {
         netlist: output,
         name_map,
@@ -259,6 +259,11 @@ mod tests {
         let lowered = lower_netlist(&voltage_divider());
         assert!(lowered.netlist.contains("R1 VIN VOUT 10e3"));
         assert!(lowered.netlist.contains("V1 VIN 0 DC 10"));
+        assert!(lowered.netlist.ends_with(".END\n"));
+        assert!(
+            !lowered.netlist.contains(".OP\n"),
+            "an analysis directive must never be synthesized without canonical intent"
+        );
     }
 
     #[test]

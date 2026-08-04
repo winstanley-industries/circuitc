@@ -117,6 +117,21 @@ pub fn compile(design: &Design) -> Result<CompiledArtifacts, CompileError> {
     design
         .validate()
         .map_err(|diagnostics| CompileError { diagnostics })?;
+    if let Some(analysis) = design
+        .analyses
+        .iter()
+        .min_by(|left, right| left.path.cmp(&right.path))
+    {
+        return Err(CompileError {
+            diagnostics: vec![Diagnostic {
+                code: "CC-SIM-PHASE-001",
+                path: format!("design.analyses.{}", analysis.path),
+                related_path: None,
+                message: "declared simulation intent cannot be compiled until deterministic per-analysis lowering and checked execution are available"
+                    .to_owned(),
+            }],
+        });
+    }
     let validated_kicad = kicad::validate(design);
     if !validated_kicad.diagnostics.is_empty() {
         return Err(CompileError {
@@ -171,7 +186,10 @@ mod tests {
     use std::panic::catch_unwind;
 
     use crate::demo::voltage_divider;
-    use crate::design::{ComponentValue, ConnectionState, CopperLayer, ModuleInstance};
+    use crate::design::{
+        ComponentValue, ConnectionState, CopperLayer, ModuleInstance, SimulationAnalysis,
+        SimulationAnalysisKind,
+    };
     use crate::quantity::{Quantity, Unit};
 
     use super::{CompiledArtifacts, compile};
@@ -199,6 +217,36 @@ mod tests {
                 "CircuitC.pretty/R_0603_1608Metric.kicad_mod"
             ]
         );
+    }
+
+    #[test]
+    fn declared_simulation_intent_fails_closed_before_legacy_backend_lowering() {
+        let mut design = voltage_divider();
+        design.analyses = vec![
+            SimulationAnalysis {
+                path: "divider.simulation.transient".to_owned(),
+                kind: SimulationAnalysisKind::DcOperatingPoint,
+            },
+            SimulationAnalysis {
+                path: "divider.simulation.op".to_owned(),
+                kind: SimulationAnalysisKind::DcOperatingPoint,
+            },
+        ];
+
+        for candidate in [design.clone(), {
+            let mut reversed = design;
+            reversed.analyses.reverse();
+            reversed
+        }] {
+            let error = compile(&candidate)
+                .expect_err("declared analysis must not be silently lowered by the legacy backend");
+            assert_eq!(error.diagnostics.len(), 1);
+            assert_eq!(error.diagnostics[0].code, "CC-SIM-PHASE-001");
+            assert_eq!(
+                error.diagnostics[0].path,
+                "design.analyses.divider.simulation.op"
+            );
+        }
     }
 
     #[test]

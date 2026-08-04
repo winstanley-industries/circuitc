@@ -93,6 +93,8 @@ pub fn voltage_divider() -> Design {
                 }),
             },
         ],
+        analyses: Vec::new(),
+        assertions: Vec::new(),
         board: Board {
             outline: RectNm {
                 origin: PointNm::new(0, 0),

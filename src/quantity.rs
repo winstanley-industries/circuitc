@@ -1,13 +1,17 @@
+use std::cmp::Ordering;
 use std::fmt;
 
 /// Physical dimension carried by an exact decimal quantity.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Unit {
     Ohm,
     Volt,
     Ampere,
     Farad,
     Henry,
+    Hertz,
+    Second,
+    Degree,
     Dimensionless,
 }
 
@@ -19,6 +23,9 @@ impl Unit {
             Self::Ampere => "A",
             Self::Farad => "F",
             Self::Henry => "H",
+            Self::Hertz => "Hz",
+            Self::Second => "s",
+            Self::Degree => "°",
             Self::Dimensionless => "",
         }
     }
@@ -55,6 +62,20 @@ impl Quantity {
 
     pub const fn exponent_is_valid(self) -> bool {
         self.exponent >= Self::MIN_EXPONENT && self.exponent <= Self::MAX_EXPONENT
+    }
+
+    /// Compare two same-dimension decimal quantities without lowering to
+    /// floating point or overflowing a fixed-width scaled integer.
+    pub fn exact_cmp(self, other: Self) -> Option<Ordering> {
+        if self.unit != other.unit {
+            return None;
+        }
+        Some(compare_decimal(
+            self.coefficient,
+            self.exponent,
+            other.coefficient,
+            other.exponent,
+        ))
     }
 
     /// Return an exact SPICE-compatible decimal literal without using floats.
@@ -106,6 +127,62 @@ impl Quantity {
         let shift = u32::from((self.exponent - exponent) as u8);
         (i128::from(self.coefficient) * 10_i128.pow(shift), exponent)
     }
+}
+
+fn compare_decimal(
+    left_coefficient: i64,
+    left_exponent: i8,
+    right_coefficient: i64,
+    right_exponent: i8,
+) -> Ordering {
+    match (left_coefficient.signum(), right_coefficient.signum()) {
+        (left, right) if left != right => return left.cmp(&right),
+        (0, 0) => return Ordering::Equal,
+        _ => {}
+    }
+
+    let ordering = compare_decimal_magnitude(
+        left_coefficient.unsigned_abs(),
+        left_exponent,
+        right_coefficient.unsigned_abs(),
+        right_exponent,
+    );
+    if left_coefficient.is_negative() {
+        ordering.reverse()
+    } else {
+        ordering
+    }
+}
+
+fn compare_decimal_magnitude(
+    left_coefficient: u64,
+    left_exponent: i8,
+    right_coefficient: u64,
+    right_exponent: i8,
+) -> Ordering {
+    let left_digits = left_coefficient.to_string();
+    let right_digits = right_coefficient.to_string();
+    let left_order = i16::try_from(left_digits.len()).expect("u64 decimal width fits i16")
+        + i16::from(left_exponent);
+    let right_order = i16::try_from(right_digits.len()).expect("u64 decimal width fits i16")
+        + i16::from(right_exponent);
+    match left_order.cmp(&right_order) {
+        Ordering::Equal => {}
+        ordering => return ordering,
+    }
+
+    let width = left_digits.len().max(right_digits.len());
+    let left_bytes = left_digits.as_bytes();
+    let right_bytes = right_digits.as_bytes();
+    for index in 0..width {
+        let left = left_bytes.get(index).copied().unwrap_or(b'0');
+        let right = right_bytes.get(index).copied().unwrap_or(b'0');
+        match left.cmp(&right) {
+            Ordering::Equal => {}
+            ordering => return ordering,
+        }
+    }
+    Ordering::Equal
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -162,6 +239,8 @@ impl fmt::Display for Quantity {
 
 #[cfg(test)]
 mod tests {
+    use std::cmp::Ordering;
+
     use super::{Quantity, Unit};
 
     #[test]
@@ -200,5 +279,29 @@ mod tests {
             Quantity::new(100, -3, Unit::Volt)
         );
         assert!(expected.is_canonical());
+    }
+
+    #[test]
+    fn compares_exact_decimals_without_floating_point_or_scaled_integer_overflow() {
+        assert_eq!(
+            Quantity::new(1, 18, Unit::Hertz).exact_cmp(Quantity::new(i64::MAX, -18, Unit::Hertz)),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            Quantity::new(-1, 18, Unit::Second).exact_cmp(Quantity::new(
+                i64::MIN,
+                -18,
+                Unit::Second
+            )),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            Quantity::new(12, 0, Unit::Degree).exact_cmp(Quantity::new(1, 1, Unit::Degree)),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            Quantity::new(1, 0, Unit::Volt).exact_cmp(Quantity::new(1, 0, Unit::Ohm)),
+            None
+        );
     }
 }

@@ -130,6 +130,8 @@ pub(crate) enum DeclarationSyntax {
     Net(NetSyntax),
     Module(ModuleSyntax),
     Component(ComponentSyntax),
+    SimulationAnalysis(SimulationAnalysisSyntax),
+    SimulationAssertion(SimulationAssertionSyntax),
     Board(BoardSyntax),
 }
 
@@ -242,6 +244,57 @@ pub(crate) struct QuantitySyntax {
     pub number: Spanned<String>,
     pub unit: Spanned<String>,
     pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SimulationAnalysisSyntax {
+    pub path: Spanned<String>,
+    pub kind: SimulationAnalysisKindSyntax,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SimulationAnalysisKindSyntax {
+    DcOperatingPoint,
+    AcLinearSweep {
+        source: Spanned<String>,
+        points: Spanned<String>,
+        start_frequency: QuantitySyntax,
+        stop_frequency: QuantitySyntax,
+        magnitude: QuantitySyntax,
+        phase: QuantitySyntax,
+    },
+    Transient {
+        step: QuantitySyntax,
+        stop: QuantitySyntax,
+        start: QuantitySyntax,
+        uic: Spanned<String>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SimulationAssertionSyntax {
+    pub path: Spanned<String>,
+    pub analysis_path: Spanned<String>,
+    pub net: Spanned<String>,
+    pub sample: SimulationSampleSyntax,
+    pub expected: QuantitySyntax,
+    pub absolute_tolerance: QuantitySyntax,
+    pub relative_tolerance: QuantitySyntax,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SimulationSampleSyntax {
+    Scalar(Span),
+    Frequency {
+        quantity: QuantitySyntax,
+        span: Span,
+    },
+    Time {
+        quantity: QuantitySyntax,
+        span: Span,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

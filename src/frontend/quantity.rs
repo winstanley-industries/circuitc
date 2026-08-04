@@ -80,13 +80,20 @@ pub(crate) fn lower_electrical(
         "ohm" => (Unit::Ohm, 0_i32),
         "kohm" => (Unit::Ohm, 3),
         "V" => (Unit::Volt, 0),
+        "Hz" => (Unit::Hertz, 0),
+        "kHz" => (Unit::Hertz, 3),
+        "s" => (Unit::Second, 0),
+        "ms" => (Unit::Second, -3),
+        "us" => (Unit::Second, -6),
+        "deg" => (Unit::Degree, 0),
+        "ratio" => (Unit::Dimensionless, 0),
         other => {
             diagnostics.push(SourceDiagnostic::new(
                 "CC-LANG-QUANTITY-002",
                 source,
                 quantity.unit.span,
                 semantic_path.map(str::to_owned),
-                format!("unsupported electrical unit `{other}`"),
+                format!("unsupported exact quantity unit `{other}`"),
             ));
             return None;
         }
@@ -115,7 +122,7 @@ pub(crate) fn lower_electrical(
                 source,
                 quantity.span,
                 semantic_path.map(str::to_owned),
-                format!("electrical exponent {exponent} is outside [-18, 18]"),
+                format!("quantity exponent {exponent} is outside [-18, 18]"),
             ));
             None
         }
@@ -273,6 +280,69 @@ mod tests {
             lower_electrical(&source, &resistance, Unit::Ohm, None, &mut Vec::new()),
             Some(Quantity::new(10, 3, Unit::Ohm))
         );
+    }
+
+    #[test]
+    fn lowers_simulation_intent_units_exactly() {
+        for (number, suffix, unit, expected) in [
+            ("10", "Hz", Unit::Hertz, Quantity::new(10, 0, Unit::Hertz)),
+            ("2.5", "kHz", Unit::Hertz, Quantity::new(25, 2, Unit::Hertz)),
+            ("3", "s", Unit::Second, Quantity::new(3, 0, Unit::Second)),
+            (
+                "1.5",
+                "ms",
+                Unit::Second,
+                Quantity::new(15, -4, Unit::Second),
+            ),
+            (
+                "25",
+                "us",
+                Unit::Second,
+                Quantity::new(25, -6, Unit::Second),
+            ),
+            (
+                "-90",
+                "deg",
+                Unit::Degree,
+                Quantity::new(-90, 0, Unit::Degree),
+            ),
+            (
+                "0.01",
+                "ratio",
+                Unit::Dimensionless,
+                Quantity::new(1, -2, Unit::Dimensionless),
+            ),
+        ] {
+            let (source, syntax) = syntax(number, suffix);
+            assert_eq!(
+                lower_electrical(&source, &syntax, unit, None, &mut Vec::new()),
+                Some(expected),
+                "failed to lower {number} {suffix}"
+            );
+        }
+    }
+
+    #[test]
+    fn simulation_quantity_dimension_mismatch_has_a_stable_span_and_path() {
+        let (source, wrong) = syntax("1", "ms");
+        let mut diagnostics = Vec::new();
+        assert_eq!(
+            lower_electrical(
+                &source,
+                &wrong,
+                Unit::Hertz,
+                Some("design.analyses.ac.start_frequency"),
+                &mut diagnostics,
+            ),
+            None
+        );
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "CC-LANG-QUANTITY-005");
+        assert_eq!(
+            diagnostics[0].semantic_path.as_deref(),
+            Some("design.analyses.ac.start_frequency")
+        );
+        assert_eq!((diagnostics[0].start, diagnostics[0].end), (2, 4));
     }
 
     #[test]
