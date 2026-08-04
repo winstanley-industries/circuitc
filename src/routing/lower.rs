@@ -58,33 +58,37 @@ pub(crate) fn lower_request(design: &Design) -> Result<Option<RouteInputBundle>,
 fn lower_one(design: &Design, request: &RoutingRequest) -> Result<RouteInputBundle, Diagnostic> {
     let request_diagnostic_path = request_path(request);
     let mut identities = IdentityAllocator::new(stable_u64);
-    let layers = lower_layers(design, &mut identities, &request_diagnostic_path)?;
-
-    let mut net_refs = BTreeMap::new();
-    for net in sorted_nets(design) {
-        let reference = identities.allocate(
-            &design.name,
-            "net",
-            &[net.name.as_str()],
-            format!("design.nets.{}", net.name),
-        )?;
-        net_refs.insert(net.name.as_str(), reference);
-    }
-    let routed_net = net_refs.get(request.net.as_str()).copied().ok_or_else(|| {
-        lower_diagnostic(
-            LOWER_INTERNAL,
-            &request_diagnostic_path,
-            format!(
-                "validated routing request references missing canonical net {}",
-                request.net
-            ),
-        )
-    })?;
+    let selected_layer = layer_id(request.layer);
+    let layers = lower_layers(
+        design,
+        request.layer,
+        &mut identities,
+        &request_diagnostic_path,
+    )?;
+    let routed_net_definition = design
+        .nets
+        .iter()
+        .find(|net| net.name == request.net)
+        .ok_or_else(|| {
+            lower_diagnostic(
+                LOWER_INTERNAL,
+                &request_diagnostic_path,
+                format!(
+                    "validated routing request references missing canonical net {}",
+                    request.net
+                ),
+            )
+        })?;
+    let routed_net = identities.allocate(
+        &design.name,
+        "net",
+        &[routed_net_definition.name.as_str()],
+        format!("design.nets.{}", routed_net_definition.name),
+    )?;
 
     let mut terminals = Vec::new();
     let mut target_terminals = Vec::new();
     let mut obstacles = Vec::new();
-    let mut terminals_by_net: BTreeMap<&str, Vec<EntityRef>> = BTreeMap::new();
 
     let mut components: Vec<_> = design
         .components
@@ -97,6 +101,9 @@ fn lower_one(design: &Design, request: &RoutingRequest) -> Result<RouteInputBund
         let Some(physical) = component.physical.as_ref() else {
             continue;
         };
+        if physical.placement.layer != request.layer {
+            continue;
+        }
         let mut pads: Vec<_> = physical.footprint.pads.iter().collect();
         pads.sort_by(|left, right| left.number.cmp(&right.number));
         for pad in pads {
@@ -115,17 +122,11 @@ fn lower_one(design: &Design, request: &RoutingRequest) -> Result<RouteInputBund
                 pad.size,
                 &format!("{pad_path}.bounds"),
             )?;
-            let layer = layer_id(physical.placement.layer);
-            let owner_net = match component.net_for_pad(&pad.number) {
-                Some(name) => Some(net_refs.get(name).copied().ok_or_else(|| {
-                    lower_diagnostic(
-                        LOWER_INTERNAL,
-                        &pad_path,
-                        format!("validated pad references missing canonical net {name}"),
-                    )
-                })?),
-                None => None,
-            };
+            let layer = selected_layer;
+            let owner_net = component
+                .net_for_pad(&pad.number)
+                .filter(|name| *name == request.net)
+                .map(|_| routed_net);
 
             if let Some(net) = owner_net {
                 let reference = identities.allocate(
@@ -143,23 +144,11 @@ fn lower_one(design: &Design, request: &RoutingRequest) -> Result<RouteInputBund
                     connection_region: bounds,
                     layers: vec![layer],
                 };
-                terminals_by_net
-                    .entry(component.net_for_pad(&pad.number).ok_or_else(|| {
-                        lower_diagnostic(
-                            LOWER_INTERNAL,
-                            &pad_path,
-                            "connected terminal lost its canonical net association",
-                        )
-                    })?)
-                    .or_default()
-                    .push(reference);
-                if net == routed_net {
-                    target_terminals.push((
-                        component.path.as_str(),
-                        pad.number.as_str(),
-                        terminal.clone(),
-                    ));
-                }
+                target_terminals.push((
+                    component.path.as_str(),
+                    pad.number.as_str(),
+                    terminal.clone(),
+                ));
                 terminals.push(terminal);
             }
 
@@ -181,17 +170,11 @@ fn lower_one(design: &Design, request: &RoutingRequest) -> Result<RouteInputBund
     let mut routes: Vec<_> = design.board.routes.iter().collect();
     routes.sort_by(|left, right| left.path.cmp(&right.path));
     for route in routes {
+        if route.layer != request.layer {
+            continue;
+        }
         let route_path = format!("design.board.routes.{}", route.path);
-        let owner_net = net_refs.get(route.net.as_str()).copied().ok_or_else(|| {
-            lower_diagnostic(
-                LOWER_INTERNAL,
-                &route_path,
-                format!(
-                    "validated route references missing canonical net {}",
-                    route.net
-                ),
-            )
-        })?;
+        let owner_net = (route.net == request.net).then_some(routed_net);
         obstacles.push(ObstacleContract {
             reference: identities.allocate(
                 &design.name,
@@ -201,7 +184,7 @@ fn lower_one(design: &Design, request: &RoutingRequest) -> Result<RouteInputBund
             )?,
             layer: layer_id(route.layer),
             bounds: route_bounds(route.start, route.end, route.width_nm, &route_path)?,
-            owner_net: Some(owner_net),
+            owner_net,
             provenance: route.path.clone(),
         });
     }
@@ -220,29 +203,16 @@ fn lower_one(design: &Design, request: &RoutingRequest) -> Result<RouteInputBund
         ));
     };
 
-    let mut nets = Vec::with_capacity(net_refs.len());
-    for net in sorted_nets(design) {
-        let reference = net_refs.get(net.name.as_str()).copied().ok_or_else(|| {
-            lower_diagnostic(
-                LOWER_INTERNAL,
-                format!("design.nets.{}", net.name),
-                "canonical net identity disappeared during lowering",
-            )
-        })?;
-        let mut net_terminals = terminals_by_net
-            .remove(net.name.as_str())
-            .unwrap_or_default();
-        net_terminals.sort();
-        nets.push(NetContract {
-            reference,
-            name: net.name.clone(),
-            terminals: net_terminals,
-        });
-    }
-    nets.sort_by_key(|net| net.reference);
+    let nets = vec![NetContract {
+        reference: routed_net,
+        name: routed_net_definition.name.clone(),
+        terminals: terminals
+            .iter()
+            .map(|terminal| terminal.reference)
+            .collect(),
+    }];
 
     let board_bounds = board_bounds(design, &request_diagnostic_path)?;
-    let selected_layer = layer_id(request.layer);
     let nominal_width_dbu = size_to_dbu(
         request.width_nm,
         &format!("{request_diagnostic_path}.width_nm"),
@@ -388,45 +358,27 @@ fn lower_one(design: &Design, request: &RoutingRequest) -> Result<RouteInputBund
 
 fn lower_layers(
     design: &Design,
+    selected: CopperLayer,
     identities: &mut IdentityAllocator,
     path: &str,
 ) -> Result<Vec<LayerContract>, Diagnostic> {
-    Ok(vec![
-        LayerContract {
-            reference: identities.allocate(
-                &design.name,
-                "layer",
-                &["front"],
-                format!("{path}.layers.front"),
-            )?,
-            routing_id: FRONT_ROUTING_ID,
-            name: "F.Cu".to_owned(),
-            physical_order: 0,
-            side: LayerSide::Front,
-            routable: true,
-        },
-        LayerContract {
-            reference: identities.allocate(
-                &design.name,
-                "layer",
-                &["back"],
-                format!("{path}.layers.back"),
-            )?,
-            routing_id: BACK_ROUTING_ID,
-            name: "B.Cu".to_owned(),
-            physical_order: 1,
-            side: LayerSide::Back,
-            routable: true,
-        },
-    ])
-}
-
-fn sorted_nets(design: &Design) -> Vec<&crate::design::Net> {
-    let mut nets: Vec<_> = design.nets.iter().collect();
-    nets.sort_by(|left, right| {
-        (left.is_ground, left.name.as_str()).cmp(&(right.is_ground, right.name.as_str()))
-    });
-    nets
+    let (identity, routing_id, name, physical_order, side) = match selected {
+        CopperLayer::Front => ("front", FRONT_ROUTING_ID, "F.Cu", 0, LayerSide::Front),
+        CopperLayer::Back => ("back", BACK_ROUTING_ID, "B.Cu", 1, LayerSide::Back),
+    };
+    Ok(vec![LayerContract {
+        reference: identities.allocate(
+            &design.name,
+            "layer",
+            &[identity],
+            format!("{path}.layers.{identity}"),
+        )?,
+        routing_id,
+        name: name.to_owned(),
+        physical_order,
+        side,
+        routable: true,
+    }])
 }
 
 fn board_bounds(design: &Design, path: &str) -> Result<BoxDbu, Diagnostic> {
@@ -809,9 +761,18 @@ mod tests {
         let request = &bundle.request;
         assert_eq!(request.dbu_per_millimeter, 2_000_000);
         assert_eq!(request.request_path, "board.autoroute.vout");
-        assert_eq!(request.layers.len(), 2);
+        assert_eq!(request.layers.len(), 1);
         assert_eq!(request.layers[0].routing_id, FRONT_ROUTING_ID);
-        assert_eq!(request.layers[1].routing_id, BACK_ROUTING_ID);
+        assert_eq!(request.nets.len(), 1);
+        assert_eq!(request.nets[0].name, "VOUT");
+        assert_eq!(request.terminals.len(), 2);
+        assert!(
+            request
+                .obstacles
+                .iter()
+                .any(|obstacle| obstacle.owner_net.is_none()),
+            "foreign-net pads remain conservative anonymous obstacles"
+        );
         assert_eq!(request.routing_profile.nominal_width_dbu, 500_000);
         assert_eq!(request.routing_profile.clearance_dbu, 400_000);
         assert_eq!(

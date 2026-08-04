@@ -506,18 +506,25 @@ impl RouteRequestContract {
             "unsupported_host_rules",
             &mut diagnostics,
         );
-        if self.layers.is_empty() {
+        if self.layers.len() != 1 {
             invalid(
                 &mut diagnostics,
                 "layers",
-                "request requires at least one layer",
+                "route request v1 requires exactly one layer",
             );
         }
-        if self.nets.is_empty() {
+        if self.nets.len() != 1 {
             invalid(
                 &mut diagnostics,
                 "nets",
-                "request requires at least one net",
+                "route request v1 requires exactly one routed net",
+            );
+        }
+        if self.terminals.len() != 2 {
+            invalid(
+                &mut diagnostics,
+                "terminals",
+                "route request v1 requires exactly two terminal records",
             );
         }
         validate_sorted_unique(
@@ -2070,6 +2077,39 @@ mod tests {
         assert!(result_json.ends_with('\n'));
         assert!(!result_json[..result_json.len() - 1].contains('\n'));
         assert_eq!(parse_result(&result_json).unwrap(), result);
+    }
+
+    #[test]
+    fn request_v1_rejects_expanded_layer_net_and_terminal_catalogues() {
+        let mut extra_layer = request();
+        let mut layer = extra_layer.layers[0].clone();
+        layer.reference = entity(6);
+        layer.routing_id = 31;
+        layer.name = "back".to_owned();
+        layer.physical_order = 1;
+        layer.side = LayerSide::Back;
+        extra_layer.layers.push(layer);
+        let error = render_request(&extra_layer).unwrap_err();
+        assert_eq!(error.path, "layers");
+        assert!(error.message.contains("exactly one layer"));
+
+        let mut extra_net = request();
+        extra_net.nets.push(NetContract {
+            reference: entity(6),
+            name: "FOREIGN".to_owned(),
+            terminals: Vec::new(),
+        });
+        let error = render_request(&extra_net).unwrap_err();
+        assert_eq!(error.path, "nets");
+        assert!(error.message.contains("exactly one routed net"));
+
+        let mut extra_terminal = request();
+        let mut terminal = extra_terminal.terminals[0].clone();
+        terminal.reference = entity(6);
+        extra_terminal.terminals.push(terminal);
+        let error = render_request(&extra_terminal).unwrap_err();
+        assert_eq!(error.path, "terminals");
+        assert!(error.message.contains("exactly two terminal records"));
     }
 
     #[test]
