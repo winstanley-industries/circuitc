@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import decimal
 import hashlib
 import json
 import pathlib
 import re
 import stat
+import subprocess
 import sys
 from typing import Any
 
@@ -20,6 +22,30 @@ CHECKSUM_PATTERN = re.compile(r"[0-9a-f]{16}\Z")
 UUID_V8_PATTERN = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z"
 )
+PCB_SEGMENT_PATTERN = re.compile(
+    r"^  \(segment\n"
+    r"    \(start (-?[0-9]+(?:\.[0-9]+)?) (-?[0-9]+(?:\.[0-9]+)?)\)\n"
+    r"    \(end (-?[0-9]+(?:\.[0-9]+)?) (-?[0-9]+(?:\.[0-9]+)?)\)\n"
+    r"    \(width ([0-9]+(?:\.[0-9]+)?)\)\n"
+    r'    \(layer "(F\.Cu|B\.Cu)"\)\n'
+    r'    \(net "([^"\n]+)"\)\n'
+    r'    \(uuid "([0-9a-f-]+)"\)\n'
+    r"  \)$",
+    re.MULTILINE,
+)
+ERC_IGNORED_CHECKS = {
+    "footprint_filter": "Assigned footprint doesn't match footprint filters",
+    "four_way_junction": "Four connection points are joined together",
+    "simulation_model_issue": "SPICE model issue",
+    "single_global_label": "Global label only appears once in the schematic",
+}
+DRC_IGNORED_CHECKS = {
+    "footprint_filters_mismatch": "Footprint doesn't match symbol's footprint filters",
+    "footprint_type_mismatch": "Footprint component type doesn't match footprint pads",
+    "missing_courtyard": "Footprint has no courtyard defined",
+    "track_not_centered_on_via": "Track endpoint not centered on via",
+    "tuning_profile_track_geometries": "Tuning profile track geometries",
+}
 
 
 class AcceptanceError(Exception):
@@ -39,11 +65,12 @@ def _reject_constant(value: str) -> None:
     raise AcceptanceError(f"non-finite JSON number {value!r}")
 
 
-def _read_regular(path: pathlib.Path) -> bytes:
-    metadata = path.lstat()
+def _read_regular(path: pathlib.Path, *, follow_symlink: bool = False) -> bytes:
+    resolved = path.resolve(strict=True) if follow_symlink else path
+    metadata = resolved.lstat()
     if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_INPUT_BYTES:
         raise AcceptanceError(f"{path} is not a bounded regular file")
-    data = path.read_bytes()
+    data = resolved.read_bytes()
     if len(data) != metadata.st_size:
         raise AcceptanceError(f"{path} changed while it was read")
     return data
@@ -111,7 +138,11 @@ def _sha256(data: bytes) -> str:
 
 
 def _require_schema(value: dict[str, Any], name: str, path: str) -> None:
-    if value.get("schema_name") != name or value.get("schema_version") != 1:
+    if (
+        value.get("schema_name") != name
+        or type(value.get("schema_version")) is not int
+        or value["schema_version"] != 1
+    ):
         raise AcceptanceError(f"{path} has an unsupported schema")
 
 
@@ -195,7 +226,10 @@ CANDIDATE_KEYS = {
 
 
 def _validate_host_report(
-    report: dict[str, Any], kind: str, expected_source: str
+    report: dict[str, Any],
+    kind: str,
+    expected_source: pathlib.Path,
+    expected_source_data: bytes,
 ) -> dict[str, Any]:
     common = {
         "schema_version",
@@ -207,9 +241,9 @@ def _validate_host_report(
         "ignored_checks",
     }
     keys = (
-        common | {"schematic_parity", "unconnected_items", "violations"}
+        common | {"source_sha256", "schematic_parity", "unconnected_items", "violations"}
         if kind == "drc"
-        else common | {"sheets"}
+        else common | {"source_sha256", "sheets"}
     )
     _require_keys(report, keys, kind)
     if report["schema_version"] != 1 or report["report_kind"] != kind:
@@ -222,16 +256,23 @@ def _validate_host_report(
         or not host["version"].startswith("10.")
     ):
         raise AcceptanceError(f"{kind} report is not supported KiCad 10 evidence")
-    if report["source"] != expected_source:
-        raise AcceptanceError(f"{kind} report source does not match {expected_source}")
+    if report["source"] != expected_source.name:
+        raise AcceptanceError(f"{kind} report source does not match {expected_source.name}")
+    if report["source_sha256"] != _sha256(expected_source_data):
+        raise AcceptanceError(f"{kind} report does not bind the exact source artifact bytes")
     _require_string(report["coordinate_units"], f"{kind}.coordinate_units")
     if report["included_severities"] != ["error", "exclusion", "warning"]:
         raise AcceptanceError(f"{kind}.included_severities does not match required policy")
     ignored_checks = _require_list(report["ignored_checks"], f"{kind}.ignored_checks")
+    expected_ignored_checks = DRC_IGNORED_CHECKS if kind == "drc" else ERC_IGNORED_CHECKS
+    observed_ignored_checks = {}
     for index, ignored in enumerate(ignored_checks):
         ignored = _require_keys(ignored, {"description", "key"}, f"{kind}.ignored_checks[{index}]")
         _require_string(ignored["description"], f"{kind}.ignored_checks[{index}].description")
         _require_string(ignored["key"], f"{kind}.ignored_checks[{index}].key")
+        observed_ignored_checks[ignored["key"]] = ignored["description"]
+    if observed_ignored_checks != expected_ignored_checks:
+        raise AcceptanceError(f"{kind}.ignored_checks does not match the acceptance policy")
     if kind == "drc":
         for field in ("schematic_parity", "unconnected_items", "violations"):
             if report[field] != []:
@@ -247,6 +288,71 @@ def _validate_host_report(
             if sheet["violations"] != []:
                 raise AcceptanceError(f"erc.sheets[{index}].violations must be empty")
     return host
+
+
+VERIFIED_EVIDENCE_KEYS = {
+    "schema_name",
+    "schema_version",
+    "design_name",
+    "request_path",
+    "request_identity_sha256",
+    "request_sha256",
+    "result_sha256",
+    "provenance_sha256",
+    "selected_candidate_id",
+    "candidate_geometry_signature",
+    "candidate_resource_signature",
+    "candidate_payload_checksum",
+    "tool",
+    "segments",
+}
+
+
+def _verified_apgar_evidence(
+    verifier: pathlib.Path,
+    request_path: pathlib.Path,
+    result_path: pathlib.Path,
+    provenance_path: pathlib.Path,
+    request_data: bytes,
+    result_data: bytes,
+    provenance_data: bytes,
+) -> dict[str, Any]:
+    process = subprocess.run(
+        [str(verifier), str(request_path), str(result_path), str(provenance_path)],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=False,
+    )
+    if process.returncode != 0:
+        message = process.stderr.decode("utf-8", errors="replace").strip()
+        raise AcceptanceError(f"strict APGAR evidence verifier rejected input: {message}")
+    if len(process.stdout) > MAX_INPUT_BYTES or process.stderr:
+        raise AcceptanceError("strict APGAR evidence verifier emitted invalid output")
+    try:
+        text = process.stdout.decode("utf-8")
+        verified = json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise AcceptanceError("strict APGAR evidence verifier output is invalid") from error
+    _require_keys(verified, VERIFIED_EVIDENCE_KEYS, "verified_evidence")
+    canonical = (
+        json.dumps(verified, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n"
+    ).encode()
+    if canonical != process.stdout:
+        raise AcceptanceError("strict APGAR evidence verifier output is not canonical")
+    if (
+        verified["schema_name"] != "circuitc.verified_apgar_route_evidence"
+        or type(verified["schema_version"]) is not int
+        or verified["schema_version"] != 1
+        or verified["request_sha256"] != _sha256(request_data)
+        or verified["result_sha256"] != _sha256(result_data)
+        or verified["provenance_sha256"] != _sha256(provenance_data)
+    ):
+        raise AcceptanceError("strict APGAR evidence summary does not bind exact input bytes")
+    return verified
 
 
 def _selected_candidate(result: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -511,13 +617,75 @@ def _validate_projection_geometry(
             raise AcceptanceError(f"projected KiCad UUID {uuid!r} is not unique in exact PCB bytes")
 
 
+def _millimeters_to_nm(value: str, path: str) -> int:
+    try:
+        nanometers = decimal.Decimal(value) * decimal.Decimal(1_000_000)
+    except decimal.InvalidOperation as error:
+        raise AcceptanceError(f"{path} is not an exact KiCad coordinate") from error
+    if nanometers != nanometers.to_integral_value():
+        raise AcceptanceError(f"{path} is not exactly representable in nanometres")
+    return int(nanometers)
+
+
+def _validate_exact_pcb_segments(projection: dict[str, Any], pcb_data: bytes) -> None:
+    try:
+        pcb = pcb_data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise AcceptanceError("emitted KiCad PCB is not UTF-8") from error
+    matches = list(PCB_SEGMENT_PATTERN.finditer(pcb))
+    if len(matches) != pcb.count("  (segment\n"):
+        raise AcceptanceError("emitted KiCad PCB contains an unsupported segment encoding")
+    by_uuid: dict[str, list[dict[str, Any]]] = {}
+    for index, match in enumerate(matches):
+        start_x, start_y, end_x, end_y, width, layer, net, uuid = match.groups()
+        record = {
+            "start_nm": {
+                "x": _millimeters_to_nm(start_x, f"pcb.segments[{index}].start.x"),
+                "y": _millimeters_to_nm(start_y, f"pcb.segments[{index}].start.y"),
+            },
+            "end_nm": {
+                "x": _millimeters_to_nm(end_x, f"pcb.segments[{index}].end.x"),
+                "y": _millimeters_to_nm(end_y, f"pcb.segments[{index}].end.y"),
+            },
+            "width_nm": _millimeters_to_nm(width, f"pcb.segments[{index}].width"),
+            "layer": {"F.Cu": "front", "B.Cu": "back"}[layer],
+            "net": net,
+        }
+        by_uuid.setdefault(uuid, []).append(record)
+    for index, segment in enumerate(projection["segments"]):
+        uuid = segment["kicad_uuid"]
+        expected = {
+            "start_nm": segment["start_nm"],
+            "end_nm": segment["end_nm"],
+            "width_nm": segment["width_nm"],
+            "layer": segment["layer"],
+            "net": segment["net"],
+        }
+        if by_uuid.get(uuid) != [expected]:
+            raise AcceptanceError(
+                f"exact KiCad segment {index} does not match authenticated APGAR geometry"
+            )
+
+
 def bind(args: argparse.Namespace) -> bytes:
     request, request_data = _load_canonical_contract(args.request)
     result, result_data = _load_canonical_contract(args.result)
     projection, projection_data = _load_canonical_contract(args.projection)
     pcb_data = _read_regular(args.pcb)
+    schematic_data = _read_regular(args.schematic)
     drc, drc_data = _load_json(args.drc)
     erc, erc_data = _load_json(args.erc)
+    provenance_data = _read_regular(args.provenance, follow_symlink=True)
+
+    verified = _verified_apgar_evidence(
+        args.route_verifier,
+        args.request,
+        args.result,
+        args.provenance,
+        request_data,
+        result_data,
+        provenance_data,
+    )
 
     selected_id, candidate, tool = _validate_apgar_join(
         request, request_data, result, result_data, projection, projection_data
@@ -526,10 +694,34 @@ def bind(args: argparse.Namespace) -> bytes:
     if projection["kicad_pcb_sha256"] != pcb_sha:
         raise AcceptanceError("projection PCB digest does not match exact emitted board bytes")
     _validate_projection_geometry(request, candidate, projection, pcb_data)
+    _validate_exact_pcb_segments(projection, pcb_data)
+
+    if (
+        verified["design_name"] != request["design_name"]
+        or verified["request_path"] != request["request_path"]
+        or verified["request_identity_sha256"] != request["request_identity_sha256"]
+        or verified["selected_candidate_id"] != selected_id
+        or verified["candidate_geometry_signature"] != candidate["geometry_signature"]
+        or verified["candidate_resource_signature"] != candidate["resource_signature"]
+        or verified["candidate_payload_checksum"] != candidate["payload_checksum"]
+        or verified["tool"] != tool
+    ):
+        raise AcceptanceError("strict APGAR evidence summary disagrees with joined contracts")
+    expected_segments = [
+        {key: value for key, value in segment.items() if key != "kicad_uuid"}
+        for segment in projection["segments"]
+    ]
+    if verified["segments"] != expected_segments:
+        raise AcceptanceError("projection geometry disagrees with strict APGAR evidence")
 
     design_name = _require_string(request["design_name"], "request.design_name")
-    drc_host = _validate_host_report(drc, "drc", f"{design_name}.kicad_pcb")
-    erc_host = _validate_host_report(erc, "erc", f"{design_name}.kicad_sch")
+    if (
+        args.pcb.name != f"{design_name}.kicad_pcb"
+        or args.schematic.name != f"{design_name}.kicad_sch"
+    ):
+        raise AcceptanceError("KiCad artifact basenames do not match the routed design")
+    drc_host = _validate_host_report(drc, "drc", args.pcb, pcb_data)
+    erc_host = _validate_host_report(erc, "erc", args.schematic, schematic_data)
     if drc_host != erc_host:
         raise AcceptanceError("ERC and DRC host identities do not match")
 
@@ -542,6 +734,7 @@ def bind(args: argparse.Namespace) -> bytes:
         "request_sha256": _sha256(request_data),
         "result_sha256": _sha256(result_data),
         "projection_sha256": _sha256(projection_data),
+        "tool_provenance_sha256": _sha256(provenance_data),
         "selected_candidate_id": selected_id,
         "candidate": {
             "geometry_signature": candidate["geometry_signature"],
@@ -560,6 +753,8 @@ def bind(args: argparse.Namespace) -> bytes:
             "host": drc_host,
             "pcb_filename": args.pcb.name,
             "pcb_sha256": pcb_sha,
+            "schematic_filename": args.schematic.name,
+            "schematic_sha256": _sha256(schematic_data),
             "drc_filename": args.drc.name,
             "drc_sha256": _sha256(drc_data),
             "erc_filename": args.erc.name,
@@ -577,8 +772,11 @@ def main() -> int:
     parser.add_argument("--result", required=True, type=pathlib.Path)
     parser.add_argument("--projection", required=True, type=pathlib.Path)
     parser.add_argument("--pcb", required=True, type=pathlib.Path)
+    parser.add_argument("--schematic", required=True, type=pathlib.Path)
     parser.add_argument("--drc", required=True, type=pathlib.Path)
     parser.add_argument("--erc", required=True, type=pathlib.Path)
+    parser.add_argument("--provenance", required=True, type=pathlib.Path)
+    parser.add_argument("--route-verifier", required=True, type=pathlib.Path)
     parser.add_argument("--output", required=True, type=pathlib.Path)
     args = parser.parse_args()
     try:

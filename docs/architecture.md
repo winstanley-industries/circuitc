@@ -195,7 +195,8 @@ only worth adding after the schema stabilizes. APGAR's exact validation and
 KiCad DRC both gate a route; neither is bypassed for convenience. A separate
 canonical acceptance manifest recomputes the exact request, result, projection,
 emitted-board, and normalized KiCad ERC/DRC digest joins after the supported
-host has parsed the generated project.
+host has parsed the generated project. Checked compilation produces
+provisional routed artifacts; only this post-host manifest denotes acceptance.
 
 ## 7. Parts and libraries
 

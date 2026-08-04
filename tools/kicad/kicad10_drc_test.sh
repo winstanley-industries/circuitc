@@ -9,6 +9,8 @@ project_validator="$5"
 physical_source_fixture="$6"
 routed_source_fixture="$7"
 route_acceptance_binder="$8"
+route_evidence_verifier="$9"
+apgar_route_provenance="${10}"
 
 if [[ -n "${CIRCUITC_KICAD_CLI:-}" ]]; then
   kicad_cli="${CIRCUITC_KICAD_CLI}"
@@ -206,7 +208,8 @@ for directory in "${routed_first_dir}" "${routed_second_dir}"; do
     --allow-ignored-check four_way_junction \
     --allow-ignored-check simulation_model_issue \
     --allow-ignored-check footprint_filter \
-    --identity-map "${directory}/routed_voltage_divider.kicad-map.json"
+    --identity-map "${directory}/routed_voltage_divider.kicad-map.json" \
+    --source-artifact "${directory}/routed_voltage_divider.kicad_sch"
 
   KICAD_CONFIG_HOME="${config_directory}" "${kicad_cli}" pcb drc \
     --format json \
@@ -223,7 +226,8 @@ for directory in "${routed_first_dir}" "${routed_second_dir}"; do
     --allow-ignored-check tuning_profile_track_geometries \
     --allow-ignored-check footprint_filters_mismatch \
     --allow-ignored-check footprint_type_mismatch \
-    --identity-map "${directory}/routed_voltage_divider.kicad-map.json"
+    --identity-map "${directory}/routed_voltage_divider.kicad-map.json" \
+    --source-artifact "${directory}/routed_voltage_divider.kicad_pcb"
 
   route_directory="$(find "${directory}/routing" -mindepth 1 -maxdepth 1 -type d)"
   test "$(printf '%s\n' "${route_directory}" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
@@ -232,8 +236,11 @@ for directory in "${routed_first_dir}" "${routed_second_dir}"; do
     --result "${route_directory}/result.json" \
     --projection "${route_directory}/projection.json" \
     --pcb "${directory}/routed_voltage_divider.kicad_pcb" \
+    --schematic "${directory}/routed_voltage_divider.kicad_sch" \
     --drc "${directory}/drc.normalized.json" \
     --erc "${directory}/erc.normalized.json" \
+    --provenance "${apgar_route_provenance}" \
+    --route-verifier "${route_evidence_verifier}" \
     --output "${directory}/route-acceptance.json"
 done
 

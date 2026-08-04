@@ -1,6 +1,7 @@
 //! Versioned CircuitC-to-APGAR routing process boundary.
 
 pub(crate) mod contract;
+pub(crate) mod evidence;
 pub(crate) mod import;
 pub(crate) mod lower;
 pub(crate) mod project;
