@@ -13,17 +13,13 @@ pub mod frontend;
 mod kicad;
 mod library;
 pub mod quantity;
-// The routing contract is integrated with checked compilation in a later
-// stacked layer. Keep this independently tested contract slice lint-clean
-// while its production process boundary is intentionally not reachable yet.
-#[allow(dead_code)]
 pub(crate) mod routing;
 pub mod simulation;
 mod spice;
 
 pub use compile::{
     CheckedCompileError, CheckedCompiledArtifacts, CompileError, CompiledArtifacts,
-    CompiledSimulation, InvalidRelativeArtifactPath, KicadIdentity, KicadLibraryFile,
-    KicadLibraryFileKind, RelativeArtifactPath, compile, compile_checked,
+    CompiledRouting, CompiledSimulation, InvalidRelativeArtifactPath, KicadIdentity,
+    KicadLibraryFile, KicadLibraryFileKind, RelativeArtifactPath, compile, compile_checked,
 };
 pub use spice::{SpiceComponentNameMapping, SpiceNameMap, SpiceNetNameMapping};

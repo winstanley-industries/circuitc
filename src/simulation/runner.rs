@@ -2541,8 +2541,14 @@ mod tests {
             ),
         )
         .unwrap();
-        let runner = OhmnivoreRunner::from_paths(&executable, &provenance, &root)
-            .with_limits(limits.unwrap_or_default());
+        let limits = limits.unwrap_or_else(|| {
+            let mut limits = OhmnivoreLimits::default();
+            limits.handshake_wall = Duration::from_secs(10);
+            limits.analysis_wall = Duration::from_secs(60);
+            limits
+        });
+        let runner =
+            OhmnivoreRunner::from_paths(&executable, &provenance, &root).with_limits(limits);
         (runner, root)
     }
 }

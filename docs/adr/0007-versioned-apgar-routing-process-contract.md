@@ -70,6 +70,15 @@ change APGAR routing source, public APIs, candidate evidence, or exact
 admission. CUDA execution is outside this initial boundary and is not implied
 to be validated by the CPU adapter.
 
+On supported Unix hosts, CircuitC hashes and records filesystem identity from
+one open adapter handle, copies those exact verified bytes into the private
+per-execution directory, executes only that restricted copy, and rechecks both
+the pinned source and staged image before accepting output. Other hosts fail
+before process launch until they provide an equivalent isolation boundary;
+they do not silently weaken executable identity or resource controls. The
+caller's UID and local filesystem are part of the trusted computing base; the
+private directory excludes other users, not hostile same-UID processes.
+
 A result remains untrusted routing evidence until CircuitC strictly parses it,
 authenticates it against the exact request and toolchain, verifies the selected
 candidate and APGAR exact-admission status, and losslessly imports only the
@@ -89,6 +98,18 @@ CircuitC source remains the human-authored authority. The authored request
 authorizes route search, the authenticated import supplies the selected exact
 geometry to the canonical Design IR for that build, and generated KiCad files
 remain deterministic outputs rather than an alternate editable source.
+
+Static compiler APIs reject unresolved autoroute intent. Checked compilation
+executes the complete route boundary before static and simulation lowering. On
+success, the canonical request, authenticated result, projection manifest,
+exact generated board, and other compiled artifacts are published atomically
+as provisional build output. They are not accepted route evidence until the
+separate supported-host validation and acceptance-manifest step succeeds. A
+routing failure publishes neither provisional output nor a checked-failure
+tree. If routing succeeds but a later simulation fails, CircuitC discards
+routing and static artifacts and may publish only the complete simulation
+evidence chains: the projection is not meaningful without the exact board it
+binds.
 
 ## Consequences
 

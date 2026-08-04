@@ -8,7 +8,7 @@ use crate::design::{CopperLayer, PointNm, RouteSegment};
 use super::contract::{
     AdmittedCandidate, ContractDiagnostic, RouteOutcome, ToolIdentity, sha256_hex,
 };
-use super::import::ImportedRoute;
+use super::import::{ImportedRoute, dbu_to_nm, point_to_nm};
 
 const PROJECTION_SCHEMA_NAME: &str = "circuitc.apgar_route_projection";
 const PROJECTION_SCHEMA_VERSION: u32 = 1;
@@ -71,6 +71,32 @@ struct ProjectionPoint {
 pub(crate) fn project_imported_route(
     imported: &ImportedRoute,
 ) -> Result<ProjectedRoute, ContractDiagnostic> {
+    validate_projectable(imported)?;
+    let candidate = selected_candidate(imported)?;
+    let static_artifacts = compile(&imported.design).map_err(|error| {
+        error.diagnostics.into_iter().next().map_or_else(
+            || projection_error("design", "KiCad projection failed without a diagnostic"),
+            |diagnostic| {
+                projection_error(
+                    diagnostic.path,
+                    format!("{}: {}", diagnostic.code, diagnostic.message),
+                )
+            },
+        )
+    })?;
+    project_with_static_artifacts(imported, candidate, static_artifacts)
+}
+
+pub(crate) fn project_imported_route_with_static_artifacts(
+    imported: &ImportedRoute,
+    static_artifacts: CompiledArtifacts,
+) -> Result<ProjectedRoute, ContractDiagnostic> {
+    validate_projectable(imported)?;
+    let candidate = selected_candidate(imported)?;
+    project_with_static_artifacts(imported, candidate, static_artifacts)
+}
+
+fn validate_projectable(imported: &ImportedRoute) -> Result<(), ContractDiagnostic> {
     imported.design.validate().map_err(|diagnostics| {
         diagnostics.into_iter().next().map_or_else(
             || {
@@ -93,18 +119,14 @@ pub(crate) fn project_imported_route(
             "imported route projection requires a fully resolved Design IR",
         ));
     }
-    let candidate = selected_candidate(imported)?;
-    let static_artifacts = compile(&imported.design).map_err(|error| {
-        error.diagnostics.into_iter().next().map_or_else(
-            || projection_error("design", "KiCad projection failed without a diagnostic"),
-            |diagnostic| {
-                projection_error(
-                    diagnostic.path,
-                    format!("{}: {}", diagnostic.code, diagnostic.message),
-                )
-            },
-        )
-    })?;
+    Ok(())
+}
+
+fn project_with_static_artifacts(
+    imported: &ImportedRoute,
+    candidate: &AdmittedCandidate,
+    static_artifacts: CompiledArtifacts,
+) -> Result<ProjectedRoute, ContractDiagnostic> {
     let segments = bind_segments(imported, candidate, &static_artifacts)?;
     let contract = RouteProjectionContract {
         schema_name: PROJECTION_SCHEMA_NAME.to_owned(),
@@ -220,8 +242,18 @@ fn bind_segments(
                 ));
             }
             let line = candidate.geometry[index];
-            let expected_start = point_nm(line.start);
-            let expected_end = point_nm(line.end);
+            let expected_start = point_to_nm(
+                line.start,
+                &format!("result.outcome.candidate.geometry[{index}].start"),
+            )?;
+            let expected_end = point_to_nm(
+                line.end,
+                &format!("result.outcome.candidate.geometry[{index}].end"),
+            )?;
+            let expected_width = dbu_to_nm(
+                line.width_dbu,
+                &format!("result.outcome.candidate.geometry[{index}].width_dbu"),
+            )?;
             let expected_layer = copper_layer(line.layer).ok_or_else(|| {
                 projection_error(
                     &route.path,
@@ -230,7 +262,7 @@ fn bind_segments(
             })?;
             if route.start != expected_start
                 || route.end != expected_end
-                || route.width_nm != line.width_dbu / 2
+                || route.width_nm != expected_width
                 || route.layer != expected_layer
             {
                 return Err(projection_error(
@@ -296,10 +328,6 @@ fn projected_segment(
         end_nm: projection_point(route.end),
         width_nm: route.width_nm,
     }
-}
-
-const fn point_nm(point: super::contract::PointDbu) -> PointNm {
-    PointNm::new(point.x / 2, point.y / 2)
 }
 
 const fn projection_point(point: PointNm) -> ProjectionPoint {
@@ -500,6 +528,13 @@ mod tests {
         let mut identity_drift = imported();
         identity_drift.selected_candidate_id = "ffffffffffffffffffffffffffffffff".to_owned();
         assert!(project_imported_route(&identity_drift).is_err());
+
+        let mut odd_dbu_drift = imported();
+        let RouteOutcome::Completed { candidates, .. } = &mut odd_dbu_drift.result.outcome else {
+            panic!("fixture must contain a completed candidate")
+        };
+        candidates[0].geometry[0].start.x += 1;
+        assert!(project_imported_route(&odd_dbu_drift).is_err());
     }
 
     #[test]

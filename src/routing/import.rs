@@ -176,7 +176,7 @@ fn authenticate_current_request(
     Ok(())
 }
 
-fn authenticate_result_root(
+pub(super) fn authenticate_result_root(
     bundle: &RouteInputBundle,
     result: &RouteResultContract,
     expected_tool: &ToolIdentity,
@@ -225,7 +225,7 @@ fn authenticate_result_root(
     Ok(())
 }
 
-fn authenticate_candidate(
+pub(super) fn authenticate_candidate(
     request: &RouteRequestContract,
     candidate: &AdmittedCandidate,
 ) -> Result<(), ContractDiagnostic> {
@@ -1063,14 +1063,14 @@ fn point_on_lattice(point: PointDbu, origin: PointDbu, step: i64) -> bool {
     (point.x - origin.x) % step == 0 && (point.y - origin.y) % step == 0
 }
 
-fn point_to_nm(point: PointDbu, path: &str) -> Result<PointNm, ContractDiagnostic> {
+pub(super) fn point_to_nm(point: PointDbu, path: &str) -> Result<PointNm, ContractDiagnostic> {
     Ok(PointNm::new(
         dbu_to_nm(point.x, &format!("{path}.x"))?,
         dbu_to_nm(point.y, &format!("{path}.y"))?,
     ))
 }
 
-fn dbu_to_nm(value: i64, path: &str) -> Result<i64, ContractDiagnostic> {
+pub(super) fn dbu_to_nm(value: i64, path: &str) -> Result<i64, ContractDiagnostic> {
     if value % 2 != 0 {
         return Err(import_error(
             IMPORT_CONVERSION,
