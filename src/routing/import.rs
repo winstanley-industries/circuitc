@@ -394,6 +394,7 @@ fn derive_candidate_fields(
     let mut orthogonal_steps = 0_u64;
     let mut diagonal_steps = 0_u64;
     let mut bends = 0_u64;
+    let mut expanded_steps = 0_u64;
     let mut scalar_cost = 0_u64;
     let mut intrinsic_cost = 0_u64;
 
@@ -450,6 +451,20 @@ fn derive_candidate_fields(
             ));
         }
         let step_count = dx.unsigned_abs().max(dy.unsigned_abs());
+        expanded_steps = expanded_steps.checked_add(step_count).ok_or_else(|| {
+            import_error(
+                IMPORT_GEOMETRY,
+                &path,
+                "candidate expanded-resource count overflows uint64",
+            )
+        })?;
+        if expanded_steps > request.resource_limits.expanded_resource_edges {
+            return Err(import_error(
+                IMPORT_GEOMETRY,
+                "outcome.candidate.resources",
+                "candidate exceeds the authenticated expanded-resource bound",
+            ));
+        }
         let mut source = start;
         for _ in 0..step_count {
             let resource = canonical_resource(selected_layer, source.0, source.1, direction);
@@ -1672,6 +1687,19 @@ mod tests {
             .code,
             IMPORT_CONVERSION
         );
+    }
+
+    #[test]
+    fn geometry_exceeding_authenticated_edge_bound_fails_before_expansion() {
+        let mut bundle = bundle();
+        let candidate = completed_candidate(&bundle);
+        bundle.request.resource_limits.expanded_resource_edges = 1;
+        let error = match derive_candidate_fields(&bundle.request, &candidate) {
+            Err(error) => error,
+            Ok(_) => panic!("over-bound candidate expansion unexpectedly succeeded"),
+        };
+        assert_eq!(error.code, super::IMPORT_GEOMETRY);
+        assert_eq!(error.path, "outcome.candidate.resources");
     }
 
     #[test]
