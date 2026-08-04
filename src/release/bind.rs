@@ -1494,10 +1494,12 @@ pub fn bind_release(inputs: &ReleaseInputs<'_>) -> Result<ReleaseBundle, Release
     preflight_inputs(inputs)?;
     authenticate_source_design(inputs)?;
     let design_identity_sha256 = canonical_design_identity(inputs.design)?;
+    if let FabricationCompilerArtifacts::Checked(checked) = inputs.compiler {
+        verify_simulations(inputs.design, Some(checked))?;
+    }
     let (static_artifacts, checked) = authenticated_compiler(inputs)?;
     authenticate_source(inputs, static_artifacts)?;
     verify_predecessors(inputs)?;
-    verify_simulations(inputs.design, checked)?;
     verify_ohmnivore_tools(inputs)?;
     verify_routing(inputs, checked, static_artifacts)?;
 

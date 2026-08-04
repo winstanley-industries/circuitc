@@ -157,12 +157,22 @@ impl CheckedCompiledArtifacts {
         &self.static_artifacts
     }
 
+    #[cfg(test)]
+    pub(crate) fn static_artifacts_mut(&mut self) -> &mut CompiledArtifacts {
+        &mut self.static_artifacts
+    }
+
     pub fn routing(&self) -> Option<&CompiledRouting> {
         self.routing.as_ref()
     }
 
     pub fn simulations(&self) -> &[CompiledSimulation] {
         &self.simulations
+    }
+
+    #[cfg(test)]
+    pub(crate) fn simulations_mut(&mut self) -> &mut [CompiledSimulation] {
+        &mut self.simulations
     }
 
     pub fn into_simulations(self) -> Vec<CompiledSimulation> {

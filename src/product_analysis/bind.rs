@@ -989,6 +989,8 @@ mod tests {
         ReleaseAnalysisEvidence, ReleaseFabricationEvidence, ReleaseInputs, ReleaseRoutingEvidence,
         ReleaseToolchainEvidence, assemble_release, bind_release, verify_release,
     };
+    use crate::simulation::assert::evaluate_assertions;
+    use crate::simulation::{canonical_f64, parse_result};
     use crate::{CompiledArtifacts, RelativeArtifactPath};
 
     use super::*;
@@ -1527,6 +1529,64 @@ mod tests {
             bind_release(&stale_semantic_inputs).unwrap_err().code,
             "CC-RELEASE-SOURCE-001"
         );
+
+        let mut stale_compiled = fixture.compiled.clone();
+        stale_compiled.kicad_pcb.push('\n');
+        let stale_compiler_inputs = ReleaseInputs {
+            compiler: FabricationCompilerArtifacts::Static(&stale_compiled),
+            ..inputs
+        };
+        assert_eq!(
+            bind_release(&stale_compiler_inputs).unwrap_err().code,
+            "CC-RELEASE-COMPILER-001"
+        );
+
+        let mut failing_host = host_evidence.clone();
+        let mut drc: Value = serde_json::from_slice(&failing_host.drc_report_json).unwrap();
+        drc["violations"] = Value::Array(vec![dirty_finding(&fixture, "clearance")]);
+        failing_host.drc_report_json = pretty(&drc);
+        refresh_receipt(&fixture, &mut failing_host);
+        let failing_analysis = bind_fixture(&fixture, &failing_host);
+        let failing_analysis_inputs = ReleaseInputs {
+            analysis: ReleaseAnalysisEvidence {
+                analysis_path: ANALYSIS,
+                host: &failing_host,
+                bundle: &failing_analysis,
+            },
+            ..inputs
+        };
+        assert_eq!(
+            bind_release(&failing_analysis_inputs).unwrap_err().code,
+            "CC-RELEASE-ANALYSIS-001"
+        );
+
+        let wrong_analysis_path_inputs = ReleaseInputs {
+            analysis: ReleaseAnalysisEvidence {
+                analysis_path: "release.other",
+                ..inputs.analysis
+            },
+            ..inputs
+        };
+        let diagnostic = bind_release(&wrong_analysis_path_inputs).unwrap_err();
+        assert_eq!(diagnostic.code, "CC-RELEASE-ANALYSIS-001");
+        assert_eq!(diagnostic.path, "analysis_path");
+        assert_eq!(
+            diagnostic.message,
+            "fabrication and board-analysis evidence do not name the same analysis"
+        );
+        let mut mismatched_host = host_evidence.clone();
+        mismatched_host.host_executable.push(b'x');
+        let mismatched_tool_inputs = ReleaseInputs {
+            analysis: ReleaseAnalysisEvidence {
+                host: &mismatched_host,
+                ..inputs.analysis
+            },
+            ..inputs
+        };
+        assert_eq!(
+            bind_release(&mismatched_tool_inputs).unwrap_err().code,
+            "CC-RELEASE-TOOL-001"
+        );
     }
 
     fn exercise_checked_release_case(simulation: bool, routing_applicable: bool) {
@@ -1766,6 +1826,44 @@ mod tests {
         );
 
         if simulation {
+            let mut stale_checked = (*checked).clone();
+            stale_checked.static_artifacts_mut().kicad_pcb.push('\n');
+            let stale_checked_inputs = ReleaseInputs {
+                compiler: FabricationCompilerArtifacts::Checked(&stale_checked),
+                ..inputs
+            };
+            assert_eq!(
+                bind_release(&stale_checked_inputs).unwrap_err().code,
+                "CC-RELEASE-COMPILER-001"
+            );
+
+            let mut failing_checked = (*checked).clone();
+            let simulation_evidence = &mut failing_checked.simulations_mut()[0];
+            let mut failing_result = parse_result(&simulation_evidence.result_json).unwrap();
+            for signal in &mut failing_result.signals {
+                for value in &mut signal.values {
+                    *value = canonical_f64(6.0).unwrap();
+                }
+            }
+            let failing_result_json = failing_result.to_canonical_json().unwrap();
+            let failing_evaluation = evaluate_assertions(
+                simulation_evidence.request_json.as_bytes(),
+                simulation_evidence.spice_identity_map_json.as_bytes(),
+                failing_result_json.as_bytes(),
+            )
+            .unwrap();
+            assert!(!failing_evaluation.checked_success);
+            simulation_evidence.result_json = failing_result_json;
+            simulation_evidence.report_json = failing_evaluation.report_json;
+            let failing_simulation_inputs = ReleaseInputs {
+                compiler: FabricationCompilerArtifacts::Checked(&failing_checked),
+                ..inputs
+            };
+            assert_eq!(
+                bind_release(&failing_simulation_inputs).unwrap_err().code,
+                "CC-RELEASE-SIMULATION-001"
+            );
+
             let mut wrong_ohmnivore = ohmnivore_executable.clone();
             wrong_ohmnivore.push(0);
             let stale_tool_inputs = ReleaseInputs {
