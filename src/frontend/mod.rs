@@ -5,17 +5,32 @@ mod parser;
 mod quantity;
 mod syntax;
 
+use std::path::Path;
+
 pub use diagnostic::{DiagnosticFormat, RelatedLocation, SourceDiagnostic, render_diagnostics};
 pub use elaborate::{ElaboratedDesign, ProvenanceMap};
 pub use syntax::{SourceFile, Span, SyntaxTree};
 
-use crate::CompiledArtifacts;
+use crate::{CheckedCompiledArtifacts, CompiledArtifacts, CompiledSimulation};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledSource {
     pub elaborated: ElaboratedDesign,
     pub artifacts: CompiledArtifacts,
     pub kicad_identity_map: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckedCompiledSource {
+    pub elaborated: ElaboratedDesign,
+    pub artifacts: CheckedCompiledArtifacts,
+    pub kicad_identity_map: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckedSourceError {
+    pub diagnostics: Vec<SourceDiagnostic>,
+    pub simulations: Vec<CompiledSimulation>,
 }
 
 pub fn parse_source(
@@ -54,6 +69,43 @@ pub fn compile_source(
         &artifacts.kicad_identities,
     );
     Ok(CompiledSource {
+        elaborated,
+        artifacts,
+        kicad_identity_map,
+    })
+}
+
+pub fn compile_source_checked(
+    filename: impl Into<String>,
+    source: impl Into<String>,
+    work_root: &Path,
+) -> Result<CheckedCompiledSource, CheckedSourceError> {
+    let syntax = parse_source(filename, source).map_err(|diagnostics| CheckedSourceError {
+        diagnostics,
+        simulations: Vec::new(),
+    })?;
+    let elaborated = elaborate_syntax(&syntax).map_err(|diagnostics| CheckedSourceError {
+        diagnostics,
+        simulations: Vec::new(),
+    })?;
+    let artifacts = crate::compile_checked(&elaborated.design, work_root).map_err(|error| {
+        CheckedSourceError {
+            diagnostics: elaborate::map_ir_diagnostics(
+                &syntax.source,
+                &elaborated.provenance,
+                error.diagnostics,
+            ),
+            simulations: error.simulations,
+        }
+    })?;
+    let logical_source_name = format!("{}.circuitc", elaborated.design.name);
+    let kicad_identity_map = render_kicad_identity_map(
+        &syntax.source,
+        &logical_source_name,
+        &elaborated.provenance,
+        &artifacts.static_artifacts.kicad_identities,
+    );
+    Ok(CheckedCompiledSource {
         elaborated,
         artifacts,
         kicad_identity_map,

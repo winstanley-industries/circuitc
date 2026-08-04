@@ -3,7 +3,13 @@ use std::fmt;
 use std::path::Path;
 
 use crate::design::{Design, Diagnostic};
-use crate::simulation::lower;
+use crate::simulation::assert::evaluate_assertions;
+use crate::simulation::lower::{self, SimulationInputBundle};
+use crate::simulation::{
+    AnalysisKind, AssertionStatus, AxisKind, CONTRACT_SCHEMA_VERSION, ContractDiagnostic,
+    ExecutionStatus, MAX_CONTRACT_BYTES, NormalizedDiagnostic, OhmnivoreRunner, RESULT_SCHEMA_NAME,
+    ResultAxis, SimulationResult, parse_request, sha256_hex,
+};
 use crate::spice::SpiceNameMap;
 use crate::{kicad, spice};
 
@@ -96,6 +102,47 @@ pub struct CompiledArtifacts {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompiledSimulation {
+    pub analysis_path: String,
+    pub netlist_path: RelativeArtifactPath,
+    pub request_path: RelativeArtifactPath,
+    pub map_path: RelativeArtifactPath,
+    pub result_path: RelativeArtifactPath,
+    pub report_path: RelativeArtifactPath,
+    pub netlist: String,
+    pub request_json: String,
+    pub spice_identity_map_json: String,
+    pub result_json: String,
+    pub report_json: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckedCompiledArtifacts {
+    pub static_artifacts: CompiledArtifacts,
+    pub simulations: Vec<CompiledSimulation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckedCompileError {
+    pub diagnostics: Vec<Diagnostic>,
+    pub simulations: Vec<CompiledSimulation>,
+}
+
+impl fmt::Display for CheckedCompileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, diagnostic) in self.diagnostics.iter().enumerate() {
+            if index != 0 {
+                formatter.write_str("\n")?;
+            }
+            write!(formatter, "{diagnostic}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for CheckedCompileError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompileError {
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -114,6 +161,10 @@ impl fmt::Display for CompileError {
 
 impl std::error::Error for CompileError {}
 
+/// Compile static artifacts for a design with no declared simulation intent.
+///
+/// Call [`compile_checked`] when the design declares analyses; this entry point
+/// deliberately fails closed rather than executing or weakening them.
 pub fn compile(design: &Design) -> Result<CompiledArtifacts, CompileError> {
     design
         .validate()
@@ -126,11 +177,15 @@ pub fn compile(design: &Design) -> Result<CompiledArtifacts, CompileError> {
                 code: "CC-SIM-PHASE-001",
                 path: format!("design.analyses.{}", input.analysis_path),
                 related_path: None,
-                message: "lowered simulation inputs cannot be compiled until checked execution is available"
+                message: "the static-only compile entry point does not execute declared simulation analyses; use checked compilation"
                     .to_owned(),
             }],
         });
     }
+    compile_static_validated(design)
+}
+
+fn compile_static_validated(design: &Design) -> Result<CompiledArtifacts, CompileError> {
     let validated_kicad = kicad::validate(design);
     if !validated_kicad.diagnostics.is_empty() {
         return Err(CompileError {
@@ -151,6 +206,341 @@ pub fn compile(design: &Design) -> Result<CompiledArtifacts, CompileError> {
         spice: lowered_spice.netlist,
         spice_name_map: lowered_spice.name_map,
     })
+}
+
+const MAX_AGGREGATE_RESULT_BYTES: usize = MAX_CONTRACT_BYTES;
+const CHECK_FAILURE: &str = "CC-SIM-CHECK-001";
+const CHECK_EXECUTION: &str = "CC-SIM-CHECK-002";
+const CHECK_RESOURCE: &str = "CC-SIM-CHECK-003";
+const CHECK_INTERNAL: &str = "CC-SIM-CHECK-004";
+const CHECK_RESOURCE_MESSAGE: &str =
+    "aggregate normalized simulation results exceeded the 64 MiB checked-compilation budget";
+const CHECK_INTERNAL_RESULT_MESSAGE: &str =
+    "checked simulation result did not satisfy its authenticated contract";
+
+/// Compile all static artifacts only after every declared simulation has
+/// produced a complete, authenticated result and every assertion has passed.
+pub fn compile_checked(
+    design: &Design,
+    work_root: &Path,
+) -> Result<CheckedCompiledArtifacts, CheckedCompileError> {
+    let (static_artifacts, bundles) = prepare_checked(design)?;
+    if bundles.is_empty() {
+        return Ok(CheckedCompiledArtifacts {
+            static_artifacts,
+            simulations: Vec::new(),
+        });
+    }
+
+    match OhmnivoreRunner::from_bazel_runfiles(work_root) {
+        Ok(runner) => execute_checked(static_artifacts, bundles, |bundle| {
+            runner.execute(
+                bundle.netlist.as_bytes(),
+                bundle.request_json.as_bytes(),
+                bundle.spice_identity_map_json.as_bytes(),
+            )
+        }),
+        Err(error) => execute_checked(static_artifacts, bundles, |_| Err(error.clone())),
+    }
+}
+
+fn prepare_checked(
+    design: &Design,
+) -> Result<(CompiledArtifacts, Vec<SimulationInputBundle>), CheckedCompileError> {
+    design
+        .validate()
+        .map_err(|diagnostics| CheckedCompileError {
+            diagnostics,
+            simulations: Vec::new(),
+        })?;
+    let bundles = lower::lower_inputs(design).map_err(|diagnostics| CheckedCompileError {
+        diagnostics,
+        simulations: Vec::new(),
+    })?;
+    let static_artifacts =
+        compile_static_validated(design).map_err(|error| CheckedCompileError {
+            diagnostics: error.diagnostics,
+            simulations: Vec::new(),
+        })?;
+    Ok((static_artifacts, bundles))
+}
+
+fn execute_checked<F>(
+    static_artifacts: CompiledArtifacts,
+    bundles: Vec<SimulationInputBundle>,
+    execute: F,
+) -> Result<CheckedCompiledArtifacts, CheckedCompileError>
+where
+    F: FnMut(&SimulationInputBundle) -> Result<SimulationResult, ContractDiagnostic>,
+{
+    execute_checked_with_result_limit(
+        static_artifacts,
+        bundles,
+        MAX_AGGREGATE_RESULT_BYTES,
+        execute,
+    )
+}
+
+fn execute_checked_with_result_limit<F>(
+    static_artifacts: CompiledArtifacts,
+    bundles: Vec<SimulationInputBundle>,
+    result_byte_limit: usize,
+    mut execute: F,
+) -> Result<CheckedCompiledArtifacts, CheckedCompileError>
+where
+    F: FnMut(&SimulationInputBundle) -> Result<SimulationResult, ContractDiagnostic>,
+{
+    let resource_results = bundles
+        .iter()
+        .map(|bundle| canonical_failure_result(bundle, CHECK_RESOURCE, CHECK_RESOURCE_MESSAGE))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| internal_checked_error(error, Vec::new()))?;
+    let mut remaining_resource_bytes = resource_results
+        .iter()
+        .try_fold(0_usize, |total, (_, json)| total.checked_add(json.len()))
+        .ok_or_else(|| internal_checked_error_message(Vec::new()))?;
+
+    let mut result_bytes = 0_usize;
+    let mut resource_exhausted = false;
+    let mut all_checked = true;
+    let mut simulations = Vec::with_capacity(bundles.len());
+    let mut diagnostics = Vec::new();
+
+    for (index, bundle) in bundles.iter().enumerate() {
+        remaining_resource_bytes = remaining_resource_bytes
+            .checked_sub(resource_results[index].1.len())
+            .ok_or_else(|| internal_checked_error_message(simulations.clone()))?;
+
+        let executed = execute(bundle);
+        let candidate = if resource_exhausted {
+            resource_results[index].clone()
+        } else {
+            canonical_executed_result(bundle, executed)
+                .map_err(|error| internal_checked_error(error, simulations.clone()))?
+        };
+        let (mut result, mut result_json) = select_result_with_budget(
+            candidate,
+            &resource_results[index],
+            result_bytes,
+            remaining_resource_bytes,
+            result_byte_limit,
+            &mut resource_exhausted,
+        );
+
+        let evaluation = match evaluate_assertions(
+            bundle.request_json.as_bytes(),
+            bundle.spice_identity_map_json.as_bytes(),
+            result_json.as_bytes(),
+        ) {
+            Ok(evaluation) => evaluation,
+            Err(_) => {
+                let fallback =
+                    canonical_failure_result(bundle, CHECK_INTERNAL, CHECK_INTERNAL_RESULT_MESSAGE)
+                        .map_err(|error| internal_checked_error(error, simulations.clone()))?;
+                (result, result_json) = select_result_with_budget(
+                    fallback,
+                    &resource_results[index],
+                    result_bytes,
+                    remaining_resource_bytes,
+                    result_byte_limit,
+                    &mut resource_exhausted,
+                );
+                evaluate_assertions(
+                    bundle.request_json.as_bytes(),
+                    bundle.spice_identity_map_json.as_bytes(),
+                    result_json.as_bytes(),
+                )
+                .map_err(|error| internal_checked_error(error, simulations.clone()))?
+            }
+        };
+        result_bytes = result_bytes
+            .checked_add(result_json.len())
+            .ok_or_else(|| internal_checked_error_message(simulations.clone()))?;
+
+        all_checked &= evaluation.checked_success;
+        diagnostics.extend(checked_diagnostics(&result, &evaluation.report));
+        simulations.push(CompiledSimulation {
+            analysis_path: bundle.analysis_path.clone(),
+            netlist_path: bundle.netlist_path.clone(),
+            request_path: bundle.request_path.clone(),
+            map_path: bundle.map_path.clone(),
+            result_path: bundle.result_path.clone(),
+            report_path: bundle.report_path.clone(),
+            netlist: bundle.netlist.clone(),
+            request_json: bundle.request_json.clone(),
+            spice_identity_map_json: bundle.spice_identity_map_json.clone(),
+            result_json,
+            report_json: evaluation.report_json,
+        });
+    }
+
+    if all_checked && diagnostics.is_empty() {
+        Ok(CheckedCompiledArtifacts {
+            static_artifacts,
+            simulations,
+        })
+    } else {
+        Err(CheckedCompileError {
+            diagnostics,
+            simulations,
+        })
+    }
+}
+
+fn select_result_with_budget(
+    candidate: (SimulationResult, String),
+    resource_result: &(SimulationResult, String),
+    result_bytes: usize,
+    remaining_resource_bytes: usize,
+    result_byte_limit: usize,
+    resource_exhausted: &mut bool,
+) -> (SimulationResult, String) {
+    if *resource_exhausted {
+        return resource_result.clone();
+    }
+    let projected = result_bytes
+        .checked_add(candidate.1.len())
+        .and_then(|value| value.checked_add(remaining_resource_bytes));
+    if projected.is_none_or(|projected| projected > result_byte_limit) {
+        *resource_exhausted = true;
+        resource_result.clone()
+    } else {
+        candidate
+    }
+}
+
+fn canonical_executed_result(
+    bundle: &SimulationInputBundle,
+    executed: Result<SimulationResult, ContractDiagnostic>,
+) -> Result<(SimulationResult, String), ContractDiagnostic> {
+    match executed {
+        Ok(result) => match result.to_canonical_json() {
+            Ok(json) => Ok((result, json)),
+            Err(_) => canonical_failure_result(
+                bundle,
+                CHECK_INTERNAL,
+                "simulator adapter produced a non-canonical normalized result",
+            ),
+        },
+        Err(error) => canonical_failure_result(bundle, error.code, &error.message),
+    }
+}
+
+fn canonical_failure_result(
+    bundle: &SimulationInputBundle,
+    code: &str,
+    message: &str,
+) -> Result<(SimulationResult, String), ContractDiagnostic> {
+    let request = parse_request(&bundle.request_json)?;
+    let result = SimulationResult {
+        schema_name: RESULT_SCHEMA_NAME.to_owned(),
+        schema_version: CONTRACT_SCHEMA_VERSION,
+        design: request.design,
+        analysis_path: request.analysis.path,
+        analysis_kind: request.analysis.kind,
+        status: ExecutionStatus::Failed,
+        request_sha256: sha256_hex(bundle.request_json.as_bytes()),
+        map_sha256: sha256_hex(bundle.spice_identity_map_json.as_bytes()),
+        axis: ResultAxis {
+            kind: axis_kind(bundle.analysis_kind),
+            samples: Vec::new(),
+        },
+        signals: Vec::new(),
+        diagnostics: vec![NormalizedDiagnostic {
+            code: code.to_owned(),
+            message: message.to_owned(),
+        }],
+    };
+    let json = result.to_canonical_json()?;
+    Ok((result, json))
+}
+
+const fn axis_kind(kind: AnalysisKind) -> AxisKind {
+    match kind {
+        AnalysisKind::DcOperatingPoint => AxisKind::Scalar,
+        AnalysisKind::AcLinearSweep => AxisKind::FrequencyHertz,
+        AnalysisKind::Transient => AxisKind::TimeSeconds,
+    }
+}
+
+fn checked_diagnostics(
+    result: &SimulationResult,
+    report: &crate::simulation::SimulationReport,
+) -> Vec<Diagnostic> {
+    let result_diagnostic = result
+        .diagnostics
+        .first()
+        .map(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))
+        .unwrap_or_else(|| "simulation did not complete".to_owned());
+    let mut diagnostics = Vec::new();
+    if result.status != ExecutionStatus::Completed {
+        diagnostics.push(Diagnostic {
+            code: CHECK_EXECUTION,
+            path: format!("design.analyses.{}", result.analysis_path),
+            related_path: None,
+            message: format!("checked simulation did not complete: {result_diagnostic}"),
+        });
+    }
+    for assertion in &report.assertions {
+        let (code, message) = match assertion.status {
+            AssertionStatus::Pass => continue,
+            AssertionStatus::Fail => (
+                CHECK_FAILURE,
+                format!(
+                    "assertion failed: actual {} is outside expected {} with absolute tolerance {} and relative tolerance {}",
+                    assertion
+                        .actual
+                        .as_ref()
+                        .map_or("<missing>", String::as_str),
+                    assertion.expected,
+                    assertion.absolute_tolerance,
+                    assertion.relative_tolerance,
+                ),
+            ),
+            AssertionStatus::Unsupported => (
+                CHECK_EXECUTION,
+                format!("assertion is unsupported: {result_diagnostic}"),
+            ),
+            AssertionStatus::Unevaluated => (
+                CHECK_EXECUTION,
+                format!("assertion was not evaluated: {result_diagnostic}"),
+            ),
+        };
+        diagnostics.push(Diagnostic {
+            code,
+            path: format!("design.assertions.{}", assertion.path),
+            related_path: Some(format!("design.analyses.{}", result.analysis_path)),
+            message,
+        });
+    }
+    diagnostics
+}
+
+fn internal_checked_error(
+    error: ContractDiagnostic,
+    simulations: Vec<CompiledSimulation>,
+) -> CheckedCompileError {
+    CheckedCompileError {
+        diagnostics: vec![Diagnostic {
+            code: CHECK_INTERNAL,
+            path: "design.analyses".to_owned(),
+            related_path: None,
+            message: format!("checked simulation contract construction failed: {error}"),
+        }],
+        simulations,
+    }
+}
+
+fn internal_checked_error_message(simulations: Vec<CompiledSimulation>) -> CheckedCompileError {
+    CheckedCompileError {
+        diagnostics: vec![Diagnostic {
+            code: CHECK_INTERNAL,
+            path: "design.analyses".to_owned(),
+            related_path: None,
+            message: "checked simulation evidence accounting overflowed".to_owned(),
+        }],
+        simulations,
+    }
 }
 
 fn kicad_library_files(design: &Design) -> Vec<KicadLibraryFile> {
@@ -187,11 +577,565 @@ mod tests {
     use crate::demo::voltage_divider;
     use crate::design::{
         ComponentValue, ConnectionState, CopperLayer, ModuleInstance, SimulationAnalysis,
-        SimulationAnalysisKind,
+        SimulationAnalysisKind, SimulationAssertion, SimulationSample,
     };
     use crate::quantity::{Quantity, Unit};
+    use crate::simulation::{
+        AnalysisKind, CONTRACT_SCHEMA_VERSION, ExecutionStatus, NormalizedDiagnostic,
+        RESULT_SCHEMA_NAME, ResultAxis, ResultSignal, ResultUnit, SignalKind, SimulationResult,
+        canonical_f64, parse_report, parse_request, parse_result, sha256_hex,
+    };
 
-    use super::{CompiledArtifacts, compile};
+    use super::{
+        CHECK_EXECUTION, CHECK_FAILURE, CHECK_INTERNAL, CHECK_INTERNAL_RESULT_MESSAGE,
+        CHECK_RESOURCE, CHECK_RESOURCE_MESSAGE, CompiledArtifacts, SimulationInputBundle,
+        axis_kind, canonical_failure_result, compile, execute_checked,
+        execute_checked_with_result_limit, prepare_checked,
+    };
+
+    fn checked_dc_design(paths: &[&str], assertions: bool) -> crate::design::Design {
+        let mut design = voltage_divider();
+        design.analyses = paths
+            .iter()
+            .map(|path| SimulationAnalysis {
+                path: (*path).to_owned(),
+                kind: SimulationAnalysisKind::DcOperatingPoint,
+            })
+            .collect();
+        design.assertions = if assertions {
+            paths
+                .iter()
+                .map(|path| SimulationAssertion {
+                    path: format!("checks.{}", path.rsplit('.').next().unwrap()),
+                    analysis_path: (*path).to_owned(),
+                    net: "VOUT".to_owned(),
+                    sample: SimulationSample::Scalar,
+                    expected: Quantity::new(5, 0, Unit::Volt),
+                    absolute_tolerance: Quantity::new(0, 0, Unit::Volt),
+                    relative_tolerance: Quantity::new(0, 0, Unit::Dimensionless),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        design.canonicalize();
+        design
+    }
+
+    fn checked_all_kinds_design() -> crate::design::Design {
+        let mut design = voltage_divider();
+        design.analyses = vec![
+            SimulationAnalysis {
+                path: "simulation.transient".to_owned(),
+                kind: SimulationAnalysisKind::Transient {
+                    step: Quantity::new(125, -3, Unit::Second),
+                    stop: Quantity::new(500, -3, Unit::Second),
+                    start: Quantity::new(0, 0, Unit::Second),
+                    uic: false,
+                },
+            },
+            SimulationAnalysis {
+                path: "simulation.dc".to_owned(),
+                kind: SimulationAnalysisKind::DcOperatingPoint,
+            },
+            SimulationAnalysis {
+                path: "simulation.ac".to_owned(),
+                kind: SimulationAnalysisKind::AcLinearSweep {
+                    source: "divider.analysis.input".to_owned(),
+                    points: 4,
+                    start_frequency: Quantity::new(1, 0, Unit::Hertz),
+                    stop_frequency: Quantity::new(4, 0, Unit::Hertz),
+                    magnitude: Quantity::new(1, 0, Unit::Volt),
+                    phase: Quantity::new(0, 0, Unit::Degree),
+                },
+            },
+        ];
+        design.assertions = vec![
+            SimulationAssertion {
+                path: "checks.transient".to_owned(),
+                analysis_path: "simulation.transient".to_owned(),
+                net: "VOUT".to_owned(),
+                sample: SimulationSample::Time(Quantity::new(500, -3, Unit::Second)),
+                expected: Quantity::new(5, 0, Unit::Volt),
+                absolute_tolerance: Quantity::new(0, 0, Unit::Volt),
+                relative_tolerance: Quantity::new(0, 0, Unit::Dimensionless),
+            },
+            SimulationAssertion {
+                path: "checks.dc".to_owned(),
+                analysis_path: "simulation.dc".to_owned(),
+                net: "VOUT".to_owned(),
+                sample: SimulationSample::Scalar,
+                expected: Quantity::new(5, 0, Unit::Volt),
+                absolute_tolerance: Quantity::new(0, 0, Unit::Volt),
+                relative_tolerance: Quantity::new(0, 0, Unit::Dimensionless),
+            },
+            SimulationAssertion {
+                path: "checks.ac".to_owned(),
+                analysis_path: "simulation.ac".to_owned(),
+                net: "VOUT".to_owned(),
+                sample: SimulationSample::Frequency(Quantity::new(3, 0, Unit::Hertz)),
+                expected: Quantity::new(5, 0, Unit::Volt),
+                absolute_tolerance: Quantity::new(0, 0, Unit::Volt),
+                relative_tolerance: Quantity::new(0, 0, Unit::Dimensionless),
+            },
+        ];
+        design.canonicalize();
+        design
+    }
+
+    fn completed_dc_result(bundle: &SimulationInputBundle, actual: f64) -> SimulationResult {
+        let request = parse_request(&bundle.request_json).unwrap();
+        SimulationResult {
+            schema_name: RESULT_SCHEMA_NAME.to_owned(),
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            design: request.design,
+            analysis_path: request.analysis.path,
+            analysis_kind: request.analysis.kind,
+            status: ExecutionStatus::Completed,
+            request_sha256: sha256_hex(bundle.request_json.as_bytes()),
+            map_sha256: sha256_hex(bundle.spice_identity_map_json.as_bytes()),
+            axis: ResultAxis {
+                kind: axis_kind(bundle.analysis_kind),
+                samples: vec![crate::simulation::canonical_f64(0.0).unwrap()],
+            },
+            signals: vec![ResultSignal {
+                kind: SignalKind::NetVoltage,
+                canonical_identity: "VOUT".to_owned(),
+                unit: ResultUnit::Volt,
+                values: vec![crate::simulation::canonical_f64(actual).unwrap()],
+            }],
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn completed_result_for_kind(bundle: &SimulationInputBundle, actual: f64) -> SimulationResult {
+        let request = parse_request(&bundle.request_json).unwrap();
+        let (samples, signal_kind) = match request.analysis.kind {
+            AnalysisKind::DcOperatingPoint => (vec![0.0], SignalKind::NetVoltage),
+            AnalysisKind::AcLinearSweep => {
+                (vec![1.0, 2.0, 3.0, 4.0], SignalKind::NetVoltageMagnitude)
+            }
+            AnalysisKind::Transient => (vec![0.0, 0.125, 0.25, 0.375, 0.5], SignalKind::NetVoltage),
+        };
+        let value_count = samples.len();
+        SimulationResult {
+            schema_name: RESULT_SCHEMA_NAME.to_owned(),
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            design: request.design,
+            analysis_path: request.analysis.path,
+            analysis_kind: request.analysis.kind,
+            status: ExecutionStatus::Completed,
+            request_sha256: sha256_hex(bundle.request_json.as_bytes()),
+            map_sha256: sha256_hex(bundle.spice_identity_map_json.as_bytes()),
+            axis: ResultAxis {
+                kind: axis_kind(bundle.analysis_kind),
+                samples: samples
+                    .into_iter()
+                    .map(|value| canonical_f64(value).unwrap())
+                    .collect(),
+            },
+            signals: vec![ResultSignal {
+                kind: signal_kind,
+                canonical_identity: "VOUT".to_owned(),
+                unit: ResultUnit::Volt,
+                values: (0..value_count)
+                    .map(|_| canonical_f64(actual).unwrap())
+                    .collect(),
+            }],
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn failed_dc_result(bundle: &SimulationInputBundle) -> SimulationResult {
+        let request = parse_request(&bundle.request_json).unwrap();
+        SimulationResult {
+            schema_name: RESULT_SCHEMA_NAME.to_owned(),
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            design: request.design,
+            analysis_path: request.analysis.path,
+            analysis_kind: request.analysis.kind,
+            status: ExecutionStatus::Failed,
+            request_sha256: sha256_hex(bundle.request_json.as_bytes()),
+            map_sha256: sha256_hex(bundle.spice_identity_map_json.as_bytes()),
+            axis: ResultAxis {
+                kind: axis_kind(bundle.analysis_kind),
+                samples: Vec::new(),
+            },
+            signals: Vec::new(),
+            diagnostics: vec![NormalizedDiagnostic {
+                code: "CC-SIM-EXECUTION-TEST".to_owned(),
+                message: "deterministic injected execution failure".to_owned(),
+            }],
+        }
+    }
+
+    #[test]
+    fn checked_execution_publishes_a_fully_bound_five_file_chain() {
+        let design = checked_dc_design(&["simulation.dc"], true);
+        let (static_artifacts, bundles) = prepare_checked(&design).unwrap();
+        let checked = execute_checked(static_artifacts, bundles, |bundle| {
+            Ok(completed_dc_result(bundle, 5.0))
+        })
+        .unwrap();
+
+        assert_eq!(checked.simulations.len(), 1);
+        let simulation = &checked.simulations[0];
+        let directory = simulation
+            .netlist_path
+            .as_str()
+            .strip_suffix("/analysis.spice")
+            .unwrap();
+        assert_eq!(
+            simulation.request_path.as_str(),
+            format!("{directory}/request.json")
+        );
+        assert_eq!(
+            simulation.map_path.as_str(),
+            format!("{directory}/spice-map.json")
+        );
+        assert_eq!(
+            simulation.result_path.as_str(),
+            format!("{directory}/result.json")
+        );
+        assert_eq!(
+            simulation.report_path.as_str(),
+            format!("{directory}/report.json")
+        );
+
+        let result = parse_result(&simulation.result_json).unwrap();
+        result
+            .verify_binding_bytes(
+                simulation.request_json.as_bytes(),
+                simulation.spice_identity_map_json.as_bytes(),
+            )
+            .unwrap();
+        let report = parse_report(&simulation.report_json).unwrap();
+        report
+            .verify_binding_bytes(
+                simulation.request_json.as_bytes(),
+                simulation.spice_identity_map_json.as_bytes(),
+                simulation.result_json.as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(report.summary.pass, 1);
+        assert_eq!(report.summary.fail, 0);
+        assert!(
+            checked
+                .static_artifacts
+                .kicad_schematic
+                .starts_with("(kicad_sch")
+        );
+    }
+
+    #[test]
+    fn checked_execution_evaluates_dc_ac_and_transient_in_canonical_order() {
+        let design = checked_all_kinds_design();
+        let (static_artifacts, bundles) = prepare_checked(&design).unwrap();
+        assert_eq!(
+            bundles
+                .iter()
+                .map(|bundle| bundle.analysis_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["simulation.ac", "simulation.dc", "simulation.transient"]
+        );
+
+        let checked = execute_checked(static_artifacts, bundles, |bundle| {
+            Ok(completed_result_for_kind(bundle, 5.0))
+        })
+        .unwrap();
+
+        assert_eq!(checked.simulations.len(), 3);
+        assert_eq!(
+            checked
+                .simulations
+                .iter()
+                .map(|simulation| {
+                    let result = parse_result(&simulation.result_json).unwrap();
+                    let report = parse_report(&simulation.report_json).unwrap();
+                    assert_eq!(result.status, ExecutionStatus::Completed);
+                    assert_eq!(report.summary.pass, 1);
+                    assert_eq!(report.summary.fail, 0);
+                    result.analysis_kind
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                AnalysisKind::AcLinearSweep,
+                AnalysisKind::DcOperatingPoint,
+                AnalysisKind::Transient,
+            ]
+        );
+    }
+
+    #[test]
+    fn checked_execution_retains_noncompleted_ac_and_transient_evidence() {
+        let design = checked_all_kinds_design();
+        let (static_artifacts, bundles) = prepare_checked(&design).unwrap();
+        let error = execute_checked(static_artifacts, bundles, |bundle| {
+            if bundle.analysis_kind == AnalysisKind::DcOperatingPoint {
+                Ok(completed_result_for_kind(bundle, 5.0))
+            } else {
+                Ok(failed_dc_result(bundle))
+            }
+        })
+        .unwrap_err();
+
+        assert_eq!(error.simulations.len(), 3);
+        assert_eq!(
+            error
+                .simulations
+                .iter()
+                .map(|simulation| {
+                    let result = parse_result(&simulation.result_json).unwrap();
+                    let report = parse_report(&simulation.report_json).unwrap();
+                    (
+                        result.analysis_kind,
+                        result.status,
+                        report.summary.unevaluated,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                (AnalysisKind::AcLinearSweep, ExecutionStatus::Failed, 1),
+                (
+                    AnalysisKind::DcOperatingPoint,
+                    ExecutionStatus::Completed,
+                    0
+                ),
+                (AnalysisKind::Transient, ExecutionStatus::Failed, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn checked_failure_retains_bound_evidence_and_machine_diagnostics() {
+        let design = checked_dc_design(&["simulation.dc"], true);
+        let (static_artifacts, bundles) = prepare_checked(&design).unwrap();
+        let error = execute_checked(static_artifacts, bundles, |bundle| {
+            Ok(completed_dc_result(bundle, 6.0))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.simulations.len(), 1);
+        assert_eq!(error.diagnostics.len(), 1);
+        assert_eq!(error.diagnostics[0].code, CHECK_FAILURE);
+        assert_eq!(error.diagnostics[0].path, "design.assertions.checks.dc");
+        let report = parse_report(&error.simulations[0].report_json).unwrap();
+        assert_eq!(report.summary.fail, 1);
+        report
+            .verify_binding_bytes(
+                error.simulations[0].request_json.as_bytes(),
+                error.simulations[0].spice_identity_map_json.as_bytes(),
+                error.simulations[0].result_json.as_bytes(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn checked_execution_runs_every_analysis_in_canonical_order_after_failure() {
+        use std::cell::RefCell;
+
+        let design = checked_dc_design(&["simulation.z", "simulation.a"], true);
+        let (static_artifacts, bundles) = prepare_checked(&design).unwrap();
+        let executed = RefCell::new(Vec::new());
+        let error = execute_checked(static_artifacts, bundles, |bundle| {
+            executed.borrow_mut().push(bundle.analysis_path.clone());
+            if bundle.analysis_path == "simulation.a" {
+                Ok(failed_dc_result(bundle))
+            } else {
+                Ok(completed_dc_result(bundle, 5.0))
+            }
+        })
+        .unwrap_err();
+
+        assert_eq!(
+            executed.into_inner(),
+            vec!["simulation.a".to_owned(), "simulation.z".to_owned()]
+        );
+        assert_eq!(
+            error
+                .simulations
+                .iter()
+                .map(|simulation| simulation.analysis_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["simulation.a", "simulation.z"]
+        );
+        assert!(
+            error
+                .diagnostics
+                .iter()
+                .any(|item| item.code == CHECK_EXECUTION)
+        );
+    }
+
+    #[test]
+    fn non_completed_zero_assertion_analysis_fails_explicitly() {
+        let design = checked_dc_design(&["simulation.dc"], false);
+        let (static_artifacts, bundles) = prepare_checked(&design).unwrap();
+        let error = execute_checked(static_artifacts, bundles, |bundle| {
+            Ok(failed_dc_result(bundle))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.diagnostics.len(), 1);
+        assert_eq!(error.diagnostics[0].code, CHECK_EXECUTION);
+        assert_eq!(error.diagnostics[0].path, "design.analyses.simulation.dc");
+        assert!(
+            parse_report(&error.simulations[0].report_json)
+                .unwrap()
+                .assertions
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn aggregate_result_budget_reserves_future_failure_evidence_without_omission() {
+        use std::cell::Cell;
+
+        let design = checked_dc_design(&["simulation.a", "simulation.b"], true);
+        let (static_artifacts, bundles) = prepare_checked(&design).unwrap();
+        let first_completed_bytes = completed_dc_result(&bundles[0], 5.0)
+            .to_canonical_json()
+            .unwrap()
+            .len();
+        let second_resource_bytes =
+            canonical_failure_result(&bundles[1], CHECK_RESOURCE, CHECK_RESOURCE_MESSAGE)
+                .unwrap()
+                .1
+                .len();
+        let result_limit = first_completed_bytes
+            .checked_add(second_resource_bytes)
+            .unwrap()
+            - 1;
+        let first_resource_bytes =
+            canonical_failure_result(&bundles[0], CHECK_RESOURCE, CHECK_RESOURCE_MESSAGE)
+                .unwrap()
+                .1
+                .len();
+        assert!(first_completed_bytes <= result_limit);
+        assert!(
+            first_resource_bytes + second_resource_bytes <= result_limit,
+            "the injected budget must retain canonical resource evidence for every analysis"
+        );
+        assert!(
+            first_completed_bytes + second_resource_bytes > result_limit,
+            "the boundary must fit the current result alone but not reserved future evidence"
+        );
+        let executions = Cell::new(0_usize);
+        let error =
+            execute_checked_with_result_limit(static_artifacts, bundles, result_limit, |bundle| {
+                executions.set(executions.get() + 1);
+                Ok(completed_dc_result(bundle, 5.0))
+            })
+            .unwrap_err();
+
+        assert_eq!(executions.get(), 2);
+        assert_eq!(error.simulations.len(), 2);
+        for simulation in &error.simulations {
+            let result = parse_result(&simulation.result_json).unwrap();
+            assert_eq!(result.status, ExecutionStatus::Failed);
+            assert_eq!(result.diagnostics[0].code, CHECK_RESOURCE);
+            assert_eq!(
+                parse_report(&simulation.report_json)
+                    .unwrap()
+                    .summary
+                    .unevaluated,
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn evaluator_fallback_is_rebudgeted_before_result_accounting() {
+        let design = checked_dc_design(&["simulation.dc"], true);
+        let (static_artifacts, bundles) = prepare_checked(&design).unwrap();
+        let mut stale = failed_dc_result(&bundles[0]);
+        stale.request_sha256 = "0".repeat(64);
+        stale.diagnostics = vec![NormalizedDiagnostic {
+            code: "CC-SIM-TEST".to_owned(),
+            message: "x".to_owned(),
+        }];
+        let stale_bytes = stale.to_canonical_json().unwrap().len();
+        let internal_bytes =
+            canonical_failure_result(&bundles[0], CHECK_INTERNAL, CHECK_INTERNAL_RESULT_MESSAGE)
+                .unwrap()
+                .1
+                .len();
+        assert!(
+            stale_bytes < internal_bytes,
+            "the injected boundary must distinguish pre- and post-fallback accounting"
+        );
+
+        let error =
+            execute_checked_with_result_limit(static_artifacts, bundles, stale_bytes, |_| {
+                Ok(stale.clone())
+            })
+            .unwrap_err();
+
+        let result = parse_result(&error.simulations[0].result_json).unwrap();
+        assert_eq!(result.status, ExecutionStatus::Failed);
+        assert_eq!(result.diagnostics[0].code, CHECK_RESOURCE);
+    }
+
+    #[test]
+    fn smaller_evaluator_fallback_releases_budget_for_later_completed_result() {
+        let design = checked_dc_design(&["simulation.a", "simulation.b"], true);
+        let (static_artifacts, bundles) = prepare_checked(&design).unwrap();
+        let internal_bytes =
+            canonical_failure_result(&bundles[0], CHECK_INTERNAL, CHECK_INTERNAL_RESULT_MESSAGE)
+                .unwrap()
+                .1
+                .len();
+        let second_resource_bytes =
+            canonical_failure_result(&bundles[1], CHECK_RESOURCE, CHECK_RESOURCE_MESSAGE)
+                .unwrap()
+                .1
+                .len();
+        let second_completed_bytes = completed_dc_result(&bundles[1], 5.0)
+            .to_canonical_json()
+            .unwrap()
+            .len();
+        let result_limit = internal_bytes + second_completed_bytes;
+
+        let stale = (1..=256)
+            .find_map(|message_len| {
+                let mut candidate = failed_dc_result(&bundles[0]);
+                candidate.request_sha256 = "0".repeat(64);
+                candidate.diagnostics = vec![NormalizedDiagnostic {
+                    code: "CC-SIM-TEST".to_owned(),
+                    message: "x".repeat(message_len),
+                }];
+                let bytes = candidate.to_canonical_json().unwrap().len();
+                (bytes > internal_bytes && bytes + second_resource_bytes <= result_limit)
+                    .then_some(candidate)
+            })
+            .expect("construct a stale result that distinguishes fallback accounting");
+
+        let error =
+            execute_checked_with_result_limit(static_artifacts, bundles, result_limit, |bundle| {
+                if bundle.analysis_path == "simulation.a" {
+                    Ok(stale.clone())
+                } else {
+                    Ok(completed_dc_result(bundle, 5.0))
+                }
+            })
+            .unwrap_err();
+
+        assert_eq!(error.simulations.len(), 2);
+        assert_eq!(
+            parse_result(&error.simulations[0].result_json)
+                .unwrap()
+                .diagnostics[0]
+                .code,
+            CHECK_INTERNAL
+        );
+        assert_eq!(
+            parse_result(&error.simulations[1].result_json)
+                .unwrap()
+                .status,
+            ExecutionStatus::Completed,
+            "the smaller canonical fallback must release its unused bytes"
+        );
+    }
 
     #[test]
     fn compiles_reference_design_deterministically() {
@@ -247,7 +1191,7 @@ mod tests {
             );
             assert_eq!(
                 error.diagnostics[0].message,
-                "lowered simulation inputs cannot be compiled until checked execution is available"
+                "the static-only compile entry point does not execute declared simulation analyses; use checked compilation"
             );
         }
     }

@@ -42,6 +42,72 @@ kind across the chain before accepting the artifact. Result signals must join
 through the map, and reports must contain one outcome for every authenticated
 request assertion and join pass/fail values to exact normalized samples.
 
+Each analysis uses one deterministic artifact directory. Its
+`<analysis-stem>` is the lowercase hexadecimal SHA-256 of
+`circuitc-simulation-path-v1\0<design>\0<analysis-path>`, where `<design>` is
+the design name and `<analysis-path>` is the analysis semantic path. The
+complete per-analysis chain has exactly these generated paths:
+
+```text
+simulation/<analysis-stem>/analysis.spice
+simulation/<analysis-stem>/request.json
+simulation/<analysis-stem>/spice-map.json
+simulation/<analysis-stem>/result.json
+simulation/<analysis-stem>/report.json
+```
+
+CircuitC executes every declared analysis in semantic-path order and evaluates
+every authenticated assertion instead of stopping at the first checked
+failure. The checked phase succeeds only when every per-analysis result has
+status `completed` and every report outcome is `pass`. A completed analysis
+with no assertions therefore passes vacuously; an `unsupported`, `failed`, or
+`unevaluated` result with no assertions still fails because its result is not
+`completed`.
+
+The checked compiler retains at most 64 MiB of canonical normalized-result
+bytes across the complete analysis set, in addition to the lowering layer's
+64 MiB aggregate input-artifact budget. It reserves deterministic failed-result
+evidence for every remaining analysis before accepting another completed
+result. Crossing the result budget produces `CC-SIM-CHECK-003` failed results
+and unevaluated reports for the current and remaining analyses; all analyses
+are still invoked under the runner's aggregate process deadline, and no
+analysis disappears from the evidence set.
+
+On checked success, CircuitC publishes all five files for every analysis in the
+same failure-atomic transaction as the static design, KiCad, identity-map, and
+generic SPICE artifacts. On an assertion, unsupported-capability, or simulation
+runtime failure, CircuitC instead publishes the complete five-file chain for
+every analysis to the deterministic sibling root `<OUTPUT_DIRECTORY>.failed`.
+The requested success root remains untouched. Failure evidence begins only
+after netlist, request, and map lowering has succeeded; source, semantic, or
+lowering failures before that boundary cannot produce a digest-authenticated
+result and report chain.
+
+Both output roots are additive: publication replaces the paths emitted by the
+current invocation but does not prune unrelated or stale paths. The emitted
+relative paths, not a directory scan, identify the current artifact set. The
+publication transactions provide all-or-rollback failure atomicity for their
+emitted paths; they do not claim snapshot isolation for concurrent readers.
+Readers consume a bundle only after the command reports successful publication.
+Transaction cleanup retains the descriptor that established each staged or
+backup file identity until that file is removed or restored, so an unlinked
+inode cannot be recycled for a racing replacement and then pass the recorded
+device/inode comparison. It reserves cleanup descriptor capacity before
+staging and releases that reserve before rollback or successful disposition;
+descriptor exhaustion must therefore either fail before staging or roll back
+without displacing originals or leaving transaction residue.
+
+Checked execution creates its private compiler work root outside the output in
+the same validated namespace. For an existing output, the work root is a random
+descriptor-created sibling in the output's immediate parent. For a missing
+output, it is a sibling of the first missing component in the deepest existing
+validated ancestor. The sibling parent is retained from the output walk and is
+validated as a mutable transaction parent; it is not reconstructed through an
+OS temporary path. Post-creation lexical and device/inode checks reject direct
+aliases and races. This placement requires sibling-creation permission even
+when an existing output directory itself is writable, and `/` is not a valid
+output because it has no outside sibling.
+
 Ohmnivore remains behind a process boundary. Bazel owns the exact source
 revision `c2189a651d4879211019e109b2136dee836a5c5d`, builds the executable, and
 passes it to the CircuitC adapter through runfiles. The initial adapter accepts
@@ -125,6 +191,9 @@ CI. Its unavailability is reported, never treated as passing evidence.
   connectivity or assertion intent.
 - One analysis produces one independently checksummed request, map, result,
   and report chain.
+- Successful checked compilation publishes each complete five-file analysis
+  chain together with the successful design bundle; checked failure retains
+  complete evidence separately without modifying that bundle.
 - Result serialization is byte-deterministic even though the solver boundary
   uses floating point.
 - Unsupported capabilities, solver failure, malformed output, stale bindings,

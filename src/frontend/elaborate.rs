@@ -3898,7 +3898,7 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
         );
         assert_eq!(
             diagnostic.message,
-            "lowered simulation inputs cannot be compiled until checked execution is available"
+            "the static-only compile entry point does not execute declared simulation analyses; use checked compilation"
         );
         assert_eq!(&source[diagnostic.start..diagnostic.end], declaration);
     }
