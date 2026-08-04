@@ -946,9 +946,12 @@ pub fn verify_kicad10_fabrication_manifest(
 #[cfg(test)]
 mod tests {
     use crate::demo::voltage_divider;
-    use crate::design::{SimulationAnalysis, SimulationAnalysisKind};
+    use crate::design::{
+        SimulationAnalysis, SimulationAnalysisKind, SimulationAssertion, SimulationSample,
+    };
     use crate::manufacturing::contract::MAX_POSITION_ROWS;
     use crate::product::compile_product_artifacts;
+    use crate::quantity::{Quantity, Unit};
 
     use super::*;
 
@@ -1114,6 +1117,114 @@ mod tests {
             .unwrap_err()
             .code,
             "CC-FABRICATION-AUTH-001"
+        );
+    }
+
+    #[test]
+    fn checked_compiler_evidence_authenticates_simulation_design_for_fabrication() {
+        let mut design = voltage_divider();
+        design.analyses.push(SimulationAnalysis {
+            path: "simulation.dc".to_owned(),
+            kind: SimulationAnalysisKind::DcOperatingPoint,
+        });
+        design.canonicalize();
+        let work_root = std::env::var_os("TEST_TMPDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("fabrication-checked-simulation-positive");
+        let checked = crate::compile_checked(&design, &work_root).unwrap();
+        let product = compile_product_artifacts(&design, SNAPSHOT, "production").unwrap();
+
+        bind_kicad10_fabrication(
+            &design,
+            SNAPSHOT,
+            "production",
+            FabricationCompilerArtifacts::Checked(&checked),
+            &product,
+            ANALYSIS,
+            ASSERTION,
+            KICAD_VERSION,
+            HOST_EXECUTABLE,
+            &raw_files(&design, 1),
+        )
+        .expect("authenticated checked evidence must bind for a simulation Design");
+    }
+
+    #[test]
+    fn fabrication_rejects_same_path_checked_simulation_semantic_drift() {
+        let mut design = voltage_divider();
+        design.analyses.push(SimulationAnalysis {
+            path: "simulation.dc".to_owned(),
+            kind: SimulationAnalysisKind::DcOperatingPoint,
+        });
+        design.canonicalize();
+        let work_root = std::env::var_os("TEST_TMPDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("fabrication-checked-simulation-stale");
+        let checked = crate::compile_checked(&design, &work_root).unwrap();
+
+        design.assertions.push(SimulationAssertion {
+            path: "checks.dc".to_owned(),
+            analysis_path: "simulation.dc".to_owned(),
+            net: "VOUT".to_owned(),
+            sample: SimulationSample::Scalar,
+            expected: Quantity::new(5, 0, Unit::Volt),
+            absolute_tolerance: Quantity::new(0, 0, Unit::Volt),
+            relative_tolerance: Quantity::new(0, 0, Unit::Dimensionless),
+        });
+        design.canonicalize();
+        let product = compile_product_artifacts(&design, SNAPSHOT, "production").unwrap();
+        let diagnostic = bind_kicad10_fabrication(
+            &design,
+            SNAPSHOT,
+            "production",
+            FabricationCompilerArtifacts::Checked(&checked),
+            &product,
+            ANALYSIS,
+            ASSERTION,
+            KICAD_VERSION,
+            HOST_EXECUTABLE,
+            &raw_files(&design, 1),
+        )
+        .expect_err("fabrication must reject stale same-path checked simulation evidence");
+        assert_eq!(diagnostic.code, "CC-FABRICATION-AUTH-001");
+        assert_eq!(diagnostic.path, "compiled_artifacts");
+        assert!(
+            diagnostic
+                .message
+                .contains("checked simulation inputs do not equal deterministic lowering")
+        );
+    }
+
+    #[test]
+    fn checked_compiler_evidence_cannot_replace_static_recompilation() {
+        let design = voltage_divider();
+        let work_root = std::env::var_os("TEST_TMPDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("fabrication-checked-static-negative");
+        let checked = crate::compile_checked(&design, &work_root).unwrap();
+        let product = compile_product_artifacts(&design, SNAPSHOT, "production").unwrap();
+
+        let diagnostic = bind_kicad10_fabrication(
+            &design,
+            SNAPSHOT,
+            "production",
+            FabricationCompilerArtifacts::Checked(&checked),
+            &product,
+            ANALYSIS,
+            ASSERTION,
+            KICAD_VERSION,
+            HOST_EXECUTABLE,
+            &raw_files(&design, 1),
+        )
+        .expect_err("static Design must reject opaque checked compiler artifacts");
+        assert_eq!(diagnostic.code, "CC-FABRICATION-AUTH-001");
+        assert_eq!(diagnostic.path, "compiled_artifacts");
+        assert_eq!(
+            diagnostic.message,
+            "static Design requires independently reproducible static compiler artifacts"
         );
     }
 
