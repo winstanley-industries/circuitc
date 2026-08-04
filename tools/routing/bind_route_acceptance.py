@@ -707,11 +707,7 @@ def bind(args: argparse.Namespace) -> bytes:
         or verified["tool"] != tool
     ):
         raise AcceptanceError("strict APGAR evidence summary disagrees with joined contracts")
-    expected_segments = [
-        {key: value for key, value in segment.items() if key != "kicad_uuid"}
-        for segment in projection["segments"]
-    ]
-    if verified["segments"] != expected_segments:
+    if verified["segments"] != projection["segments"]:
         raise AcceptanceError("projection geometry disagrees with strict APGAR evidence")
 
     design_name = _require_string(request["design_name"], "request.design_name")

@@ -268,6 +268,43 @@ expect_failure coordinated-pcb 'does not match authenticated APGAR geometry' \
   --provenance "${provenance}" \
   --route-verifier "${route_verifier}"
 
+uuid_dir="${root}/coordinated-uuid"
+mkdir -p "${uuid_dir}"
+uuid_pcb="${uuid_dir}/routed_voltage_divider.kicad_pcb"
+uuid_projection="${uuid_dir}/projection.json"
+python3 - "${projection}" "${pcb}" "${uuid_projection}" "${uuid_pcb}" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+projection_source, pcb_source, projection_target, pcb_target = map(pathlib.Path, sys.argv[1:])
+projection = json.loads(projection_source.read_text(encoding="utf-8"))
+old_uuid = projection["segments"][0]["kicad_uuid"]
+replacement = "0" if old_uuid[0] != "0" else "1"
+new_uuid = replacement + old_uuid[1:]
+pcb_data = pcb_source.read_bytes()
+if pcb_data.count(old_uuid.encode()) != 1:
+    raise SystemExit("expected exactly one projected UUID in PCB mutant source")
+pcb_data = pcb_data.replace(old_uuid.encode(), new_uuid.encode())
+pcb_target.write_bytes(pcb_data)
+projection["segments"][0]["kicad_uuid"] = new_uuid
+projection["kicad_pcb_sha256"] = hashlib.sha256(pcb_data).hexdigest()
+projection_target.write_text(
+    json.dumps(projection, separators=(",", ":")) + "\n", encoding="utf-8"
+)
+PY
+expect_failure coordinated-uuid 'projection geometry disagrees with strict APGAR evidence' \
+  --request "${request}" \
+  --result "${result}" \
+  --projection "${uuid_projection}" \
+  --pcb "${uuid_pcb}" \
+  --schematic "${schematic}" \
+  --drc "${drc}" \
+  --erc "${erc}" \
+  --provenance "${provenance}" \
+  --route-verifier "${route_verifier}"
+
 stale_dir="${root}/stale"
 mkdir -p "${stale_dir}"
 stale_schematic="${stale_dir}/routed_voltage_divider.kicad_sch"

@@ -3,6 +3,7 @@
 use serde::Serialize;
 
 use crate::compile::RelativeArtifactPath;
+use crate::kicad::stable_uuid;
 
 use super::contract::{
     ContractDiagnostic, LayerSide, RouteOutcome, ToolIdentity, parse_request, parse_result,
@@ -41,6 +42,7 @@ struct VerifiedEvidence {
 struct VerifiedSegment {
     ordinal: u64,
     semantic_path: String,
+    kicad_uuid: String,
     net: String,
     layer: VerifiedLayer,
     start_nm: VerifiedPoint,
@@ -142,6 +144,7 @@ pub(crate) fn verify(
         .iter()
         .enumerate()
         .map(|(index, primitive)| {
+            let semantic_path = format!("{}.segment.{index:08}", request.request_path);
             let start = point_to_nm(
                 primitive.start,
                 &format!("candidate.geometry[{index}].start"),
@@ -149,7 +152,8 @@ pub(crate) fn verify(
             let end = point_to_nm(primitive.end, &format!("candidate.geometry[{index}].end"))?;
             Ok(VerifiedSegment {
                 ordinal: index as u64,
-                semantic_path: format!("{}.segment.{index:08}", request.request_path),
+                kicad_uuid: stable_uuid(&request.design_name, "route-segment", &[&semantic_path]),
+                semantic_path,
                 net: routed_net.name.clone(),
                 layer: match layer {
                     VerifiedLayer::Front => VerifiedLayer::Front,

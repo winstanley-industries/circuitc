@@ -1367,7 +1367,7 @@ fn millimeters(nanometers: i64) -> String {
     format!("{sign}{integer}.{fraction}")
 }
 
-fn stable_uuid(namespace: &str, entity_kind: &str, identity_fields: &[&str]) -> String {
+pub(crate) fn stable_uuid(namespace: &str, entity_kind: &str, identity_fields: &[&str]) -> String {
     let mut identity = Vec::new();
     append_identity_field(&mut identity, "circuitc-kicad-identity-v1");
     append_identity_field(&mut identity, namespace);
