@@ -1686,6 +1686,11 @@ mod tests {
                 "unsupported",
             ),
         ] {
+            let noncompletion = BoardAnalysisNoncompletion {
+                kind,
+                code: "HOST-UNAVAILABLE".to_owned(),
+                message: "host did not complete the requested capabilities".to_owned(),
+            };
             let bundle = record_kicad10_board_analysis_noncompletion(
                 &fixture.design,
                 SNAPSHOT,
@@ -1695,13 +1700,41 @@ mod tests {
                 ANALYSIS,
                 &fixture.identity_map,
                 &fixture.fabrication,
-                &BoardAnalysisNoncompletion {
-                    kind,
-                    code: "HOST-UNAVAILABLE".to_owned(),
-                    message: "host did not complete the requested capabilities".to_owned(),
-                },
+                &noncompletion,
             )
             .unwrap();
+            verify_kicad10_board_analysis_noncompletion(
+                &fixture.design,
+                SNAPSHOT,
+                "production",
+                FabricationCompilerArtifacts::Static(&fixture.compiled),
+                &fixture.product,
+                ANALYSIS,
+                &fixture.identity_map,
+                &fixture.fabrication,
+                &noncompletion,
+                &bundle,
+            )
+            .expect("independent noncompletion recomputation must match");
+            let mut changed = bundle.clone();
+            changed.report_json.push('\n');
+            assert_eq!(
+                verify_kicad10_board_analysis_noncompletion(
+                    &fixture.design,
+                    SNAPSHOT,
+                    "production",
+                    FabricationCompilerArtifacts::Static(&fixture.compiled),
+                    &fixture.product,
+                    ANALYSIS,
+                    &fixture.identity_map,
+                    &fixture.fabrication,
+                    &noncompletion,
+                    &changed,
+                )
+                .unwrap_err()
+                .code,
+                "CC-BOARD-ANALYSIS-VERIFY-001"
+            );
             assert!(bundle.files().is_empty());
             let result: Value = serde_json::from_str(bundle.result_json()).unwrap();
             assert_eq!(result["status"], status);
