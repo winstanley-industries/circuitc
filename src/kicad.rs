@@ -918,7 +918,7 @@ pub(crate) fn emit_board(design: &Design) -> String {
     output.push_str("  (general\n    (thickness 1.6)\n    (legacy_teardrops no)\n  )\n");
     output.push_str("  (paper \"A4\")\n");
     output.push_str(
-        "  (layers\n    (0 \"F.Cu\" signal)\n    (2 \"B.Cu\" signal)\n    (25 \"Edge.Cuts\" user)\n    (27 \"Margin\" user)\n    (31 \"F.CrtYd\" user \"F.Courtyard\")\n    (29 \"B.CrtYd\" user \"B.Courtyard\")\n  )\n",
+        "  (layers\n    (0 \"F.Cu\" signal)\n    (2 \"B.Cu\" signal)\n    (9 \"F.Adhes\" user \"F.Adhesive\")\n    (11 \"B.Adhes\" user \"B.Adhesive\")\n    (13 \"F.Paste\" user)\n    (15 \"B.Paste\" user)\n    (5 \"F.SilkS\" user \"F.Silkscreen\")\n    (7 \"B.SilkS\" user \"B.Silkscreen\")\n    (1 \"F.Mask\" user)\n    (3 \"B.Mask\" user)\n    (17 \"Dwgs.User\" user \"User.Drawings\")\n    (19 \"Cmts.User\" user \"User.Comments\")\n    (21 \"Eco1.User\" user \"User.Eco1\")\n    (23 \"Eco2.User\" user \"User.Eco2\")\n    (25 \"Edge.Cuts\" user)\n    (27 \"Margin\" user)\n    (31 \"F.CrtYd\" user \"F.Courtyard\")\n    (29 \"B.CrtYd\" user \"B.Courtyard\")\n    (35 \"F.Fab\" user)\n    (33 \"B.Fab\" user)\n  )\n",
     );
     output.push_str(
         "  (setup\n    (pad_to_mask_clearance 0)\n    (allow_soldermask_bridges_in_footprints no)\n  )\n",
@@ -1429,9 +1429,31 @@ mod tests {
     };
 
     use super::{
-        millimeters, stable_uuid, validate_catalog_bindings, validate_catalog_footprint,
-        validate_publishable_symbol,
+        emit_board, millimeters, stable_uuid, validate_catalog_bindings,
+        validate_catalog_footprint, validate_publishable_symbol,
     };
+
+    #[test]
+    fn board_declares_every_manufacturing_layer_used_by_emitted_footprints() {
+        let board = emit_board(&voltage_divider());
+        for declaration in [
+            "(0 \"F.Cu\" signal)",
+            "(2 \"B.Cu\" signal)",
+            "(13 \"F.Paste\" user)",
+            "(15 \"B.Paste\" user)",
+            "(5 \"F.SilkS\" user \"F.Silkscreen\")",
+            "(7 \"B.SilkS\" user \"B.Silkscreen\")",
+            "(1 \"F.Mask\" user)",
+            "(3 \"B.Mask\" user)",
+            "(25 \"Edge.Cuts\" user)",
+            "(31 \"F.CrtYd\" user \"F.Courtyard\")",
+            "(29 \"B.CrtYd\" user \"B.Courtyard\")",
+            "(35 \"F.Fab\" user)",
+            "(33 \"B.Fab\" user)",
+        ] {
+            assert!(board.contains(declaration), "missing {declaration}");
+        }
+    }
 
     #[test]
     fn package_only_catalog_mismatch_reports_the_complete_part_identity() {

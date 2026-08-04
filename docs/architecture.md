@@ -71,6 +71,11 @@ cannot represent; it may not silently discard or reinterpret them.
     compiled projections of Design IR, one exact variant, and authenticated
     catalog evidence. They may not redefine component identity, population,
     placement, configuration, or quantity.
+11. KiCad 10.0.5 owns native fabrication parsing and export semantics for the
+    exact generated board. CircuitC owns the fixed export request, strict
+    native inventory, narrow host-date normalization, Design/product joins,
+    and fabrication manifest. Native position CSV is parity evidence and may
+    not redefine canonical placement or product population.
 
 Edits made only to generated KiCad files are not round-tripped. Code-authored
 placement and routing belong in CircuitC source. A future importer may help
@@ -125,6 +130,10 @@ recorded in the schema and ADRs.
 - Catalog evaluation dates are authored canonical values. Freshness decisions
   consume authenticated evidence and explicit policy; they never consult the
   build host's current date or a live remote service.
+- Raw Gerber, Gerber-job, and Excellon creation timestamps are validated and
+  replaced only in their documented native fields with the authenticated
+  catalog evaluation date at midnight. Released fabrication bytes contain no
+  host-clock value; every nonvolatile native byte remains host-owned evidence.
 
 ## 6. Component integrations
 
@@ -177,6 +186,22 @@ KiCad 10 directly parses the schematic, PCB, symbol, and footprint artifacts
 used by this gate. Its CLI has no direct `.kicad_pro` parser, so CircuitC also
 parses that JSON and enforces the exact deterministic project subset it emits,
 including the artifact filename contract.
+
+The first fabrication adapter is separate from ERC/DRC validation. A strict
+request binds one exact board, selected product variant, Layer-3 resolution and
+placement digests, fixed KiCad 10.0.5 exporter profile, and exact output
+inventory and drives the supported host only after canonical validation. The
+binder independently reproduces static/simulation board lowering and replays
+routed lowering from opaque checked route evidence, then computes executable
+identity from the exact executable bytes. The
+supported host emits nine manufacturing Gerbers, one Gerber job,
+separate zero-hit PTH/NPTH Excellon files, and a both-side all-footprint
+position CSV. CircuitC strictly parses their native functions, reconciles the
+job inventory, converts host coordinates exactly to integer nanometres, joins
+every footprint back to Design and product population, narrowly normalizes
+creation dates, and binds every normalized byte into a fabrication manifest.
+Raw host files are transient. Design IR v1 has no drill primitive, so a nonzero
+drill inventory fails unsupported rather than being silently accepted.
 
 The KiCad IPC API is not the primary headless boundary for versions 9 and 10
 because it requires a running GUI. It may later support interactive preview or
