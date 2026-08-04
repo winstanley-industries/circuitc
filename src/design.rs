@@ -362,9 +362,20 @@ pub struct RouteSegment {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoutingRequest {
+    pub path: String,
+    pub net: String,
+    pub width_nm: i64,
+    pub clearance_nm: i64,
+    pub grid_step_nm: i64,
+    pub layer: CopperLayer,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Board {
     pub outline: RectNm,
     pub routes: Vec<RouteSegment>,
+    pub routing_requests: Vec<RoutingRequest>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -471,6 +482,9 @@ impl Design {
         self.assertions.sort_by(compare_assertions);
         self.board
             .routes
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        self.board
+            .routing_requests
             .sort_by(|left, right| left.path.cmp(&right.path));
     }
 
@@ -741,6 +755,144 @@ impl Design {
                     &path,
                     "duplicate route segment would produce a duplicate stable identity",
                 );
+            }
+        }
+
+        if self.board.routing_requests.len() > 1 {
+            push(
+                &mut diagnostics,
+                "CC-AUTOROUTE-001",
+                "design.board.routing_requests",
+                "Design IR v1 supports at most one APGAR planar routing request",
+            );
+        }
+        let mut request_paths = BTreeSet::new();
+        for (index, request) in self.board.routing_requests.iter().enumerate() {
+            let path = format!("design.board.routing_requests[{index}]");
+            if !semantic_path_is_valid(&request.path) {
+                push(
+                    &mut diagnostics,
+                    "CC-AUTOROUTE-002",
+                    &path,
+                    "routing request semantic path is invalid",
+                );
+            }
+            if !request_paths.insert(request.path.as_str()) {
+                push(
+                    &mut diagnostics,
+                    "CC-AUTOROUTE-003",
+                    &path,
+                    format!("duplicate routing request semantic path {}", request.path),
+                );
+            }
+            if route_paths.contains(request.path.as_str()) {
+                push_related(
+                    &mut diagnostics,
+                    "CC-AUTOROUTE-004",
+                    &path,
+                    request.path.as_str(),
+                    format!(
+                        "routing request semantic path {} is already used by authored copper",
+                        request.path
+                    ),
+                );
+            }
+            if !net_names.contains(request.net.as_str()) {
+                push(
+                    &mut diagnostics,
+                    "CC-AUTOROUTE-005",
+                    &path,
+                    format!("routing request references unknown net {}", request.net),
+                );
+            }
+            for (value, field, positive_code, envelope_code) in [
+                (
+                    request.width_nm,
+                    "width_nm",
+                    "CC-AUTOROUTE-006",
+                    "CC-AUTOROUTE-009",
+                ),
+                (
+                    request.clearance_nm,
+                    "clearance_nm",
+                    "CC-AUTOROUTE-007",
+                    "CC-AUTOROUTE-010",
+                ),
+                (
+                    request.grid_step_nm,
+                    "grid_step_nm",
+                    "CC-AUTOROUTE-008",
+                    "CC-AUTOROUTE-011",
+                ),
+            ] {
+                if value <= 0 {
+                    push(
+                        &mut diagnostics,
+                        positive_code,
+                        format!("{path}.{field}"),
+                        format!("routing request {field} must be positive"),
+                    );
+                }
+                validate_size_envelope(value, field, &path, envelope_code, &mut diagnostics);
+            }
+
+            let mut terminals = Vec::new();
+            for component in &self.components {
+                let Some(physical) = &component.physical else {
+                    continue;
+                };
+                for pad in &physical.footprint.pads {
+                    if component.net_for_pad(&pad.number) != Some(request.net.as_str()) {
+                        continue;
+                    }
+                    if let Some(center) = physical.placement.transform(pad.offset) {
+                        terminals.push((
+                            component.path.as_str(),
+                            pad.number.as_str(),
+                            center,
+                            physical.placement.layer,
+                        ));
+                    }
+                }
+            }
+            terminals.sort_by(|left, right| (left.0, left.1).cmp(&(right.0, right.1)));
+            if terminals.len() != 2 {
+                push(
+                    &mut diagnostics,
+                    "CC-AUTOROUTE-012",
+                    &path,
+                    format!(
+                        "APGAR planar routing requires exactly two physical terminal pads on net {}; found {}",
+                        request.net,
+                        terminals.len()
+                    ),
+                );
+            }
+            for (component, pad, center, layer) in terminals {
+                if layer != request.layer {
+                    push(
+                        &mut diagnostics,
+                        "CC-AUTOROUTE-013",
+                        &path,
+                        format!(
+                            "terminal {component} pad {pad} is not on the requested copper layer"
+                        ),
+                    );
+                }
+                if request.grid_step_nm > 0 {
+                    let delta_x = center.x - self.board.outline.origin.x;
+                    let delta_y = center.y - self.board.outline.origin.y;
+                    if delta_x % request.grid_step_nm != 0 || delta_y % request.grid_step_nm != 0 {
+                        push(
+                            &mut diagnostics,
+                            "CC-AUTOROUTE-014",
+                            &path,
+                            format!(
+                                "terminal {component} pad {pad} center is not on the authored routing grid"
+                            ),
+                        );
+                    }
+                }
             }
         }
 
@@ -2341,9 +2493,9 @@ mod tests {
     use super::{
         ComponentValue, ConnectionState, CopperLayer, MAX_ABS_COORDINATE_NM,
         MAX_SIMULATION_ANALYSES, MAX_SIMULATION_ASSERTIONS, MAX_SIMULATION_SAMPLES,
-        MAX_SIMULATION_TOTAL_SAMPLES, PinPadBinding, Placement, PointNm, SimulationAnalysis,
-        SimulationAnalysisKind, SimulationAssertion, SimulationSample, TransientGridLocation,
-        ac_grid_index, transient_grid_location,
+        MAX_SIMULATION_TOTAL_SAMPLES, PinPadBinding, Placement, PointNm, RoutingRequest,
+        SimulationAnalysis, SimulationAnalysisKind, SimulationAssertion, SimulationSample,
+        TransientGridLocation, ac_grid_index, transient_grid_location,
     };
 
     fn has_code(diagnostics: &[super::Diagnostic], code: &str) -> bool {
@@ -2358,6 +2510,17 @@ mod tests {
             has_code(&diagnostics, code),
             "missing diagnostic {code}: {diagnostics:#?}"
         );
+    }
+
+    fn vout_routing_request() -> RoutingRequest {
+        RoutingRequest {
+            path: "board.autoroute.vout".to_owned(),
+            net: "VOUT".to_owned(),
+            width_nm: 250_000,
+            clearance_nm: 200_000,
+            grid_step_nm: 250_000,
+            layer: CopperLayer::Front,
+        }
     }
 
     fn design_with_simulation_intent() -> super::Design {
@@ -3619,6 +3782,83 @@ mod tests {
             .validate()
             .expect_err("duplicate route paths must be rejected");
         assert!(has_code(&diagnostics, "CC-ROUTE-007"));
+    }
+
+    #[test]
+    fn accepts_explicit_two_terminal_planar_routing_intent() {
+        let mut design = voltage_divider();
+        design.board.routing_requests = vec![vout_routing_request()];
+        assert_eq!(design.validate(), Ok(()));
+        assert_eq!(
+            design.board.routes.len(),
+            1,
+            "authored copper remains distinct"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_or_ambiguous_routing_request_identity() {
+        let mut design = voltage_divider();
+        let mut invalid = vout_routing_request();
+        invalid.path = ".invalid".to_owned();
+        design.board.routing_requests.push(invalid);
+        assert_rejected(design, "CC-AUTOROUTE-002");
+
+        let mut design = voltage_divider();
+        let mut colliding = vout_routing_request();
+        colliding.path = design.board.routes[0].path.clone();
+        design.board.routing_requests.push(colliding);
+        assert_rejected(design, "CC-AUTOROUTE-004");
+
+        let mut design = voltage_divider();
+        let first = vout_routing_request();
+        let mut second = first.clone();
+        second.path = "board.autoroute.second".to_owned();
+        design.board.routing_requests = vec![first, second];
+        assert_rejected(design, "CC-AUTOROUTE-001");
+    }
+
+    #[test]
+    fn rejects_invalid_routing_request_dimensions_and_net() {
+        let mut design = voltage_divider();
+        let mut request = vout_routing_request();
+        request.net = "UNKNOWN".to_owned();
+        request.width_nm = 0;
+        request.clearance_nm = -1;
+        request.grid_step_nm = i64::MAX;
+        design.board.routing_requests.push(request);
+        let diagnostics = design
+            .validate()
+            .expect_err("invalid routing dimensions and net must fail");
+        for code in [
+            "CC-AUTOROUTE-005",
+            "CC-AUTOROUTE-006",
+            "CC-AUTOROUTE-007",
+            "CC-AUTOROUTE-011",
+        ] {
+            assert!(has_code(&diagnostics, code), "missing diagnostic {code}");
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_terminal_count_layer_and_grid() {
+        let mut design = voltage_divider();
+        let mut request = vout_routing_request();
+        request.net = "VIN".to_owned();
+        design.board.routing_requests.push(request);
+        assert_rejected(design, "CC-AUTOROUTE-012");
+
+        let mut design = voltage_divider();
+        let mut request = vout_routing_request();
+        request.layer = CopperLayer::Back;
+        design.board.routing_requests.push(request);
+        assert_rejected(design, "CC-AUTOROUTE-013");
+
+        let mut design = voltage_divider();
+        let mut request = vout_routing_request();
+        request.grid_step_nm = 300_000;
+        design.board.routing_requests.push(request);
+        assert_rejected(design, "CC-AUTOROUTE-014");
     }
 
     #[test]

@@ -2,10 +2,10 @@
 
 ## Status and authority
 
-This document defines the active, unreleased M2 grammar. It is deliberately
-limited to the reference circuit and simulation-closure semantics. The grammar
-may evolve in place before the first language release; there is no version
-declaration or compatibility machinery yet.
+This document defines the active, unreleased CircuitC grammar. It covers the
+current reference circuit, simulation-closure semantics, and initial planar
+routing intent. The grammar may evolve in place before the first language
+release; there is no version declaration or compatibility machinery yet.
 
 CircuitC source is authoritative. Parsing and elaboration produce the canonical
 Design IR, and only the existing compiler boundary may lower that IR to KiCad or
@@ -69,6 +69,8 @@ board_item  := "rectangle" "at" point "size" point ";"
                "layer" layer ";"
              | "route" path "net" net "from" point "to" point
                "width" length "layer" layer ";"
+             | "autoroute" path "net" net "width" length
+               "clearance" length "grid" length "layer" layer ";"
 
 point       := "(" length "," length ")"
 quantity    := decimal unit
@@ -110,6 +112,31 @@ canonical coefficient and exponent, so forms such as `10 kohm` and
 `10000 ohm` elaborate identically.
 Orthogonal rotation is counterclockwise as rendered; in KiCad's Y-down frame,
 an offset `(x, y)` at 90 degrees maps to `(y, -x)`.
+
+`route` and `autoroute` have different authority. A `route` declaration is
+source-authored canonical copper. An `autoroute` declaration is a request to
+search for copper and does not itself emit a KiCad segment. A board may contain
+zero or one autoroute request. Its path is a stable routing identity, its net
+must be declared, and its width, clearance, and grid must be positive exact
+integer nanometre values within the Design IR envelope. The grid is anchored at
+the board-outline origin, and both terminal-pad centres must lie on it.
+
+The initial autoroute capability is one two-terminal physical net on one
+selected front or back layer. The deterministic CPU reference accepts only
+horizontal, vertical, and 45-degree segment chains. Vias, arcs, multipin
+routing, other headings, and approximation of unsupported geometry or rules
+fail closed with machine-readable diagnostics. At the APGAR boundary,
+CircuitC converts nanometres to the current APGAR database-unit domain by
+checked multiplication by two; no floating-point conversion or rounding is
+allowed.
+
+APGAR request and result artifacts use separate strict, canonical, versioned
+JSON process contracts. A selected result becomes canonical physical intent
+only after CircuitC authenticates it against the exact request and toolchain,
+verifies APGAR exact admission, and losslessly imports its supported geometry
+into a fresh validated Design IR. Supported-host KiCad DRC then remains a
+separate required acceptance authority. Raw, stale, mismatched, unsupported,
+or unauthenticated output is never copper.
 
 Simulation intent is always explicit. A legacy design with no `analysis`
 declaration has no implicit operating point or other analysis. Analysis and
@@ -209,8 +236,9 @@ for the corresponding pad so the host parity checker sees the intended open.
 
 Declarations are resolved by identity rather than order. Net, module, port,
 component, symbol-pin binding, footprint binding, placement, and route
-collections are canonicalized before the Design IR is exposed. Every simulated
-design has exactly one `ground` declaration.
+collections are canonicalized before the Design IR is exposed. The optional
+autoroute request retains its semantic identity independent of declaration
+order. Every simulated design has exactly one `ground` declaration.
 
 ## CLI and exit status
 

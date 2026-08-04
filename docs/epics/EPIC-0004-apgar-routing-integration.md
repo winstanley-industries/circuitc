@@ -23,6 +23,23 @@ KiCad DRC before accepting it.
 | `CC-REQ-ROUTE-006` | APGAR exact validation and supported KiCad DRC both gate every accepted imported route. |
 | `CC-REQ-ROUTE-007` | Failed, unsupported, stale, or mismatched requests and results produce machine-readable diagnostics and cannot be imported. |
 
+## Initial capability boundary
+
+- Source-authored `route` segments remain canonical copper. The distinct
+  `autoroute` form authors one unresolved request and cannot be emitted as
+  copper before authenticated import.
+- Design IR v1 permits zero or one autoroute request for exactly one
+  two-terminal physical net on one selected front or back layer. The CPU
+  reference supports horizontal, vertical, and 45-degree centreline segments.
+- The initial contract excludes vias, arcs, multipin routing, other headings,
+  and approximation of unsupported geometry or rules.
+- CircuitC crosses to APGAR's current database-unit domain with checked
+  nanometre multiplication by two. Strict canonical versioned JSON request and
+  result contracts authenticate the selected result before lossless import.
+- Imported geometry becomes canonical physical intent only after
+  authentication and validation. APGAR exact admission and supported KiCad DRC
+  remain separate required acceptance authorities.
+
 ## Non-goals
 
 - Reimplementing APGAR inside CircuitC.

@@ -4,7 +4,7 @@ use crate::design::{
     Board, Component, ComponentValue, Connection, ConnectionState, CopperLayer,
     DESIGN_SCHEMA_VERSION, Design, Diagnostic, ElectricalPinType, ModuleInstance, ModulePort, Net,
     PartIdentity, PhysicalImplementation, PinPadBinding, Placement, PointNm, PortDirection, RectNm,
-    RouteSegment, SchematicPlacement, SimulationAnalysis, SimulationAnalysisKind,
+    RouteSegment, RoutingRequest, SchematicPlacement, SimulationAnalysis, SimulationAnalysisKind,
     SimulationAssertion, SimulationModel, SimulationSample, SizeNm, SymbolBinding,
     SymbolPinBinding,
 };
@@ -13,11 +13,12 @@ use crate::quantity::Unit;
 use super::diagnostic::{SourceDiagnostic, sort_diagnostics};
 use super::quantity::{lower_electrical, lower_length, lower_rotation};
 use super::syntax::{
-    BoardItemSyntax, BoardSyntax, ComponentItemSyntax, ComponentKindSyntax, ComponentSyntax,
-    ConnectionStateSyntax, DeclarationSyntax, FootprintItemSyntax, FootprintSyntax, ModuleSyntax,
-    NetSyntax, PartSyntax, PlacementSyntax, PointSyntax, QuantitySyntax, RectangleSyntax,
-    RouteSyntax, SchematicPlacementSyntax, SimulationAnalysisKindSyntax, SimulationAnalysisSyntax,
-    SimulationAssertionSyntax, SimulationSampleSyntax, SourceFile, Span, SymbolSyntax, SyntaxTree,
+    AutorouteSyntax, BoardItemSyntax, BoardSyntax, ComponentItemSyntax, ComponentKindSyntax,
+    ComponentSyntax, ConnectionStateSyntax, DeclarationSyntax, FootprintItemSyntax,
+    FootprintSyntax, ModuleSyntax, NetSyntax, PartSyntax, PlacementSyntax, PointSyntax,
+    QuantitySyntax, RectangleSyntax, RouteSyntax, SchematicPlacementSyntax,
+    SimulationAnalysisKindSyntax, SimulationAnalysisSyntax, SimulationAssertionSyntax,
+    SimulationSampleSyntax, SourceFile, Span, SymbolSyntax, SyntaxTree,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -35,6 +36,7 @@ enum SemanticProvenanceKey {
     Analysis(String),
     Assertion(String),
     Route(String),
+    RoutingRequest(String),
     Footprint(String),
     Placement(String),
     Pad { component: String, pad: String },
@@ -43,7 +45,7 @@ enum SemanticProvenanceKey {
 impl SemanticProvenanceKey {
     fn rendered_path(&self) -> String {
         match self {
-            Self::Component(path) | Self::Route(path) => path.clone(),
+            Self::Component(path) | Self::Route(path) | Self::RoutingRequest(path) => path.clone(),
             Self::Analysis(path) => format!("design.analyses.{path}"),
             Self::Assertion(path) => format!("design.assertions.{path}"),
             Self::Footprint(component) => format!("{component}.footprint"),
@@ -303,6 +305,7 @@ pub(crate) fn elaborate(tree: &SyntaxTree) -> Result<ElaboratedDesign, Vec<Sourc
                 .outline
                 .expect("a missing rectangle produces a diagnostic"),
             routes: board_parts.routes,
+            routing_requests: board_parts.routing_requests,
         },
     };
     design.canonicalize();
@@ -399,6 +402,7 @@ pub(crate) fn map_ir_diagnostics(
                     || diagnostic.code.starts_with("CC-PORT-")
                     || diagnostic.code.starts_with("CC-BOARD-")
                     || diagnostic.code.starts_with("CC-ROUTE-")
+                    || diagnostic.code.starts_with("CC-AUTOROUTE-")
                     || diagnostic.code.starts_with("CC-SIM-");
                 let semantic_span = if diagnostic.code.starts_with("CC-KICAD-") {
                     provenance
@@ -408,7 +412,10 @@ pub(crate) fn map_ir_diagnostics(
                     provenance.component_span(path)
                 };
                 if structural {
-                    provenance.best_structural_span(path).or(semantic_span)
+                    provenance
+                        .best_structural_span(path)
+                        .or(semantic_span)
+                        .or_else(|| provenance.span_for_identity(path))
                 } else if diagnostic.code.starts_with("CC-KICAD-") {
                     provenance
                         .structural_spans
@@ -1099,6 +1106,7 @@ struct BoardParts {
     outline: Option<RectNm>,
     placements: BTreeMap<String, LoweredPlacement>,
     routes: Vec<RouteSegment>,
+    routing_requests: Vec<RoutingRequest>,
 }
 
 #[derive(Clone)]
@@ -1119,6 +1127,7 @@ fn elaborate_board(
     let mut rectangle_syntax: Option<&RectangleSyntax> = None;
     let mut placement_syntax = Vec::new();
     let mut route_syntax = Vec::new();
+    let mut autoroute_syntax = Vec::new();
     for item in &board.items {
         match item {
             BoardItemSyntax::Rectangle(rectangle) => {
@@ -1143,6 +1152,7 @@ fn elaborate_board(
             }
             BoardItemSyntax::Placement(placement) => placement_syntax.push(placement),
             BoardItemSyntax::Route(route) => route_syntax.push(route),
+            BoardItemSyntax::Autoroute(request) => autoroute_syntax.push(request),
         }
     }
     let outline = rectangle_syntax.and_then(|rectangle| {
@@ -1234,10 +1244,49 @@ fn elaborate_board(
             routes.push(route);
         }
     }
+
+    let mut routing_requests = Vec::new();
+    let mut request_paths = BTreeMap::new();
+    for syntax in autoroute_syntax {
+        let path = syntax.path.value.as_str();
+        if !semantic_path_is_valid(path) {
+            diagnostics.push(SourceDiagnostic::new(
+                "CC-LANG-AUTOROUTE-001",
+                source,
+                syntax.path.span,
+                Some(path.to_owned()),
+                "routing request semantic path is invalid",
+            ));
+        }
+        if let Some(first) = request_paths.get(path).copied() {
+            diagnostics.push(
+                SourceDiagnostic::new(
+                    "CC-LANG-AUTOROUTE-002",
+                    source,
+                    syntax.path.span,
+                    Some(path.to_owned()),
+                    format!("duplicate routing request semantic path `{path}`"),
+                )
+                .with_related(source, first, "first routing request is here"),
+            );
+            continue;
+        }
+        request_paths.insert(path, syntax.path.span);
+        if let Some(request) = lower_routing_request(source, syntax, nets, diagnostics) {
+            provenance
+                .insert_structural(format!("design.board.routing_requests.{path}"), syntax.span);
+            provenance.insert_semantic(
+                SemanticProvenanceKey::RoutingRequest(path.to_owned()),
+                syntax.span,
+            );
+            routing_requests.push(request);
+        }
+    }
     BoardParts {
         outline,
         placements,
         routes,
+        routing_requests,
     }
 }
 
@@ -2030,6 +2079,82 @@ fn lower_route(
     }
 }
 
+fn lower_routing_request(
+    source: &SourceFile,
+    syntax: &AutorouteSyntax,
+    nets: &BTreeMap<String, Net>,
+    diagnostics: &mut Vec<SourceDiagnostic>,
+) -> Option<RoutingRequest> {
+    let path = syntax.path.value.as_str();
+    if !nets.contains_key(syntax.net.value.as_str()) {
+        diagnostics.push(SourceDiagnostic::new(
+            "CC-LANG-AUTOROUTE-003",
+            source,
+            syntax.net.span,
+            Some(path.to_owned()),
+            format!(
+                "routing request references unknown net `{}`",
+                syntax.net.value
+            ),
+        ));
+    }
+    let width = lower_length(source, &syntax.width, Some(path), diagnostics);
+    let clearance = lower_length(source, &syntax.clearance, Some(path), diagnostics);
+    let grid_step = lower_length(source, &syntax.grid_step, Some(path), diagnostics);
+    for (value, code, span, message) in [
+        (
+            width,
+            "CC-LANG-AUTOROUTE-004",
+            syntax.width.span,
+            "routing request width must be positive",
+        ),
+        (
+            clearance,
+            "CC-LANG-AUTOROUTE-005",
+            syntax.clearance.span,
+            "routing request clearance must be positive",
+        ),
+        (
+            grid_step,
+            "CC-LANG-AUTOROUTE-006",
+            syntax.grid_step.span,
+            "routing request grid step must be positive",
+        ),
+    ] {
+        if value.is_some_and(|value| value <= 0) {
+            diagnostics.push(SourceDiagnostic::new(
+                code,
+                source,
+                span,
+                Some(path.to_owned()),
+                message,
+            ));
+        }
+    }
+    let layer = lower_layer(
+        source,
+        &syntax.layer.value,
+        syntax.layer.span,
+        path,
+        diagnostics,
+    );
+    match (width, clearance, grid_step, layer) {
+        (Some(width_nm), Some(clearance_nm), Some(grid_step_nm), Some(layer))
+            if width_nm > 0 && clearance_nm > 0 && grid_step_nm > 0 =>
+        {
+            Some(RoutingRequest {
+                path: path.to_owned(),
+                net: syntax.net.value.clone(),
+                width_nm,
+                clearance_nm,
+                grid_step_nm,
+                layer,
+            })
+        }
+        _ => None,
+    }
+}
+
 fn lower_point(
     source: &SourceFile,
     syntax: &PointSyntax,
@@ -2251,6 +2376,15 @@ fn register_indexed_provenance(design: &Design, provenance: &mut ProvenanceMap) 
             .copied()
         {
             provenance.insert_structural(format!("design.board.routes[{index}]"), span);
+        }
+    }
+    for (index, request) in design.board.routing_requests.iter().enumerate() {
+        if let Some(span) = provenance
+            .structural_spans
+            .get(&format!("design.board.routing_requests.{}", request.path))
+            .copied()
+        {
+            provenance.insert_structural(format!("design.board.routing_requests[{index}]"), span);
         }
     }
 }

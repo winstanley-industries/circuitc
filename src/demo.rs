@@ -108,6 +108,7 @@ pub fn voltage_divider() -> Design {
                 width_nm: 250_000,
                 layer: CopperLayer::Front,
             }],
+            routing_requests: Vec::new(),
         },
     };
     design.canonicalize();

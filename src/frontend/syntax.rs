@@ -334,6 +334,7 @@ pub(crate) enum BoardItemSyntax {
     Rectangle(RectangleSyntax),
     Placement(PlacementSyntax),
     Route(Box<RouteSyntax>),
+    Autoroute(Box<AutorouteSyntax>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -359,6 +360,17 @@ pub(crate) struct RouteSyntax {
     pub start: PointSyntax,
     pub end: PointSyntax,
     pub width: QuantitySyntax,
+    pub layer: Spanned<String>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AutorouteSyntax {
+    pub path: Spanned<String>,
+    pub net: Spanned<String>,
+    pub width: QuantitySyntax,
+    pub clearance: QuantitySyntax,
+    pub grid_step: QuantitySyntax,
     pub layer: Spanned<String>,
     pub span: Span,
 }
