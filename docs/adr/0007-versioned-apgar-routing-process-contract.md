@@ -93,6 +93,10 @@ subset. KiCad DRC establishes whether the emitted board is accepted by the
 supported KiCad host. Every accepted imported route requires both results,
 bound to the same authenticated request, selected result, imported Design IR,
 and emitted board; neither result substitutes for the other.
+The versioned route-acceptance manifest independently recomputes the digest
+chain after supported-host ERC and DRC, re-derives the lossless selected
+geometry projection, and binds the exact normalized host reports and emitted
+board. It does not make host validation part of the canonical Design IR.
 
 CircuitC source remains the human-authored authority. The authored request
 authorizes route search, the authenticated import supplies the selected exact

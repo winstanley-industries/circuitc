@@ -223,6 +223,21 @@ sh_test(
 )
 
 sh_test(
+    name = "route_acceptance_manifest_test",
+    srcs = ["tools/routing/bind_route_acceptance_test.sh"],
+    args = [
+        "$(location tools/routing/bind_route_acceptance.py)",
+        "$(location //cmd/circuitc)",
+        "$(location tools/routing/fixtures/routed_voltage_divider.circuitc)",
+    ],
+    data = [
+        "tools/routing/bind_route_acceptance.py",
+        "tools/routing/fixtures/routed_voltage_divider.circuitc",
+        "//cmd/circuitc",
+    ],
+)
+
+sh_test(
     name = "checked_simulation_cli_test",
     srcs = ["tools/simulation/checked_cli_test.sh"],
     args = [
@@ -426,12 +441,16 @@ sh_test(
         "$(location examples/voltage_divider.circuitc)",
         "$(location tools/kicad/validate_project.py)",
         "$(location examples/physical_no_connect.circuitc)",
+        "$(location tools/routing/fixtures/routed_voltage_divider.circuitc)",
+        "$(location tools/routing/bind_route_acceptance.py)",
     ],
     data = [
         "examples/physical_no_connect.circuitc",
         "examples/voltage_divider.circuitc",
         "tools/kicad/normalize_drc.py",
         "tools/kicad/validate_project.py",
+        "tools/routing/bind_route_acceptance.py",
+        "tools/routing/fixtures/routed_voltage_divider.circuitc",
         ":voltage_divider",
         "//cmd/circuitc",
     ],

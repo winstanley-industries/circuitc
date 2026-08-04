@@ -7,6 +7,8 @@ frontend="$3"
 source_fixture="$4"
 project_validator="$5"
 physical_source_fixture="$6"
+routed_source_fixture="$7"
+route_acceptance_binder="$8"
 
 if [[ -n "${CIRCUITC_KICAD_CLI:-}" ]]; then
   kicad_cli="${CIRCUITC_KICAD_CLI}"
@@ -172,3 +174,82 @@ for artifact in \
 done
 sed -n '1,240p' "${physical_first_dir}/erc.normalized.json"
 sed -n '1,240p' "${physical_first_dir}/drc.normalized.json"
+
+# Close the imported-route acceptance chain on the supported KiCad host. The
+# binder re-reads and hashes the exact route contracts and board after KiCad has
+# parsed them, so host acceptance cannot be attached to stale projection bytes.
+routed_first_dir="${TEST_TMPDIR}/routed-first"
+routed_second_dir="${TEST_TMPDIR}/routed-second"
+for directory in "${routed_first_dir}" "${routed_second_dir}"; do
+  "${frontend}" compile "${routed_source_fixture}" --output-dir "${directory}"
+done
+diff -r "${routed_first_dir}" "${routed_second_dir}"
+
+for directory in "${routed_first_dir}" "${routed_second_dir}"; do
+  python3 "${project_validator}" \
+    --project "${directory}/routed_voltage_divider.kicad_pro" \
+    --expected-filename routed_voltage_divider.kicad_pro \
+    --normalized "${directory}/project.normalized.json"
+
+  config_directory="${directory}/isolated-kicad-config"
+  mkdir -p "${config_directory}"
+  KICAD_CONFIG_HOME="${config_directory}" "${kicad_cli}" sch erc \
+    --format json \
+    --severity-all \
+    --output "${directory}/erc.raw.json" \
+    "${directory}/routed_voltage_divider.kicad_sch"
+  python3 "${normalizer}" \
+    --raw "${directory}/erc.raw.json" \
+    --normalized "${directory}/erc.normalized.json" \
+    --expected-major 10 \
+    --allow-ignored-check single_global_label \
+    --allow-ignored-check four_way_junction \
+    --allow-ignored-check simulation_model_issue \
+    --allow-ignored-check footprint_filter \
+    --identity-map "${directory}/routed_voltage_divider.kicad-map.json"
+
+  KICAD_CONFIG_HOME="${config_directory}" "${kicad_cli}" pcb drc \
+    --format json \
+    --severity-all \
+    --schematic-parity \
+    --output "${directory}/drc.raw.json" \
+    "${directory}/routed_voltage_divider.kicad_pcb"
+  python3 "${normalizer}" \
+    --raw "${directory}/drc.raw.json" \
+    --normalized "${directory}/drc.normalized.json" \
+    --expected-major 10 \
+    --allow-ignored-check missing_courtyard \
+    --allow-ignored-check track_not_centered_on_via \
+    --allow-ignored-check tuning_profile_track_geometries \
+    --allow-ignored-check footprint_filters_mismatch \
+    --allow-ignored-check footprint_type_mismatch \
+    --identity-map "${directory}/routed_voltage_divider.kicad-map.json"
+
+  route_directory="$(find "${directory}/routing" -mindepth 1 -maxdepth 1 -type d)"
+  test "$(printf '%s\n' "${route_directory}" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
+  python3 "${route_acceptance_binder}" \
+    --request "${route_directory}/request.json" \
+    --result "${route_directory}/result.json" \
+    --projection "${route_directory}/projection.json" \
+    --pcb "${directory}/routed_voltage_divider.kicad_pcb" \
+    --drc "${directory}/drc.normalized.json" \
+    --erc "${directory}/erc.normalized.json" \
+    --output "${directory}/route-acceptance.json"
+done
+
+for artifact in \
+  routed_voltage_divider.kicad_sch \
+  routed_voltage_divider.kicad_pcb \
+  routed_voltage_divider.kicad_pro \
+  routed_voltage_divider.spice \
+  routed_voltage_divider.kicad-map.json \
+  project.normalized.json \
+  erc.normalized.json \
+  drc.normalized.json \
+  route-acceptance.json; do
+  cmp "${routed_first_dir}/${artifact}" "${routed_second_dir}/${artifact}"
+done
+diff -r "${routed_first_dir}/routing" "${routed_second_dir}/routing"
+sed -n '1,240p' "${routed_first_dir}/erc.normalized.json"
+sed -n '1,240p' "${routed_first_dir}/drc.normalized.json"
+sed -n '1,240p' "${routed_first_dir}/route-acceptance.json"
