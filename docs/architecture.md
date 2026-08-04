@@ -58,6 +58,13 @@ cannot represent; it may not silently discard or reinterpret them.
    result, while CircuitC owns model mapping and assertion semantics.
 7. APGAR owns route search and exact routing validation within its declared
    rule subset. KiCad DRC still gates committed KiCad routes.
+8. CircuitC source and canonical Design IR own product policy, approved
+   substitutions, variants, population state, configuration, and requested
+   manufacturability assertions.
+9. A checksum-pinned catalog snapshot owns only its point-in-time remote
+   observations. It may prove or fail authored constraints, but it may not add
+   product intent, select an unapproved substitute, or become a build-time
+   network dependency.
 
 Edits made only to generated KiCad files are not round-tripped. Code-authored
 placement and routing belong in CircuitC source. A future importer may help
@@ -75,7 +82,10 @@ The Design IR contains concepts common to all useful views:
 - exact dimensional quantities, ranges, and tolerances;
 - explicit part, symbol, footprint, and simulation-model bindings;
 - assertions with proof status rather than unchecked annotations; and
-- physical and simulation intent attached through typed extensions.
+- physical and simulation intent attached through typed extensions;
+- product variants with explicit population and configuration state; and
+- pinned catalog-evidence identity plus capability-declared
+  manufacturability intent.
 
 It deliberately does not embed:
 
@@ -106,6 +116,9 @@ recorded in the schema and ADRs.
   emitted-identity uniqueness before writing artifacts.
 - Output order is canonical. Wall-clock time, random UUIDs, absolute paths,
   network lookups, and hash-map iteration order may not affect artifacts.
+- Catalog evaluation dates are authored canonical values. Freshness decisions
+  consume authenticated evidence and explicit policy; they never consult the
+  build host's current date or a live remote service.
 
 ## 6. Component integrations
 
@@ -204,12 +217,28 @@ Production builds are offline and hermetic:
 
 - symbols, footprints, 3D models, and simulation models are vendored or fetched
   through checksum-pinned Bazel repositories;
-- a part binds manufacturer and part number separately from logical device
-  type;
+- a part binds logical function, manufacturer, manufacturer part number,
+  package, lifecycle requirement, sourcing constraints, and approved
+  substitutions as independent fields;
 - pin-to-pad, pin-to-symbol, and pin-to-model mappings are explicit and
   validated; and
-- remote catalog search may assist authoring but can never be required to
-  rebuild a committed design.
+- remote catalog search may assist authoring, but a build consumes only an
+  explicitly named checksum-pinned snapshot evaluated on an authored date.
+
+Virtual parts retain logical function and omit every physical product field.
+Every design containing a physical component carries one catalog-evidence
+reference and at least one explicit product variant. Variants assign exactly
+one fitted, not-fitted, or approved-alternate state to every physical
+component; no generated BOM or board edit may redefine that state.
+
+The initial manufacturability intent is limited to KiCad major version 10 and
+stable assertions for clean ERC, clean DRC, clean unconnected and
+schematic-parity results, and a complete fabrication inventory. This is
+canonical requested intent only. Manufacturing export, normalized analysis
+evidence, and release-manifest closure remain separate compiled boundaries and
+require later accepted decisions before CircuitC can claim a release.
+The authority and initial field-level contract are recorded in
+[ADR-0008](adr/0008-product-intent-and-pinned-catalog-evidence.md).
 
 This directly avoids hosted-backend availability becoming a build dependency.
 
@@ -280,9 +309,12 @@ silently redefine them.
 
 ### M4: product and manufacturing closure
 
-- part selection constraints and lifecycle data;
+- independently authored logical function, part identity, package, lifecycle
+  requirement, sourcing constraints, and approved substitutions;
+- checksum-pinned catalog evidence whose authored evaluation date makes
+  freshness reproducible without wall-clock or network access;
 - variants, BOM, placement, fabrication, and assembly outputs;
-- board-level signal/power analysis adapters; and
+- an initial capability-declared KiCad 10 manufacturability analysis; and
 - reproducible release manifests tying every artifact to source and toolchain
   identities.
 

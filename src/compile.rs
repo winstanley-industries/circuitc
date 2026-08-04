@@ -2206,9 +2206,7 @@ mod tests {
 
         let mut design = voltage_divider();
         design.components[0].physical = None;
-        let diagnostics = compile(&design)
-            .expect_err("physical catalog parts require physical implementations")
-            .diagnostics;
+        let diagnostics = crate::kicad::validate(&design).diagnostics;
         for code in ["CC-KICAD-SYMBOL-005", "CC-KICAD-FOOTPRINT-004"] {
             assert!(
                 diagnostics.iter().any(|diagnostic| diagnostic.code == code),
@@ -2333,6 +2331,15 @@ mod tests {
         ]);
         design.components[0].path = "root.x".to_owned();
         design.components[1].path = "root.x.footprint.pad.1".to_owned();
+        for variant in &mut design.product.variants {
+            for component in &mut variant.components {
+                component.component_path = match component.component_path.as_str() {
+                    "divider.r_top" => "root.x".to_owned(),
+                    "divider.r_bottom" => "root.x.footprint.pad.1".to_owned(),
+                    path => path.to_owned(),
+                };
+            }
+        }
 
         let diagnostics = compile(&design)
             .expect_err("rendered KiCad semantic paths must be globally unique")

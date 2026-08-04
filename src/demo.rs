@@ -1,10 +1,14 @@
 //! Code-authored reference designs used for executable architecture tests.
 
 use crate::design::{
-    Board, Component, ComponentValue, Connection, ConnectionState, CopperLayer,
-    DESIGN_SCHEMA_VERSION, Design, ElectricalPinType, ModuleInstance, ModulePort, Net,
-    PartIdentity, PhysicalImplementation, PinPadBinding, Placement, PointNm, PortDirection, RectNm,
-    RouteSegment, SchematicPlacement, SimulationModel, SizeNm, SymbolBinding, SymbolPinBinding,
+    ApprovedSubstitution, Board, CatalogEvidenceRef, Component, ComponentValue, Connection,
+    ConnectionState, CopperLayer, DESIGN_SCHEMA_VERSION, Design, ElectricalPinType,
+    LifecycleStatus, ManufacturabilityAnalysis, ManufacturabilityAssertion,
+    ManufacturabilityCapability, ModuleInstance, ModulePort, Net, PartIdentity,
+    PhysicalImplementation, PinPadBinding, Placement, PointNm, PopulationState, PortDirection,
+    ProductConfiguration, ProductIntent, ProductVariant, RectNm, RouteSegment, SchematicPlacement,
+    SimulationModel, SizeNm, SourcingConstraints, SymbolBinding, SymbolPinBinding,
+    VariantComponent,
 };
 use crate::quantity::{Quantity, Unit};
 
@@ -65,9 +69,13 @@ pub fn voltage_divider() -> Design {
                 path: "divider.analysis.input".to_owned(),
                 reference: "V1".to_owned(),
                 part: PartIdentity {
-                    logical_device: "dc_voltage_source".to_owned(),
+                    logical_function: "dc_voltage_source".to_owned(),
                     manufacturer: None,
                     manufacturer_part_number: None,
+                    package: None,
+                    lifecycle: None,
+                    sourcing: None,
+                    approved_substitutions: Vec::new(),
                 },
                 symbol: two_pin_symbol("CircuitC:VDC", "p", "n"),
                 schematic_placement: SchematicPlacement {
@@ -110,6 +118,7 @@ pub fn voltage_divider() -> Design {
             }],
             routing_requests: Vec::new(),
         },
+        product: reference_product_intent(),
     };
     design.canonicalize();
     design
@@ -154,9 +163,17 @@ fn resistor(
         path: path.to_owned(),
         reference: reference.to_owned(),
         part: PartIdentity {
-            logical_device: "resistor".to_owned(),
+            logical_function: "resistor".to_owned(),
             manufacturer: Some("Yageo".to_owned()),
             manufacturer_part_number: Some("RC0603FR-0710KL".to_owned()),
+            package: Some("0603_1608Metric".to_owned()),
+            lifecycle: Some(LifecycleStatus::Active),
+            sourcing: Some(SourcingConstraints {
+                minimum_available_quantity: 1,
+                maximum_lead_time_days: 365,
+                required_region: "global".to_owned(),
+            }),
+            approved_substitutions: vec![approved_alternate()],
         },
         symbol: two_pin_symbol("CircuitC:R", "1", "2"),
         schematic_placement: SchematicPlacement {
@@ -198,5 +215,97 @@ fn resistor(
             positive_pin: "1".to_owned(),
             negative_pin: "2".to_owned(),
         }),
+    }
+}
+
+fn approved_alternate() -> ApprovedSubstitution {
+    ApprovedSubstitution {
+        manufacturer: "Panasonic".to_owned(),
+        manufacturer_part_number: "ERJ-3EKF1002V".to_owned(),
+        package: "0603_1608Metric".to_owned(),
+    }
+}
+
+fn reference_product_intent() -> ProductIntent {
+    let production = ProductVariant {
+        path: "production".to_owned(),
+        build_quantity: 10,
+        components: vec![
+            VariantComponent {
+                component_path: "divider.r_top".to_owned(),
+                state: PopulationState::Fitted,
+            },
+            VariantComponent {
+                component_path: "divider.r_bottom".to_owned(),
+                state: PopulationState::Fitted,
+            },
+        ],
+        configurations: vec![ProductConfiguration {
+            key: "assembly_revision".to_owned(),
+            value: "A".to_owned(),
+        }],
+    };
+    let prototype_alternate = ProductVariant {
+        path: "prototype_alternate".to_owned(),
+        build_quantity: 2,
+        components: vec![
+            VariantComponent {
+                component_path: "divider.r_top".to_owned(),
+                state: PopulationState::Alternate(approved_alternate()),
+            },
+            VariantComponent {
+                component_path: "divider.r_bottom".to_owned(),
+                state: PopulationState::NotFitted,
+            },
+        ],
+        configurations: vec![ProductConfiguration {
+            key: "assembly_revision".to_owned(),
+            value: "PROTO-ALT".to_owned(),
+        }],
+    };
+    ProductIntent {
+        catalog: Some(CatalogEvidenceRef {
+            snapshot_id: "layer1-contract-fixture".to_owned(),
+            sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned(),
+            evaluated_on: "2026-08-04".to_owned(),
+        }),
+        variants: vec![production, prototype_alternate],
+        manufacturability_analyses: vec![ManufacturabilityAnalysis {
+            path: "release.manufacturability".to_owned(),
+            adapter: "kicad".to_owned(),
+            version: "10".to_owned(),
+            assertions: vec![
+                manufacturability_assertion(
+                    "release.manufacturability.erc",
+                    ManufacturabilityCapability::ErcClean,
+                ),
+                manufacturability_assertion(
+                    "release.manufacturability.drc",
+                    ManufacturabilityCapability::DrcClean,
+                ),
+                manufacturability_assertion(
+                    "release.manufacturability.unconnected",
+                    ManufacturabilityCapability::UnconnectedClean,
+                ),
+                manufacturability_assertion(
+                    "release.manufacturability.parity",
+                    ManufacturabilityCapability::SchematicParityClean,
+                ),
+                manufacturability_assertion(
+                    "release.manufacturability.fabrication",
+                    ManufacturabilityCapability::FabricationInventoryComplete,
+                ),
+            ],
+        }],
+    }
+}
+
+fn manufacturability_assertion(
+    path: &str,
+    capability: ManufacturabilityCapability,
+) -> ManufacturabilityAssertion {
+    ManufacturabilityAssertion {
+        path: path.to_owned(),
+        capability,
     }
 }

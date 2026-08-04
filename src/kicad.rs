@@ -186,8 +186,8 @@ fn validate_catalog_bindings(design: &Design, diagnostics: &mut Vec<Diagnostic>)
                 path: path.to_owned(),
                 related_path: None,
                 message: format!(
-                    "part identity {} / {} / {} has no vendored KiCad binding",
-                    component.part.logical_device,
+                    "part identity {} / {} / {} / {} has no vendored KiCad binding",
+                    component.part.logical_function,
                     component
                         .part
                         .manufacturer
@@ -197,7 +197,8 @@ fn validate_catalog_bindings(design: &Design, diagnostics: &mut Vec<Diagnostic>)
                         .part
                         .manufacturer_part_number
                         .as_deref()
-                        .unwrap_or("<virtual>")
+                        .unwrap_or("<virtual>"),
+                    component.part.package.as_deref().unwrap_or("<virtual>")
                 ),
             });
             continue;
@@ -209,7 +210,7 @@ fn validate_catalog_bindings(design: &Design, diagnostics: &mut Vec<Diagnostic>)
                 related_path: None,
                 message: format!(
                     "logical device {} requires symbol {}",
-                    part.logical_device, part.symbol_library_id
+                    part.logical_function, part.symbol_library_id
                 ),
             });
         }
@@ -341,7 +342,7 @@ fn validate_catalog_bindings(design: &Design, diagnostics: &mut Vec<Diagnostic>)
                 related_path: None,
                 message: format!(
                     "logical device {} requires footprint {expected}",
-                    part.logical_device
+                    part.logical_function
                 ),
             }),
             (Some(_), None) => diagnostics.push(Diagnostic {
@@ -350,7 +351,7 @@ fn validate_catalog_bindings(design: &Design, diagnostics: &mut Vec<Diagnostic>)
                 related_path: None,
                 message: format!(
                     "logical device {} does not support a physical footprint",
-                    part.logical_device
+                    part.logical_function
                 ),
             }),
             (None, Some(expected)) => diagnostics.push(Diagnostic {
@@ -359,7 +360,7 @@ fn validate_catalog_bindings(design: &Design, diagnostics: &mut Vec<Diagnostic>)
                 related_path: None,
                 message: format!(
                     "logical device {} requires footprint {expected}",
-                    part.logical_device
+                    part.logical_function
                 ),
             }),
             (None, None) => {}
@@ -769,7 +770,7 @@ fn emit_schematic_symbol(
     emit_schematic_property(
         output,
         "Description",
-        &component.part.logical_device,
+        &component.part.logical_function,
         position,
         true,
     );
@@ -1096,7 +1097,7 @@ fn emit_footprint(output: &mut String, design: &Design, component: &Component) {
         design,
         component,
         "Description",
-        &component.part.logical_device,
+        &component.part.logical_function,
         PointNm::new(0, 0),
         fab_layer(physical.placement.layer),
         true,
@@ -1421,14 +1422,39 @@ fn fnv1a64(seed: u64, bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use crate::demo::voltage_divider;
     use crate::library::{
         LibraryFileDefinition, footprint_graphics, footprint_library_file, symbol,
         symbol_library_file,
     };
 
     use super::{
-        millimeters, stable_uuid, validate_catalog_footprint, validate_publishable_symbol,
+        millimeters, stable_uuid, validate_catalog_bindings, validate_catalog_footprint,
+        validate_publishable_symbol,
     };
+
+    #[test]
+    fn package_only_catalog_mismatch_reports_the_complete_part_identity() {
+        let mut design = voltage_divider();
+        let component = design
+            .components
+            .iter_mut()
+            .find(|component| component.path == "divider.r_top")
+            .expect("reference resistor must exist");
+        component.part.package = Some("0805_2012Metric".to_owned());
+
+        let mut diagnostics = Vec::new();
+        validate_catalog_bindings(&design, &mut diagnostics);
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "CC-KICAD-PART-001");
+        assert_eq!(diagnostics[0].path, "divider.r_top");
+        assert_eq!(diagnostics[0].related_path, None);
+        assert_eq!(
+            diagnostics[0].message,
+            "part identity resistor / Yageo / RC0603FR-0710KL / 0805_2012Metric has no vendored KiCad binding"
+        );
+    }
 
     #[test]
     fn converts_nanometers_without_floating_point() {

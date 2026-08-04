@@ -1,24 +1,28 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::design::{
-    Board, Component, ComponentValue, Connection, ConnectionState, CopperLayer,
-    DESIGN_SCHEMA_VERSION, Design, Diagnostic, ElectricalPinType, ModuleInstance, ModulePort, Net,
-    PartIdentity, PhysicalImplementation, PinPadBinding, Placement, PointNm, PortDirection, RectNm,
-    RouteSegment, RoutingRequest, SchematicPlacement, SimulationAnalysis, SimulationAnalysisKind,
-    SimulationAssertion, SimulationModel, SimulationSample, SizeNm, SymbolBinding,
-    SymbolPinBinding,
+    ApprovedSubstitution, Board, CatalogEvidenceRef, Component, ComponentValue, Connection,
+    ConnectionState, CopperLayer, DESIGN_SCHEMA_VERSION, Design, Diagnostic, ElectricalPinType,
+    LifecycleStatus, ManufacturabilityAnalysis, ManufacturabilityAssertion,
+    ManufacturabilityCapability, ModuleInstance, ModulePort, Net, PartIdentity,
+    PhysicalImplementation, PinPadBinding, Placement, PointNm, PopulationState, PortDirection,
+    ProductConfiguration, ProductIntent, ProductVariant, RectNm, RouteSegment, RoutingRequest,
+    SchematicPlacement, SimulationAnalysis, SimulationAnalysisKind, SimulationAssertion,
+    SimulationModel, SimulationSample, SizeNm, SourcingConstraints, SymbolBinding,
+    SymbolPinBinding, VariantComponent,
 };
 use crate::quantity::Unit;
 
 use super::diagnostic::{SourceDiagnostic, sort_diagnostics};
 use super::quantity::{lower_electrical, lower_length, lower_rotation};
 use super::syntax::{
-    AutorouteSyntax, BoardItemSyntax, BoardSyntax, ComponentItemSyntax, ComponentKindSyntax,
-    ComponentSyntax, ConnectionStateSyntax, DeclarationSyntax, FootprintItemSyntax,
-    FootprintSyntax, ModuleSyntax, NetSyntax, PartSyntax, PlacementSyntax, PointSyntax,
-    QuantitySyntax, RectangleSyntax, RouteSyntax, SchematicPlacementSyntax,
-    SimulationAnalysisKindSyntax, SimulationAnalysisSyntax, SimulationAssertionSyntax,
-    SimulationSampleSyntax, SourceFile, Span, SymbolSyntax, SyntaxTree,
+    AutorouteSyntax, BoardItemSyntax, BoardSyntax, CatalogSnapshotSyntax, ComponentItemSyntax,
+    ComponentKindSyntax, ComponentSyntax, ConnectionStateSyntax, DeclarationSyntax,
+    FootprintItemSyntax, FootprintSyntax, LifecycleSyntax, ManufacturabilitySyntax, ModuleSyntax,
+    NetSyntax, PartSyntax, PlacementSyntax, PointSyntax, QuantitySyntax, RectangleSyntax,
+    RouteSyntax, SchematicPlacementSyntax, SimulationAnalysisKindSyntax, SimulationAnalysisSyntax,
+    SimulationAssertionSyntax, SimulationSampleSyntax, SourceFile, SourcingSyntax, Span,
+    SubstituteSyntax, SymbolSyntax, SyntaxTree, VariantItemSyntax, VariantSyntax,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -186,6 +190,9 @@ pub(crate) fn elaborate(tree: &SyntaxTree) -> Result<ElaboratedDesign, Vec<Sourc
     let mut net_syntax = Vec::new();
     let mut module_syntax = Vec::new();
     let mut component_syntax = Vec::new();
+    let mut catalog_syntax = Vec::new();
+    let mut variant_syntax = Vec::new();
+    let mut manufacturability_syntax = Vec::new();
     let mut analysis_syntax = Vec::new();
     let mut assertion_syntax = Vec::new();
     let mut board_syntax = Vec::new();
@@ -194,6 +201,11 @@ pub(crate) fn elaborate(tree: &SyntaxTree) -> Result<ElaboratedDesign, Vec<Sourc
             DeclarationSyntax::Net(net) => net_syntax.push(net),
             DeclarationSyntax::Module(module) => module_syntax.push(module),
             DeclarationSyntax::Component(component) => component_syntax.push(component),
+            DeclarationSyntax::CatalogSnapshot(snapshot) => catalog_syntax.push(snapshot),
+            DeclarationSyntax::Variant(variant) => variant_syntax.push(variant),
+            DeclarationSyntax::Manufacturability(analysis) => {
+                manufacturability_syntax.push(analysis)
+            }
             DeclarationSyntax::SimulationAnalysis(analysis) => analysis_syntax.push(analysis),
             DeclarationSyntax::SimulationAssertion(assertion) => assertion_syntax.push(assertion),
             DeclarationSyntax::Board(board) => board_syntax.push(board),
@@ -212,6 +224,21 @@ pub(crate) fn elaborate(tree: &SyntaxTree) -> Result<ElaboratedDesign, Vec<Sourc
     let analyses = elaborate_analyses(source, &analysis_syntax, &mut provenance, &mut diagnostics);
     let assertions =
         elaborate_assertions(source, &assertion_syntax, &mut provenance, &mut diagnostics);
+    provenance.insert_structural("design.product", tree.design.span);
+    provenance.insert_structural("design.product.catalog", tree.design.span);
+    provenance.insert_structural("design.product.variants", tree.design.span);
+    provenance.insert_structural(
+        "design.product.manufacturability_analyses",
+        tree.design.span,
+    );
+    let product = elaborate_product_intent(
+        source,
+        &catalog_syntax,
+        &variant_syntax,
+        &manufacturability_syntax,
+        &mut provenance,
+        &mut diagnostics,
+    );
     let board = select_board(source, &board_syntax, &mut diagnostics);
     let board_parts = board.map(|board| {
         elaborate_board(
@@ -307,6 +334,7 @@ pub(crate) fn elaborate(tree: &SyntaxTree) -> Result<ElaboratedDesign, Vec<Sourc
             routes: board_parts.routes,
             routing_requests: board_parts.routing_requests,
         },
+        product,
     };
     design.canonicalize();
     register_indexed_provenance(&design, &mut provenance);
@@ -403,7 +431,8 @@ pub(crate) fn map_ir_diagnostics(
                     || diagnostic.code.starts_with("CC-BOARD-")
                     || diagnostic.code.starts_with("CC-ROUTE-")
                     || diagnostic.code.starts_with("CC-AUTOROUTE-")
-                    || diagnostic.code.starts_with("CC-SIM-");
+                    || diagnostic.code.starts_with("CC-SIM-")
+                    || diagnostic.code.starts_with("CC-PRODUCT-");
                 let semantic_span = if diagnostic.code.starts_with("CC-KICAD-") {
                     provenance
                         .kicad_span(path)
@@ -451,6 +480,343 @@ pub(crate) fn map_ir_diagnostics(
         .collect();
     sort_diagnostics(&mut mapped);
     mapped
+}
+
+fn elaborate_product_intent(
+    source: &SourceFile,
+    catalogs: &[&CatalogSnapshotSyntax],
+    variants: &[&VariantSyntax],
+    analyses: &[&ManufacturabilitySyntax],
+    provenance: &mut ProvenanceMap,
+    diagnostics: &mut Vec<SourceDiagnostic>,
+) -> ProductIntent {
+    let catalog = catalogs.first().map(|syntax| {
+        provenance.insert_structural("design.product.catalog", syntax.span);
+        provenance.insert_structural("design.product.catalog.snapshot_id", syntax.id.span);
+        provenance.insert_structural("design.product.catalog.sha256", syntax.sha256.span);
+        provenance.insert_structural(
+            "design.product.catalog.evaluated_on",
+            syntax.evaluated_on.span,
+        );
+        CatalogEvidenceRef {
+            snapshot_id: syntax.id.value.clone(),
+            sha256: syntax.sha256.value.clone(),
+            evaluated_on: syntax.evaluated_on.value.clone(),
+        }
+    });
+    if let Some(first) = catalogs.first() {
+        for duplicate in &catalogs[1..] {
+            diagnostics.push(
+                SourceDiagnostic::new(
+                    "CC-LANG-CATALOG-001",
+                    source,
+                    duplicate.span,
+                    Some("design.product.catalog".to_owned()),
+                    "catalog snapshot is declared more than once",
+                )
+                .with_related(source, first.span, "first declaration is here"),
+            );
+        }
+    }
+
+    let variants = elaborate_variants(source, variants, provenance, diagnostics);
+    let manufacturability_analyses =
+        elaborate_manufacturability(source, analyses, provenance, diagnostics);
+    ProductIntent {
+        catalog,
+        variants,
+        manufacturability_analyses,
+    }
+}
+
+fn elaborate_variants(
+    source: &SourceFile,
+    variants: &[&VariantSyntax],
+    provenance: &mut ProvenanceMap,
+    diagnostics: &mut Vec<SourceDiagnostic>,
+) -> Vec<ProductVariant> {
+    let mut first_paths = BTreeMap::new();
+    variants
+        .iter()
+        .filter_map(|syntax| {
+            let path = syntax.path.value.as_str();
+            if let Some(first) = first_paths.get(path).copied() {
+                diagnostics.push(
+                    SourceDiagnostic::new(
+                        "CC-LANG-VARIANT-001",
+                        source,
+                        syntax.path.span,
+                        Some(path.to_owned()),
+                        format!("duplicate product variant path `{path}`"),
+                    )
+                    .with_related(source, first, "first declaration is here"),
+                );
+                return None;
+            }
+            first_paths.insert(path, syntax.path.span);
+            provenance.insert_structural("design.product.variants", syntax.span);
+            provenance.insert_structural(path, syntax.span);
+            provenance.insert_structural(format!("{path}.path"), syntax.path.span);
+            provenance
+                .insert_structural(format!("{path}.build_quantity"), syntax.build_quantity.span);
+
+            let build_quantity = parse_unsigned::<u64>(
+                source,
+                &syntax.build_quantity,
+                "CC-LANG-VARIANT-002",
+                path,
+                "product variant build quantity must be an exact unsigned 64-bit integer",
+                diagnostics,
+            )?;
+
+            let mut components = Vec::new();
+            let mut configurations = Vec::new();
+            let mut component_spans = BTreeMap::new();
+            let mut configuration_spans = BTreeMap::new();
+            for item in &syntax.items {
+                match item {
+                    VariantItemSyntax::Fit {
+                        component_path,
+                        span,
+                    }
+                    | VariantItemSyntax::NotFitted {
+                        component_path,
+                        span,
+                    } => {
+                        if duplicate_variant_component(
+                            source,
+                            path,
+                            component_path,
+                            &mut component_spans,
+                            diagnostics,
+                        ) {
+                            continue;
+                        }
+                        provenance.insert_structural(
+                            format!("{path}.components.{}", component_path.value),
+                            *span,
+                        );
+                        components.push(VariantComponent {
+                            component_path: component_path.value.clone(),
+                            state: if matches!(item, VariantItemSyntax::Fit { .. }) {
+                                PopulationState::Fitted
+                            } else {
+                                PopulationState::NotFitted
+                            },
+                        });
+                    }
+                    VariantItemSyntax::Alternate {
+                        component_path,
+                        manufacturer,
+                        manufacturer_part_number,
+                        package,
+                        span,
+                    } => {
+                        if duplicate_variant_component(
+                            source,
+                            path,
+                            component_path,
+                            &mut component_spans,
+                            diagnostics,
+                        ) {
+                            continue;
+                        }
+                        provenance.insert_structural(
+                            format!("{path}.components.{}", component_path.value),
+                            *span,
+                        );
+                        components.push(VariantComponent {
+                            component_path: component_path.value.clone(),
+                            state: PopulationState::Alternate(ApprovedSubstitution {
+                                manufacturer: manufacturer.value.clone(),
+                                manufacturer_part_number: manufacturer_part_number.value.clone(),
+                                package: package.value.clone(),
+                            }),
+                        });
+                    }
+                    VariantItemSyntax::Configure { key, value, span } => {
+                        if let Some(first) = configuration_spans.get(key.value.as_str()).copied() {
+                            diagnostics.push(
+                                SourceDiagnostic::new(
+                                    "CC-LANG-VARIANT-004",
+                                    source,
+                                    key.span,
+                                    Some(path.to_owned()),
+                                    format!("duplicate product configuration key `{}`", key.value),
+                                )
+                                .with_related(
+                                    source,
+                                    first,
+                                    "first configuration is here",
+                                ),
+                            );
+                            continue;
+                        }
+                        configuration_spans.insert(key.value.as_str(), key.span);
+                        provenance.insert_structural(
+                            format!("{path}.configurations.{}", key.value),
+                            *span,
+                        );
+                        configurations.push(ProductConfiguration {
+                            key: key.value.clone(),
+                            value: value.value.clone(),
+                        });
+                    }
+                }
+            }
+
+            Some(ProductVariant {
+                path: path.to_owned(),
+                build_quantity,
+                components,
+                configurations,
+            })
+        })
+        .collect()
+}
+
+fn duplicate_variant_component<'a>(
+    source: &SourceFile,
+    variant_path: &str,
+    component_path: &'a super::syntax::Spanned<String>,
+    first_spans: &mut BTreeMap<&'a str, Span>,
+    diagnostics: &mut Vec<SourceDiagnostic>,
+) -> bool {
+    if let Some(first) = first_spans.get(component_path.value.as_str()).copied() {
+        diagnostics.push(
+            SourceDiagnostic::new(
+                "CC-LANG-VARIANT-003",
+                source,
+                component_path.span,
+                Some(variant_path.to_owned()),
+                format!(
+                    "component `{}` is assigned more than once in product variant `{variant_path}`",
+                    component_path.value
+                ),
+            )
+            .with_related(source, first, "first assignment is here"),
+        );
+        true
+    } else {
+        first_spans.insert(component_path.value.as_str(), component_path.span);
+        false
+    }
+}
+
+fn elaborate_manufacturability(
+    source: &SourceFile,
+    analyses: &[&ManufacturabilitySyntax],
+    provenance: &mut ProvenanceMap,
+    diagnostics: &mut Vec<SourceDiagnostic>,
+) -> Vec<ManufacturabilityAnalysis> {
+    let mut first_analyses = BTreeMap::new();
+    let mut first_assertions = BTreeMap::new();
+    analyses
+        .iter()
+        .filter_map(|syntax| {
+            let path = syntax.path.value.as_str();
+            if let Some(first) = first_analyses.get(path).copied() {
+                diagnostics.push(
+                    SourceDiagnostic::new(
+                        "CC-LANG-MANUFACTURABILITY-001",
+                        source,
+                        syntax.path.span,
+                        Some(path.to_owned()),
+                        format!("duplicate manufacturability analysis path `{path}`"),
+                    )
+                    .with_related(source, first, "first declaration is here"),
+                );
+                return None;
+            }
+            first_analyses.insert(path, syntax.path.span);
+            provenance.insert_structural("design.product.manufacturability_analyses", syntax.span);
+            provenance.insert_structural(path, syntax.span);
+            provenance.insert_structural(format!("{path}.path"), syntax.path.span);
+            provenance.insert_structural(format!("{path}.adapter"), syntax.adapter.span);
+            provenance.insert_structural(format!("{path}.version"), syntax.version.span);
+
+            let mut assertions = Vec::new();
+            for assertion in &syntax.assertions {
+                let assertion_path = assertion.path.value.as_str();
+                if let Some(first) = first_assertions.get(assertion_path).copied() {
+                    diagnostics.push(
+                        SourceDiagnostic::new(
+                            "CC-LANG-MANUFACTURABILITY-002",
+                            source,
+                            assertion.path.span,
+                            Some(path.to_owned()),
+                            format!(
+                                "duplicate manufacturability assertion path `{assertion_path}`"
+                            ),
+                        )
+                        .with_related(
+                            source,
+                            first,
+                            "first declaration is here",
+                        ),
+                    );
+                    continue;
+                }
+                first_assertions.insert(assertion_path, assertion.path.span);
+                provenance.insert_structural(assertion_path, assertion.span);
+                let capability = match assertion.capability.value.as_str() {
+                    "erc_clean" => ManufacturabilityCapability::ErcClean,
+                    "drc_clean" => ManufacturabilityCapability::DrcClean,
+                    "unconnected_clean" => ManufacturabilityCapability::UnconnectedClean,
+                    "schematic_parity_clean" => ManufacturabilityCapability::SchematicParityClean,
+                    "fabrication_inventory_complete" => {
+                        ManufacturabilityCapability::FabricationInventoryComplete
+                    }
+                    unsupported => {
+                        diagnostics.push(SourceDiagnostic::new(
+                            "CC-LANG-MANUFACTURABILITY-003",
+                            source,
+                            assertion.capability.span,
+                            Some(path.to_owned()),
+                            format!("unsupported manufacturability capability `{unsupported}`"),
+                        ));
+                        continue;
+                    }
+                };
+                assertions.push(ManufacturabilityAssertion {
+                    path: assertion_path.to_owned(),
+                    capability,
+                });
+            }
+            Some(ManufacturabilityAnalysis {
+                path: path.to_owned(),
+                adapter: syntax.adapter.value.clone(),
+                version: syntax.version.value.clone(),
+                assertions,
+            })
+        })
+        .collect()
+}
+
+fn parse_unsigned<T>(
+    source: &SourceFile,
+    syntax: &super::syntax::Spanned<String>,
+    code: &'static str,
+    semantic_path: &str,
+    message: &str,
+    diagnostics: &mut Vec<SourceDiagnostic>,
+) -> Option<T>
+where
+    T: std::str::FromStr,
+{
+    match syntax.value.parse() {
+        Ok(value) => Some(value),
+        Err(_) => {
+            diagnostics.push(SourceDiagnostic::new(
+                code,
+                source,
+                syntax.span,
+                Some(semantic_path.to_owned()),
+                message,
+            ));
+            None
+        }
+    }
 }
 
 fn elaborate_analyses(
@@ -1330,6 +1696,9 @@ fn elaborate_component(
     };
 
     let mut parts = Vec::new();
+    let mut lifecycles = Vec::new();
+    let mut sourcing_constraints = Vec::new();
+    let mut substitutions = Vec::new();
     let mut symbols = Vec::new();
     let mut models: Vec<(&super::syntax::Spanned<String>, Span)> = Vec::new();
     let mut schematic_placements = Vec::new();
@@ -1349,6 +1718,9 @@ fn elaborate_component(
     for item in &syntax.items {
         match item {
             ComponentItemSyntax::Part(part) => parts.push(part),
+            ComponentItemSyntax::Lifecycle(lifecycle) => lifecycles.push(lifecycle),
+            ComponentItemSyntax::Sourcing(sourcing) => sourcing_constraints.push(sourcing),
+            ComponentItemSyntax::Substitute(substitute) => substitutions.push(substitute),
             ComponentItemSyntax::Symbol(symbol) => symbols.push(symbol),
             ComponentItemSyntax::Model { library_id, span } => models.push((library_id, *span)),
             ComponentItemSyntax::SchematicPlacement(placement) => {
@@ -1382,6 +1754,59 @@ fn elaborate_component(
         diagnostics,
     )
     .copied();
+    let physical_part = part.is_some_and(|part| part.manufacturer.is_some());
+    let lifecycle = select_single(
+        source,
+        &lifecycles,
+        syntax.path.span,
+        path,
+        "CC-LANG-LIFECYCLE-001",
+        "CC-LANG-LIFECYCLE-002",
+        if physical_part {
+            "physical component requires one `lifecycle` declaration"
+        } else {
+            ""
+        },
+        "component lifecycle is declared more than once",
+        diagnostics,
+    )
+    .copied();
+    let sourcing = select_single(
+        source,
+        &sourcing_constraints,
+        syntax.path.span,
+        path,
+        "CC-LANG-SOURCING-001",
+        "CC-LANG-SOURCING-002",
+        if physical_part {
+            "physical component requires one `sourcing` declaration"
+        } else {
+            ""
+        },
+        "component sourcing constraints are declared more than once",
+        diagnostics,
+    )
+    .copied();
+    if !physical_part {
+        for lifecycle in &lifecycles {
+            diagnostics.push(SourceDiagnostic::new(
+                "CC-LANG-LIFECYCLE-003",
+                source,
+                lifecycle.span,
+                Some(path.to_owned()),
+                "virtual component must not declare lifecycle intent",
+            ));
+        }
+        for sourcing in &sourcing_constraints {
+            diagnostics.push(SourceDiagnostic::new(
+                "CC-LANG-SOURCING-003",
+                source,
+                sourcing.span,
+                Some(path.to_owned()),
+                "virtual component must not declare sourcing constraints",
+            ));
+        }
+    }
     let symbol = select_single(
         source,
         &symbols,
@@ -1418,7 +1843,18 @@ fn elaborate_component(
     )
     .copied();
 
-    let lowered_part = part.map(lower_part);
+    let lowered_part = part.and_then(|part| {
+        lower_part(
+            source,
+            part,
+            lifecycle,
+            sourcing,
+            &substitutions,
+            path,
+            provenance,
+            diagnostics,
+        )
+    });
     let lowered_symbol =
         symbol.and_then(|symbol| lower_symbol_binding(source, symbol, path, diagnostics));
     let lowered_schematic_placement = schematic_placement
@@ -1696,9 +2132,117 @@ fn elaborate_component(
     })
 }
 
-fn lower_part(syntax: &PartSyntax) -> PartIdentity {
-    PartIdentity {
-        logical_device: syntax.logical_device.value.clone(),
+#[allow(clippy::too_many_arguments)]
+fn lower_part(
+    source: &SourceFile,
+    syntax: &PartSyntax,
+    lifecycle: Option<&LifecycleSyntax>,
+    sourcing: Option<&SourcingSyntax>,
+    substitutions: &[&SubstituteSyntax],
+    component_path: &str,
+    provenance: &mut ProvenanceMap,
+    diagnostics: &mut Vec<SourceDiagnostic>,
+) -> Option<PartIdentity> {
+    provenance.insert_structural(format!("{component_path}.part"), syntax.span);
+    provenance.insert_structural(
+        format!("{component_path}.part.logical_function"),
+        syntax.logical_function.span,
+    );
+    if let Some(manufacturer) = &syntax.manufacturer {
+        provenance.insert_structural(
+            format!("{component_path}.part.manufacturer"),
+            manufacturer.span,
+        );
+    }
+    if let Some(number) = &syntax.manufacturer_part_number {
+        provenance.insert_structural(
+            format!("{component_path}.part.manufacturer_part_number"),
+            number.span,
+        );
+    }
+    if let Some(package) = &syntax.package {
+        provenance.insert_structural(format!("{component_path}.part.package"), package.span);
+    }
+
+    let lifecycle = match lifecycle {
+        Some(lifecycle) => {
+            provenance
+                .insert_structural(format!("{component_path}.part.lifecycle"), lifecycle.span);
+            match lifecycle.status.value.as_str() {
+                "active" => Some(LifecycleStatus::Active),
+                "not_recommended_for_new_designs" => {
+                    Some(LifecycleStatus::NotRecommendedForNewDesigns)
+                }
+                "obsolete" => Some(LifecycleStatus::Obsolete),
+                unsupported => {
+                    diagnostics.push(SourceDiagnostic::new(
+                        "CC-LANG-LIFECYCLE-004",
+                        source,
+                        lifecycle.status.span,
+                        Some(component_path.to_owned()),
+                        format!("unsupported component lifecycle status `{unsupported}`"),
+                    ));
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+
+    let sourcing = match sourcing {
+        Some(sourcing) => {
+            provenance.insert_structural(format!("{component_path}.part.sourcing"), sourcing.span);
+            let minimum_available_quantity = parse_unsigned::<u64>(
+                source,
+                &sourcing.minimum_available,
+                "CC-LANG-SOURCING-004",
+                component_path,
+                "sourcing minimum available quantity must be an exact unsigned 64-bit integer",
+                diagnostics,
+            );
+            let maximum_lead_time_days = parse_unsigned::<u32>(
+                source,
+                &sourcing.maximum_lead_time_days,
+                "CC-LANG-SOURCING-005",
+                component_path,
+                "sourcing maximum lead time days must be an exact unsigned 32-bit integer",
+                diagnostics,
+            );
+            match (minimum_available_quantity, maximum_lead_time_days) {
+                (Some(minimum_available_quantity), Some(maximum_lead_time_days)) => {
+                    Some(SourcingConstraints {
+                        minimum_available_quantity,
+                        maximum_lead_time_days,
+                        required_region: sourcing.region.value.clone(),
+                    })
+                }
+                _ => None,
+            }
+        }
+        None => None,
+    };
+
+    let approved_substitutions = substitutions
+        .iter()
+        .map(|substitution| {
+            provenance.insert_structural(
+                format!("{component_path}.part.approved_substitutions"),
+                substitution.span,
+            );
+            ApprovedSubstitution {
+                manufacturer: substitution.manufacturer.value.clone(),
+                manufacturer_part_number: substitution.manufacturer_part_number.value.clone(),
+                package: substitution.package.value.clone(),
+            }
+        })
+        .collect();
+
+    let physical = syntax.manufacturer.is_some();
+    if physical && (lifecycle.is_none() || sourcing.is_none()) {
+        return None;
+    }
+    Some(PartIdentity {
+        logical_function: syntax.logical_function.value.clone(),
         manufacturer: syntax
             .manufacturer
             .as_ref()
@@ -1707,7 +2251,11 @@ fn lower_part(syntax: &PartSyntax) -> PartIdentity {
             .manufacturer_part_number
             .as_ref()
             .map(|number| number.value.clone()),
-    }
+        package: syntax.package.as_ref().map(|package| package.value.clone()),
+        lifecycle,
+        sourcing,
+        approved_substitutions,
+    })
 }
 
 fn lower_symbol_binding(
@@ -2296,6 +2844,18 @@ impl HasSpan for &PartSyntax {
     }
 }
 
+impl HasSpan for &LifecycleSyntax {
+    fn span(&self) -> Span {
+        self.span
+    }
+}
+
+impl HasSpan for &SourcingSyntax {
+    fn span(&self) -> Span {
+        self.span
+    }
+}
+
 impl HasSpan for &SymbolSyntax {
     fn span(&self) -> Span {
         self.span
@@ -2629,6 +3189,322 @@ mod tests {
     }
 
     #[test]
+    fn product_and_manufacturing_intent_lower_to_typed_design_ir() {
+        let elaborated = elaborate_source(REFERENCE).expect("reference source must elaborate");
+        let product = &elaborated.design.product;
+        let catalog = product
+            .catalog
+            .as_ref()
+            .expect("physical reference design carries pinned catalog evidence");
+        assert_eq!(catalog.snapshot_id, "layer1-contract-fixture");
+        assert_eq!(catalog.evaluated_on, "2026-08-04");
+        assert_eq!(product.variants.len(), 2);
+        let alternate = product
+            .variants
+            .iter()
+            .find(|variant| variant.path == "prototype_alternate")
+            .expect("alternate-population variant must exist");
+        assert_eq!(alternate.build_quantity, 2);
+        assert!(alternate.components.iter().any(|component| {
+            component.component_path == "divider.r_top"
+                && matches!(
+                    &component.state,
+                    crate::design::PopulationState::Alternate(substitution)
+                        if substitution.manufacturer == "Panasonic"
+                            && substitution.manufacturer_part_number == "ERJ-3EKF1002V"
+                            && substitution.package == "0603_1608Metric"
+                )
+        }));
+        assert_eq!(product.manufacturability_analyses.len(), 1);
+        assert!(
+            product.manufacturability_analyses[0]
+                .assertions
+                .iter()
+                .any(|assertion| {
+                    assertion.capability
+                        == crate::design::ManufacturabilityCapability::FabricationInventoryComplete
+                })
+        );
+
+        let resistor = elaborated
+            .design
+            .components
+            .iter()
+            .find(|component| component.path == "divider.r_top")
+            .expect("physical resistor must exist");
+        assert_eq!(resistor.part.logical_function, "resistor");
+        assert_eq!(resistor.part.package.as_deref(), Some("0603_1608Metric"));
+        assert_eq!(
+            resistor.part.lifecycle,
+            Some(crate::design::LifecycleStatus::Active)
+        );
+        assert_eq!(
+            resistor
+                .part
+                .sourcing
+                .as_ref()
+                .map(|sourcing| sourcing.minimum_available_quantity),
+            Some(1)
+        );
+        assert_eq!(resistor.part.approved_substitutions.len(), 1);
+
+        let virtual_component = elaborated
+            .design
+            .components
+            .iter()
+            .find(|component| component.path == "divider.analysis.input")
+            .expect("virtual analysis source must exist");
+        assert!(virtual_component.part.manufacturer.is_none());
+        assert!(virtual_component.part.package.is_none());
+        assert!(virtual_component.part.lifecycle.is_none());
+        assert!(virtual_component.part.sourcing.is_none());
+    }
+
+    #[test]
+    fn physical_product_declarations_are_exactly_once_and_virtual_parts_reject_them() {
+        let missing_lifecycle = REFERENCE.replacen("    lifecycle active;\n", "", 1);
+        let component_path = missing_lifecycle
+            .find("divider.r_top R1")
+            .expect("component path exists");
+        assert_source_diagnostic(
+            &missing_lifecycle,
+            "CC-LANG-LIFECYCLE-001",
+            "physical component requires one `lifecycle` declaration",
+            component_path,
+            "divider.r_top",
+            0,
+        );
+
+        let duplicate_lifecycle = REFERENCE.replacen(
+            "    lifecycle active;\n",
+            "    lifecycle active;\n    lifecycle obsolete;\n",
+            1,
+        );
+        let duplicate_start = duplicate_lifecycle
+            .find("lifecycle obsolete;")
+            .expect("duplicate lifecycle exists");
+        assert_source_diagnostic(
+            &duplicate_lifecycle,
+            "CC-LANG-LIFECYCLE-002",
+            "component lifecycle is declared more than once",
+            duplicate_start,
+            "lifecycle obsolete;",
+            1,
+        );
+
+        let duplicate_sourcing = REFERENCE.replacen(
+            "    sourcing minimum_available 1 maximum_lead_time_days 365 region \"global\";\n",
+            "    sourcing minimum_available 1 maximum_lead_time_days 365 region \"global\";\n    sourcing minimum_available 2 maximum_lead_time_days 30 region \"US\";\n",
+            1,
+        );
+        let duplicate_start = duplicate_sourcing
+            .find("sourcing minimum_available 2")
+            .expect("duplicate sourcing exists");
+        let duplicate_text =
+            "sourcing minimum_available 2 maximum_lead_time_days 30 region \"US\";";
+        assert_source_diagnostic(
+            &duplicate_sourcing,
+            "CC-LANG-SOURCING-002",
+            "component sourcing constraints are declared more than once",
+            duplicate_start,
+            duplicate_text,
+            1,
+        );
+
+        let virtual_lifecycle = REFERENCE.replacen(
+            "    part \"dc_voltage_source\" virtual;\n",
+            "    part \"dc_voltage_source\" virtual;\n    lifecycle active;\n",
+            1,
+        );
+        let virtual_component_start = virtual_lifecycle
+            .find("dc_source")
+            .expect("virtual component exists");
+        let forbidden_start = virtual_component_start
+            + virtual_lifecycle[virtual_component_start..]
+                .find("lifecycle active;")
+                .expect("virtual lifecycle exists");
+        assert_source_diagnostic(
+            &virtual_lifecycle,
+            "CC-LANG-LIFECYCLE-003",
+            "virtual component must not declare lifecycle intent",
+            forbidden_start,
+            "lifecycle active;",
+            0,
+        );
+    }
+
+    #[test]
+    fn product_literal_failures_have_stable_field_spans() {
+        let invalid_quantity = REFERENCE.replacen("build_quantity 10", "build_quantity 1.5", 1);
+        let start = invalid_quantity
+            .find("1.5")
+            .expect("invalid build quantity exists");
+        assert_source_diagnostic(
+            &invalid_quantity,
+            "CC-LANG-VARIANT-002",
+            "product variant build quantity must be an exact unsigned 64-bit integer",
+            start,
+            "1.5",
+            0,
+        );
+
+        let invalid_lead_time = REFERENCE.replacen(
+            "maximum_lead_time_days 365",
+            "maximum_lead_time_days 4294967296",
+            1,
+        );
+        let start = invalid_lead_time
+            .find("4294967296")
+            .expect("out-of-range lead time exists");
+        assert_source_diagnostic(
+            &invalid_lead_time,
+            "CC-LANG-SOURCING-005",
+            "sourcing maximum lead time days must be an exact unsigned 32-bit integer",
+            start,
+            "4294967296",
+            0,
+        );
+
+        let unsupported = REFERENCE.replacen("capability erc_clean", "capability dfm_clean", 1);
+        let start = unsupported
+            .find("dfm_clean")
+            .expect("unsupported capability exists");
+        assert_source_diagnostic(
+            &unsupported,
+            "CC-LANG-MANUFACTURABILITY-003",
+            "unsupported manufacturability capability `dfm_clean`",
+            start,
+            "dfm_clean",
+            0,
+        );
+    }
+
+    #[test]
+    fn design_product_validation_maps_back_to_authored_declarations() {
+        let invalid_digest = REFERENCE.replacen(
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "ABC",
+            1,
+        );
+        let diagnostics = crate::frontend::compile_source("catalog.circuitc", &invalid_digest)
+            .expect_err("invalid catalog digest must fail Design validation");
+        let digest = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "CC-PRODUCT-CATALOG-003")
+            .unwrap_or_else(|| panic!("missing catalog digest diagnostic: {diagnostics:#?}"));
+        assert_eq!(&invalid_digest[digest.start..digest.end], "\"ABC\"");
+
+        let invalid_adapter = REFERENCE.replacen(
+            "adapter \"kicad\" version \"10\"",
+            "adapter \"other\" version \"1\"",
+            1,
+        );
+        let diagnostics = crate::frontend::compile_source("adapter.circuitc", &invalid_adapter)
+            .expect_err("unsupported adapter must fail Design validation");
+        let adapter = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "CC-PRODUCT-ANALYSIS-003")
+            .unwrap_or_else(|| panic!("missing adapter diagnostic: {diagnostics:#?}"));
+        assert!(invalid_adapter[adapter.start..adapter.end].starts_with("manufacturability "));
+    }
+
+    #[test]
+    fn source_rejects_self_and_package_incompatible_alternates() {
+        const SUBSTITUTE: &str = "substitute manufacturer \"Panasonic\" number \"ERJ-3EKF1002V\" package \"0603_1608Metric\";";
+        const ALTERNATE: &str = "alternate divider.r_top manufacturer \"Panasonic\" number \"ERJ-3EKF1002V\" package \"0603_1608Metric\";";
+
+        let self_substitution = REFERENCE
+            .replacen(
+                SUBSTITUTE,
+                "substitute manufacturer \"Yageo\" number \"RC0603FR-0710KL\" package \"0603_1608Metric\";",
+                1,
+            )
+            .replacen(
+                ALTERNATE,
+                "alternate divider.r_top manufacturer \"Yageo\" number \"RC0603FR-0710KL\" package \"0603_1608Metric\";",
+                1,
+            );
+        let diagnostics =
+            crate::frontend::compile_source("self-substitution.circuitc", &self_substitution)
+                .expect_err("a primary part must not be represented as an alternate");
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "CC-PRODUCT-PART-011")
+            .unwrap_or_else(|| panic!("missing self-substitution diagnostic: {diagnostics:#?}"));
+        assert_eq!(diagnostic.semantic_path.as_deref(), Some("divider.r_top"));
+
+        let wrong_package = REFERENCE
+            .replacen(
+                SUBSTITUTE,
+                "substitute manufacturer \"Panasonic\" number \"ERJ-3EKF1002V\" package \"0805_2012Metric\";",
+                1,
+            )
+            .replacen(
+                ALTERNATE,
+                "alternate divider.r_top manufacturer \"Panasonic\" number \"ERJ-3EKF1002V\" package \"0805_2012Metric\";",
+                1,
+            );
+        let diagnostics = crate::frontend::compile_source("wrong-package.circuitc", &wrong_package)
+            .expect_err("an alternate package must match the component's fixed package");
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "CC-PRODUCT-PART-010")
+            .unwrap_or_else(|| {
+                panic!("missing package-compatibility diagnostic: {diagnostics:#?}")
+            });
+        assert_eq!(diagnostic.semantic_path.as_deref(), Some("divider.r_top"));
+    }
+
+    #[test]
+    fn source_product_configuration_resource_limits_fail_closed() {
+        let configurations = (0..257)
+            .map(|index| format!("    configure option_{index} \"enabled\";"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let oversized_collection =
+            REFERENCE.replacen("    configure assembly_revision \"A\";", &configurations, 1);
+        let diagnostics =
+            crate::frontend::compile_source("configuration-count.circuitc", &oversized_collection)
+                .expect_err("a variant configuration collection above its limit must fail");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CC-PRODUCT-CONFIG-004"),
+            "missing configuration-count diagnostic: {diagnostics:#?}"
+        );
+
+        let oversized_key = "k".repeat(129);
+        let source = REFERENCE.replacen(
+            "configure assembly_revision \"A\";",
+            &format!("configure {oversized_key} \"A\";"),
+            1,
+        );
+        let diagnostics = crate::frontend::compile_source("configuration-key.circuitc", &source)
+            .expect_err("an oversized configuration key must fail");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CC-PRODUCT-CONFIG-005"),
+            "missing configuration-key diagnostic: {diagnostics:#?}"
+        );
+
+        let oversized_value = "v".repeat(4097);
+        let source = REFERENCE.replacen(
+            "configure assembly_revision \"A\";",
+            &format!("configure assembly_revision \"{oversized_value}\";"),
+            1,
+        );
+        let diagnostics = crate::frontend::compile_source("configuration-value.circuitc", &source)
+            .expect_err("an oversized configuration value must fail");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CC-PRODUCT-CONFIG-006"),
+            "missing configuration-value diagnostic: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
     fn module_ports_accept_inout_with_an_explicit_no_connect_state() {
         let source = REFERENCE.replacen(
             "port input GND passive connect GND;",
@@ -2688,7 +3564,9 @@ mod tests {
   module board_only {}
 
   resistor board_only.unused R1 {
-    part "resistor" manufacturer "Yageo" number "RC0603FR-0710KL";
+    part "resistor" manufacturer "Yageo" number "RC0603FR-0710KL" package "0603_1608Metric";
+    lifecycle active;
+    sourcing minimum_available 1 maximum_lead_time_days 365 region "global";
     symbol "CircuitC:R" {
       bind 1 1 passive;
       bind 2 2 passive;
@@ -2701,6 +3579,11 @@ mod tests {
       bind 1 1;
       bind 2 2;
     }
+  }
+
+  catalog_snapshot "physical-only" sha256 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" evaluated_on "2026-08-04";
+  variant production build_quantity 1 {
+    fit board_only.unused;
   }
 
   board {
@@ -2777,6 +3660,9 @@ mod tests {
                     module.ports.reverse()
                 }
                 crate::frontend::syntax::DeclarationSyntax::Net(_)
+                | crate::frontend::syntax::DeclarationSyntax::CatalogSnapshot(_)
+                | crate::frontend::syntax::DeclarationSyntax::Variant(_)
+                | crate::frontend::syntax::DeclarationSyntax::Manufacturability(_)
                 | crate::frontend::syntax::DeclarationSyntax::SimulationAnalysis(_)
                 | crate::frontend::syntax::DeclarationSyntax::SimulationAssertion(_) => {}
             }
@@ -3013,7 +3899,7 @@ mod tests {
             0,
         );
 
-        const PART: &str = "part \"resistor\" manufacturer \"Yageo\" number \"RC0603FR-0710KL\";";
+        const PART: &str = "part \"resistor\" manufacturer \"Yageo\" number \"RC0603FR-0710KL\" package \"0603_1608Metric\";";
         let missing_part = REFERENCE.replacen(&format!("    {PART}\n"), "", 1);
         let start = missing_part
             .find("divider.r_top")
@@ -3476,7 +4362,9 @@ mod tests {
   ground GND;
   module root {}
   resistor root.r R1 {
-    part "resistor" manufacturer "X" number "Y";
+    part "resistor" manufacturer "X" number "Y" package "0603_1608Metric";
+    lifecycle active;
+    sourcing minimum_available 1 maximum_lead_time_days 365 region "global";
     symbol "CircuitC:R" {
       bind 1 1 passive;
       bind 2 2 passive;
@@ -3502,6 +4390,10 @@ mod tests {
     terminals p n;
     connect p N;
     connect n GND;
+  }
+  catalog_snapshot "simulation-golden" sha256 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" evaluated_on "2026-08-04";
+  variant production build_quantity 1 {
+    fit root.r;
   }
   board {
     rectangle at (0 mm, 0 mm) size (2 mm, 2 mm);
@@ -3623,38 +4515,38 @@ mod tests {
                 &diagnostics,
                 crate::frontend::DiagnosticFormat::Human,
             ),
-            r###"i10-main.circuitc:5:3: CC-SIM-CAPABILITY-001 [root.r]: electrically participating component has no supported explicit simulation model (bytes 60..401)
-  related i10-main.circuitc:44:3: related entity `design.analyses.sim.ac_grid` is here (bytes 1776..1906)
-i10-main.circuitc:37:3: CC-SIM-ANALYSIS-012 [design.analyses]: aggregate declared simulation grid exceeds 10000 nominal samples (bytes 813..942)
-i10-main.circuitc:37:60: CC-SIM-ANALYSIS-003 [design.analyses.sim.points.points]: AC sweep points must be in 2..=10000; found 1 (bytes 870..871)
-i10-main.circuitc:38:54: CC-SIM-ANALYSIS-004 [design.analyses.sim.unknown_source.source]: AC source references unknown component root.missing (bytes 996..1008)
-i10-main.circuitc:39:51: CC-SIM-ANALYSIS-004 [design.analyses.sim.non_voltage.source]: AC source root.r must select a component with a DC voltage-source simulation model (bytes 1139..1145)
-  related i10-main.circuitc:5:3: related entity `root.r` is here (bytes 60..401)
-i10-main.circuitc:40:82: CC-SIM-ANALYSIS-005 [design.analyses.sim.start_zero.start_frequency]: AC start frequency must be positive (bytes 1307..1311)
-i10-main.circuitc:41:81: CC-SIM-ANALYSIS-005 [design.analyses.sim.stop_zero.start_frequency]: AC start frequency must be positive (bytes 1441..1446)
-i10-main.circuitc:41:102: CC-SIM-ANALYSIS-005 [design.analyses.sim.stop_zero.stop_frequency]: AC stop frequency must be positive (bytes 1462..1467)
-i10-main.circuitc:42:102: CC-SIM-ANALYSIS-005 [design.analyses.sim.reversed.stop_frequency]: AC stop frequency must be greater than its start frequency (bytes 1596..1601)
-i10-main.circuitc:43:128: CC-SIM-ANALYSIS-006 [design.analyses.sim.negative_magnitude.magnitude]: AC source magnitude must be non-negative (bytes 1756..1760)
-i10-main.circuitc:45:41: CC-SIM-ANALYSIS-009 [design.analyses.sim.zero_step.step]: transient step must be positive (bytes 1947..1950)
-i10-main.circuitc:46:50: CC-SIM-ANALYSIS-009 [design.analyses.sim.zero_stop.stop]: transient stop must be positive (bytes 2030..2033)
-i10-main.circuitc:47:65: CC-SIM-ANALYSIS-009 [design.analyses.sim.negative_start.start]: transient start must be non-negative (bytes 2119..2123)
-i10-main.circuitc:48:64: CC-SIM-ANALYSIS-009 [design.analyses.sim.reversed_tran.start]: transient start must not be greater than its stop (bytes 2198..2201)
-i10-main.circuitc:49:46: CC-SIM-ANALYSIS-010 [design.analyses.sim.oversized_grid.step]: inclusive transient grid exceeds 10000 samples (bytes 2258..2262)
-i10-main.circuitc:52:60: CC-SIM-ASSERTION-003 [design.assertions.checks.invalid_analysis_path.analysis_path]: assertion analysis path must be a canonical semantic path (bytes 2470..2474)
-i10-main.circuitc:53:55: CC-SIM-ASSERTION-003 [design.assertions.checks.unknown_analysis.analysis_path]: assertion references unknown analysis sim.missing (bytes 2613..2624)
-i10-main.circuitc:54:61: CC-SIM-ASSERTION-004 [design.assertions.checks.unknown_net.net]: assertion references unknown or invalid net MISSING (bytes 2769..2776)
-i10-main.circuitc:55:77: CC-SIM-ASSERTION-005 [design.assertions.checks.kind_mismatch.sample]: assertion sample kind does not match its analysis kind (bytes 2931..2937)
-  related i10-main.circuitc:44:3: related entity `design.analyses.sim.ac_grid` is here (bytes 1776..1906)
-i10-main.circuitc:56:74: CC-SIM-ASSERTION-007 [design.assertions.checks.ac_outside.sample]: AC assertion sample must lie inside the inclusive sweep range (bytes 3075..3089)
-  related i10-main.circuitc:44:3: related entity `design.analyses.sim.ac_grid` is here (bytes 1776..1906)
-i10-main.circuitc:57:75: CC-SIM-ASSERTION-007 [design.assertions.checks.ac_off_grid.sample]: AC assertion sample must exactly equal a generated linear-grid sample (bytes 3228..3243)
-  related i10-main.circuitc:44:3: related entity `design.analyses.sim.ac_grid` is here (bytes 1776..1906)
-i10-main.circuitc:58:78: CC-SIM-ASSERTION-007 [design.assertions.checks.tran_outside.sample]: transient assertion sample must lie inside the inclusive analysis interval (bytes 3385..3395)
-  related i10-main.circuitc:50:3: related entity `design.analyses.sim.tran_grid` is here (bytes 2297..2372)
-i10-main.circuitc:59:79: CC-SIM-ASSERTION-007 [design.assertions.checks.tran_off_grid.sample]: transient assertion sample must exactly equal a zero-anchored step sample or the forced stop endpoint (bytes 3538..3548)
-  related i10-main.circuitc:50:3: related entity `design.analyses.sim.tran_grid` is here (bytes 2297..2372)
-i10-main.circuitc:60:115: CC-SIM-ASSERTION-009 [design.assertions.checks.negative_absolute.absolute_tolerance]: assertion absolute tolerance must be non-negative (bytes 3727..3731)
-i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negative_relative.relative_tolerance]: assertion relative tolerance must be non-negative (bytes 3897..3905)"###
+            r###"i10-main.circuitc:5:3: CC-SIM-CAPABILITY-001 [root.r]: electrically participating component has no supported explicit simulation model (bytes 60..526)
+  related i10-main.circuitc:50:3: related entity `design.analyses.sim.ac_grid` is here (bytes 2101..2231)
+i10-main.circuitc:43:3: CC-SIM-ANALYSIS-012 [design.analyses]: aggregate declared simulation grid exceeds 10000 nominal samples (bytes 1138..1267)
+i10-main.circuitc:43:60: CC-SIM-ANALYSIS-003 [design.analyses.sim.points.points]: AC sweep points must be in 2..=10000; found 1 (bytes 1195..1196)
+i10-main.circuitc:44:54: CC-SIM-ANALYSIS-004 [design.analyses.sim.unknown_source.source]: AC source references unknown component root.missing (bytes 1321..1333)
+i10-main.circuitc:45:51: CC-SIM-ANALYSIS-004 [design.analyses.sim.non_voltage.source]: AC source root.r must select a component with a DC voltage-source simulation model (bytes 1464..1470)
+  related i10-main.circuitc:5:3: related entity `root.r` is here (bytes 60..526)
+i10-main.circuitc:46:82: CC-SIM-ANALYSIS-005 [design.analyses.sim.start_zero.start_frequency]: AC start frequency must be positive (bytes 1632..1636)
+i10-main.circuitc:47:81: CC-SIM-ANALYSIS-005 [design.analyses.sim.stop_zero.start_frequency]: AC start frequency must be positive (bytes 1766..1771)
+i10-main.circuitc:47:102: CC-SIM-ANALYSIS-005 [design.analyses.sim.stop_zero.stop_frequency]: AC stop frequency must be positive (bytes 1787..1792)
+i10-main.circuitc:48:102: CC-SIM-ANALYSIS-005 [design.analyses.sim.reversed.stop_frequency]: AC stop frequency must be greater than its start frequency (bytes 1921..1926)
+i10-main.circuitc:49:128: CC-SIM-ANALYSIS-006 [design.analyses.sim.negative_magnitude.magnitude]: AC source magnitude must be non-negative (bytes 2081..2085)
+i10-main.circuitc:51:41: CC-SIM-ANALYSIS-009 [design.analyses.sim.zero_step.step]: transient step must be positive (bytes 2272..2275)
+i10-main.circuitc:52:50: CC-SIM-ANALYSIS-009 [design.analyses.sim.zero_stop.stop]: transient stop must be positive (bytes 2355..2358)
+i10-main.circuitc:53:65: CC-SIM-ANALYSIS-009 [design.analyses.sim.negative_start.start]: transient start must be non-negative (bytes 2444..2448)
+i10-main.circuitc:54:64: CC-SIM-ANALYSIS-009 [design.analyses.sim.reversed_tran.start]: transient start must not be greater than its stop (bytes 2523..2526)
+i10-main.circuitc:55:46: CC-SIM-ANALYSIS-010 [design.analyses.sim.oversized_grid.step]: inclusive transient grid exceeds 10000 samples (bytes 2583..2587)
+i10-main.circuitc:58:60: CC-SIM-ASSERTION-003 [design.assertions.checks.invalid_analysis_path.analysis_path]: assertion analysis path must be a canonical semantic path (bytes 2795..2799)
+i10-main.circuitc:59:55: CC-SIM-ASSERTION-003 [design.assertions.checks.unknown_analysis.analysis_path]: assertion references unknown analysis sim.missing (bytes 2938..2949)
+i10-main.circuitc:60:61: CC-SIM-ASSERTION-004 [design.assertions.checks.unknown_net.net]: assertion references unknown or invalid net MISSING (bytes 3094..3101)
+i10-main.circuitc:61:77: CC-SIM-ASSERTION-005 [design.assertions.checks.kind_mismatch.sample]: assertion sample kind does not match its analysis kind (bytes 3256..3262)
+  related i10-main.circuitc:50:3: related entity `design.analyses.sim.ac_grid` is here (bytes 2101..2231)
+i10-main.circuitc:62:74: CC-SIM-ASSERTION-007 [design.assertions.checks.ac_outside.sample]: AC assertion sample must lie inside the inclusive sweep range (bytes 3400..3414)
+  related i10-main.circuitc:50:3: related entity `design.analyses.sim.ac_grid` is here (bytes 2101..2231)
+i10-main.circuitc:63:75: CC-SIM-ASSERTION-007 [design.assertions.checks.ac_off_grid.sample]: AC assertion sample must exactly equal a generated linear-grid sample (bytes 3553..3568)
+  related i10-main.circuitc:50:3: related entity `design.analyses.sim.ac_grid` is here (bytes 2101..2231)
+i10-main.circuitc:64:78: CC-SIM-ASSERTION-007 [design.assertions.checks.tran_outside.sample]: transient assertion sample must lie inside the inclusive analysis interval (bytes 3710..3720)
+  related i10-main.circuitc:56:3: related entity `design.analyses.sim.tran_grid` is here (bytes 2622..2697)
+i10-main.circuitc:65:79: CC-SIM-ASSERTION-007 [design.assertions.checks.tran_off_grid.sample]: transient assertion sample must exactly equal a zero-anchored step sample or the forced stop endpoint (bytes 3863..3873)
+  related i10-main.circuitc:56:3: related entity `design.analyses.sim.tran_grid` is here (bytes 2622..2697)
+i10-main.circuitc:66:115: CC-SIM-ASSERTION-009 [design.assertions.checks.negative_absolute.absolute_tolerance]: assertion absolute tolerance must be non-negative (bytes 4052..4056)
+i10-main.circuitc:67:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negative_relative.relative_tolerance]: assertion relative tolerance must be non-negative (bytes 4222..4230)"###
         );
         assert_eq!(
             crate::frontend::render_diagnostics(
@@ -3666,7 +4558,7 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
     "code": "CC-SIM-CAPABILITY-001",
     "filename": "i10-main.circuitc",
     "start": 60,
-    "end": 401,
+    "end": 526,
     "line": 5,
     "column": 3,
     "semantic_path": "root.r",
@@ -3674,9 +4566,9 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
     "related": [
       {
         "filename": "i10-main.circuitc",
-        "start": 1776,
-        "end": 1906,
-        "line": 44,
+        "start": 2101,
+        "end": 2231,
+        "line": 50,
         "column": 3,
         "message": "related entity `design.analyses.sim.ac_grid` is here"
       }
@@ -3685,9 +4577,9 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
   {
     "code": "CC-SIM-ANALYSIS-012",
     "filename": "i10-main.circuitc",
-    "start": 813,
-    "end": 942,
-    "line": 37,
+    "start": 1138,
+    "end": 1267,
+    "line": 43,
     "column": 3,
     "semantic_path": "design.analyses",
     "message": "aggregate declared simulation grid exceeds 10000 nominal samples",
@@ -3696,9 +4588,9 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
   {
     "code": "CC-SIM-ANALYSIS-003",
     "filename": "i10-main.circuitc",
-    "start": 870,
-    "end": 871,
-    "line": 37,
+    "start": 1195,
+    "end": 1196,
+    "line": 43,
     "column": 60,
     "semantic_path": "design.analyses.sim.points.points",
     "message": "AC sweep points must be in 2..=10000; found 1",
@@ -3707,9 +4599,9 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
   {
     "code": "CC-SIM-ANALYSIS-004",
     "filename": "i10-main.circuitc",
-    "start": 996,
-    "end": 1008,
-    "line": 38,
+    "start": 1321,
+    "end": 1333,
+    "line": 44,
     "column": 54,
     "semantic_path": "design.analyses.sim.unknown_source.source",
     "message": "AC source references unknown component root.missing",
@@ -3718,9 +4610,9 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
   {
     "code": "CC-SIM-ANALYSIS-004",
     "filename": "i10-main.circuitc",
-    "start": 1139,
-    "end": 1145,
-    "line": 39,
+    "start": 1464,
+    "end": 1470,
+    "line": 45,
     "column": 51,
     "semantic_path": "design.analyses.sim.non_voltage.source",
     "message": "AC source root.r must select a component with a DC voltage-source simulation model",
@@ -3728,7 +4620,7 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
       {
         "filename": "i10-main.circuitc",
         "start": 60,
-        "end": 401,
+        "end": 526,
         "line": 5,
         "column": 3,
         "message": "related entity `root.r` is here"
@@ -3738,9 +4630,9 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
   {
     "code": "CC-SIM-ANALYSIS-005",
     "filename": "i10-main.circuitc",
-    "start": 1307,
-    "end": 1311,
-    "line": 40,
+    "start": 1632,
+    "end": 1636,
+    "line": 46,
     "column": 82,
     "semantic_path": "design.analyses.sim.start_zero.start_frequency",
     "message": "AC start frequency must be positive",
@@ -3749,9 +4641,9 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
   {
     "code": "CC-SIM-ANALYSIS-005",
     "filename": "i10-main.circuitc",
-    "start": 1441,
-    "end": 1446,
-    "line": 41,
+    "start": 1766,
+    "end": 1771,
+    "line": 47,
     "column": 81,
     "semantic_path": "design.analyses.sim.stop_zero.start_frequency",
     "message": "AC start frequency must be positive",
@@ -3760,9 +4652,9 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
   {
     "code": "CC-SIM-ANALYSIS-005",
     "filename": "i10-main.circuitc",
-    "start": 1462,
-    "end": 1467,
-    "line": 41,
+    "start": 1787,
+    "end": 1792,
+    "line": 47,
     "column": 102,
     "semantic_path": "design.analyses.sim.stop_zero.stop_frequency",
     "message": "AC stop frequency must be positive",
@@ -3771,9 +4663,9 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
   {
     "code": "CC-SIM-ANALYSIS-005",
     "filename": "i10-main.circuitc",
-    "start": 1596,
-    "end": 1601,
-    "line": 42,
+    "start": 1921,
+    "end": 1926,
+    "line": 48,
     "column": 102,
     "semantic_path": "design.analyses.sim.reversed.stop_frequency",
     "message": "AC stop frequency must be greater than its start frequency",
@@ -3782,9 +4674,9 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
   {
     "code": "CC-SIM-ANALYSIS-006",
     "filename": "i10-main.circuitc",
-    "start": 1756,
-    "end": 1760,
-    "line": 43,
+    "start": 2081,
+    "end": 2085,
+    "line": 49,
     "column": 128,
     "semantic_path": "design.analyses.sim.negative_magnitude.magnitude",
     "message": "AC source magnitude must be non-negative",
@@ -3793,9 +4685,9 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
   {
     "code": "CC-SIM-ANALYSIS-009",
     "filename": "i10-main.circuitc",
-    "start": 1947,
-    "end": 1950,
-    "line": 45,
+    "start": 2272,
+    "end": 2275,
+    "line": 51,
     "column": 41,
     "semantic_path": "design.analyses.sim.zero_step.step",
     "message": "transient step must be positive",
@@ -3804,9 +4696,9 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
   {
     "code": "CC-SIM-ANALYSIS-009",
     "filename": "i10-main.circuitc",
-    "start": 2030,
-    "end": 2033,
-    "line": 46,
+    "start": 2355,
+    "end": 2358,
+    "line": 52,
     "column": 50,
     "semantic_path": "design.analyses.sim.zero_stop.stop",
     "message": "transient stop must be positive",
@@ -3815,9 +4707,9 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
   {
     "code": "CC-SIM-ANALYSIS-009",
     "filename": "i10-main.circuitc",
-    "start": 2119,
-    "end": 2123,
-    "line": 47,
+    "start": 2444,
+    "end": 2448,
+    "line": 53,
     "column": 65,
     "semantic_path": "design.analyses.sim.negative_start.start",
     "message": "transient start must be non-negative",
@@ -3826,9 +4718,9 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
   {
     "code": "CC-SIM-ANALYSIS-009",
     "filename": "i10-main.circuitc",
-    "start": 2198,
-    "end": 2201,
-    "line": 48,
+    "start": 2523,
+    "end": 2526,
+    "line": 54,
     "column": 64,
     "semantic_path": "design.analyses.sim.reversed_tran.start",
     "message": "transient start must not be greater than its stop",
@@ -3837,9 +4729,9 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
   {
     "code": "CC-SIM-ANALYSIS-010",
     "filename": "i10-main.circuitc",
-    "start": 2258,
-    "end": 2262,
-    "line": 49,
+    "start": 2583,
+    "end": 2587,
+    "line": 55,
     "column": 46,
     "semantic_path": "design.analyses.sim.oversized_grid.step",
     "message": "inclusive transient grid exceeds 10000 samples",
@@ -3848,9 +4740,9 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
   {
     "code": "CC-SIM-ASSERTION-003",
     "filename": "i10-main.circuitc",
-    "start": 2470,
-    "end": 2474,
-    "line": 52,
+    "start": 2795,
+    "end": 2799,
+    "line": 58,
     "column": 60,
     "semantic_path": "design.assertions.checks.invalid_analysis_path.analysis_path",
     "message": "assertion analysis path must be a canonical semantic path",
@@ -3859,9 +4751,9 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
   {
     "code": "CC-SIM-ASSERTION-003",
     "filename": "i10-main.circuitc",
-    "start": 2613,
-    "end": 2624,
-    "line": 53,
+    "start": 2938,
+    "end": 2949,
+    "line": 59,
     "column": 55,
     "semantic_path": "design.assertions.checks.unknown_analysis.analysis_path",
     "message": "assertion references unknown analysis sim.missing",
@@ -3870,9 +4762,9 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
   {
     "code": "CC-SIM-ASSERTION-004",
     "filename": "i10-main.circuitc",
-    "start": 2769,
-    "end": 2776,
-    "line": 54,
+    "start": 3094,
+    "end": 3101,
+    "line": 60,
     "column": 61,
     "semantic_path": "design.assertions.checks.unknown_net.net",
     "message": "assertion references unknown or invalid net MISSING",
@@ -3881,18 +4773,18 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
   {
     "code": "CC-SIM-ASSERTION-005",
     "filename": "i10-main.circuitc",
-    "start": 2931,
-    "end": 2937,
-    "line": 55,
+    "start": 3256,
+    "end": 3262,
+    "line": 61,
     "column": 77,
     "semantic_path": "design.assertions.checks.kind_mismatch.sample",
     "message": "assertion sample kind does not match its analysis kind",
     "related": [
       {
         "filename": "i10-main.circuitc",
-        "start": 1776,
-        "end": 1906,
-        "line": 44,
+        "start": 2101,
+        "end": 2231,
+        "line": 50,
         "column": 3,
         "message": "related entity `design.analyses.sim.ac_grid` is here"
       }
@@ -3901,18 +4793,18 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
   {
     "code": "CC-SIM-ASSERTION-007",
     "filename": "i10-main.circuitc",
-    "start": 3075,
-    "end": 3089,
-    "line": 56,
+    "start": 3400,
+    "end": 3414,
+    "line": 62,
     "column": 74,
     "semantic_path": "design.assertions.checks.ac_outside.sample",
     "message": "AC assertion sample must lie inside the inclusive sweep range",
     "related": [
       {
         "filename": "i10-main.circuitc",
-        "start": 1776,
-        "end": 1906,
-        "line": 44,
+        "start": 2101,
+        "end": 2231,
+        "line": 50,
         "column": 3,
         "message": "related entity `design.analyses.sim.ac_grid` is here"
       }
@@ -3921,18 +4813,18 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
   {
     "code": "CC-SIM-ASSERTION-007",
     "filename": "i10-main.circuitc",
-    "start": 3228,
-    "end": 3243,
-    "line": 57,
+    "start": 3553,
+    "end": 3568,
+    "line": 63,
     "column": 75,
     "semantic_path": "design.assertions.checks.ac_off_grid.sample",
     "message": "AC assertion sample must exactly equal a generated linear-grid sample",
     "related": [
       {
         "filename": "i10-main.circuitc",
-        "start": 1776,
-        "end": 1906,
-        "line": 44,
+        "start": 2101,
+        "end": 2231,
+        "line": 50,
         "column": 3,
         "message": "related entity `design.analyses.sim.ac_grid` is here"
       }
@@ -3941,18 +4833,18 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
   {
     "code": "CC-SIM-ASSERTION-007",
     "filename": "i10-main.circuitc",
-    "start": 3385,
-    "end": 3395,
-    "line": 58,
+    "start": 3710,
+    "end": 3720,
+    "line": 64,
     "column": 78,
     "semantic_path": "design.assertions.checks.tran_outside.sample",
     "message": "transient assertion sample must lie inside the inclusive analysis interval",
     "related": [
       {
         "filename": "i10-main.circuitc",
-        "start": 2297,
-        "end": 2372,
-        "line": 50,
+        "start": 2622,
+        "end": 2697,
+        "line": 56,
         "column": 3,
         "message": "related entity `design.analyses.sim.tran_grid` is here"
       }
@@ -3961,18 +4853,18 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
   {
     "code": "CC-SIM-ASSERTION-007",
     "filename": "i10-main.circuitc",
-    "start": 3538,
-    "end": 3548,
-    "line": 59,
+    "start": 3863,
+    "end": 3873,
+    "line": 65,
     "column": 79,
     "semantic_path": "design.assertions.checks.tran_off_grid.sample",
     "message": "transient assertion sample must exactly equal a zero-anchored step sample or the forced stop endpoint",
     "related": [
       {
         "filename": "i10-main.circuitc",
-        "start": 2297,
-        "end": 2372,
-        "line": 50,
+        "start": 2622,
+        "end": 2697,
+        "line": 56,
         "column": 3,
         "message": "related entity `design.analyses.sim.tran_grid` is here"
       }
@@ -3981,9 +4873,9 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
   {
     "code": "CC-SIM-ASSERTION-009",
     "filename": "i10-main.circuitc",
-    "start": 3727,
-    "end": 3731,
-    "line": 60,
+    "start": 4052,
+    "end": 4056,
+    "line": 66,
     "column": 115,
     "semantic_path": "design.assertions.checks.negative_absolute.absolute_tolerance",
     "message": "assertion absolute tolerance must be non-negative",
@@ -3992,9 +4884,9 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
   {
     "code": "CC-SIM-ASSERTION-010",
     "filename": "i10-main.circuitc",
-    "start": 3897,
-    "end": 3905,
-    "line": 61,
+    "start": 4222,
+    "end": 4230,
+    "line": 67,
     "column": 138,
     "semantic_path": "design.assertions.checks.negative_relative.relative_tolerance",
     "message": "assertion relative tolerance must be non-negative",
@@ -4094,24 +4986,24 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
                 "design.analyses.sim.ac.stop_frequency",
                 "9007199254740993 Hz",
                 "9007199254740992 Hz",
-                r###"schedule.circuitc:73:125: CC-SIM-LOWER-002 [design.analyses.sim.ac.stop_frequency]: distinct exact AC sweep endpoints collapse or reverse at the backend f64 boundary (bytes 1909..1928)
-  related schedule.circuitc:73:90: related entity `design.analyses.sim.ac.start_frequency` is here (bytes 1874..1893)"###,
+                r###"schedule.circuitc:101:125: CC-SIM-LOWER-002 [design.analyses.sim.ac.stop_frequency]: distinct exact AC sweep endpoints collapse or reverse at the backend f64 boundary (bytes 3311..3330)
+  related schedule.circuitc:101:90: related entity `design.analyses.sim.ac.start_frequency` is here (bytes 3276..3295)"###,
                 r###"[
   {
     "code": "CC-SIM-LOWER-002",
     "filename": "schedule.circuitc",
-    "start": 1909,
-    "end": 1928,
-    "line": 73,
+    "start": 3311,
+    "end": 3330,
+    "line": 101,
     "column": 125,
     "semantic_path": "design.analyses.sim.ac.stop_frequency",
     "message": "distinct exact AC sweep endpoints collapse or reverse at the backend f64 boundary",
     "related": [
       {
         "filename": "schedule.circuitc",
-        "start": 1874,
-        "end": 1893,
-        "line": 73,
+        "start": 3276,
+        "end": 3295,
+        "line": 101,
         "column": 90,
         "message": "related entity `design.analyses.sim.ac.start_frequency` is here"
       }
@@ -4125,24 +5017,24 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
                 "design.analyses.sim.tran.stop",
                 "9007199254740993 s",
                 "9007199254740992 s",
-                r###"schedule.circuitc:73:60: CC-SIM-LOWER-002 [design.analyses.sim.tran.stop]: distinct exact transient controls collapse to one value at the backend f64 boundary (bytes 1844..1862)
-  related schedule.circuitc:73:36: related entity `design.analyses.sim.tran.step` is here (bytes 1820..1838)"###,
+                r###"schedule.circuitc:101:60: CC-SIM-LOWER-002 [design.analyses.sim.tran.stop]: distinct exact transient controls collapse to one value at the backend f64 boundary (bytes 3246..3264)
+  related schedule.circuitc:101:36: related entity `design.analyses.sim.tran.step` is here (bytes 3222..3240)"###,
                 r###"[
   {
     "code": "CC-SIM-LOWER-002",
     "filename": "schedule.circuitc",
-    "start": 1844,
-    "end": 1862,
-    "line": 73,
+    "start": 3246,
+    "end": 3264,
+    "line": 101,
     "column": 60,
     "semantic_path": "design.analyses.sim.tran.stop",
     "message": "distinct exact transient controls collapse to one value at the backend f64 boundary",
     "related": [
       {
         "filename": "schedule.circuitc",
-        "start": 1820,
-        "end": 1838,
-        "line": 73,
+        "start": 3222,
+        "end": 3240,
+        "line": 101,
         "column": 36,
         "message": "related entity `design.analyses.sim.tran.step` is here"
       }
@@ -4156,24 +5048,24 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
                 "design.analyses.sim.ac.points",
                 "3",
                 "9007199254740992 Hz",
-                r###"schedule.circuitc:73:72: CC-SIM-LOWER-002 [design.analyses.sim.ac.points]: the pinned backend AC schedule is non-finite, duplicate, or non-increasing (bytes 1856..1857)
-  related schedule.circuitc:73:90: related entity `design.analyses.sim.ac.start_frequency` is here (bytes 1874..1893)"###,
+                r###"schedule.circuitc:101:72: CC-SIM-LOWER-002 [design.analyses.sim.ac.points]: the pinned backend AC schedule is non-finite, duplicate, or non-increasing (bytes 3258..3259)
+  related schedule.circuitc:101:90: related entity `design.analyses.sim.ac.start_frequency` is here (bytes 3276..3295)"###,
                 r###"[
   {
     "code": "CC-SIM-LOWER-002",
     "filename": "schedule.circuitc",
-    "start": 1856,
-    "end": 1857,
-    "line": 73,
+    "start": 3258,
+    "end": 3259,
+    "line": 101,
     "column": 72,
     "semantic_path": "design.analyses.sim.ac.points",
     "message": "the pinned backend AC schedule is non-finite, duplicate, or non-increasing",
     "related": [
       {
         "filename": "schedule.circuitc",
-        "start": 1874,
-        "end": 1893,
-        "line": 73,
+        "start": 3276,
+        "end": 3295,
+        "line": 101,
         "column": 90,
         "message": "related entity `design.analyses.sim.ac.start_frequency` is here"
       }
@@ -4229,8 +5121,8 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
                 &diagnostics,
                 crate::frontend::DiagnosticFormat::Human,
             ),
-            r###"sample-collapse.circuitc:74:72: CC-SIM-LOWER-003 [design.assertions.checks.multiple.sample]: distinct exact transient assertion or control times collapse to one value at the backend f64 boundary (bytes 1955..1978)
-  related sample-collapse.circuitc:73:60: related entity `design.analyses.sim.tran.stop` is here (bytes 1844..1862)"###
+            r###"sample-collapse.circuitc:102:72: CC-SIM-LOWER-003 [design.assertions.checks.multiple.sample]: distinct exact transient assertion or control times collapse to one value at the backend f64 boundary (bytes 3357..3380)
+  related sample-collapse.circuitc:101:60: related entity `design.analyses.sim.tran.stop` is here (bytes 3246..3264)"###
         );
         assert_eq!(
             crate::frontend::render_diagnostics(
@@ -4241,18 +5133,18 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
   {
     "code": "CC-SIM-LOWER-003",
     "filename": "sample-collapse.circuitc",
-    "start": 1955,
-    "end": 1978,
-    "line": 74,
+    "start": 3357,
+    "end": 3380,
+    "line": 102,
     "column": 72,
     "semantic_path": "design.assertions.checks.multiple.sample",
     "message": "distinct exact transient assertion or control times collapse to one value at the backend f64 boundary",
     "related": [
       {
         "filename": "sample-collapse.circuitc",
-        "start": 1844,
-        "end": 1862,
-        "line": 73,
+        "start": 3246,
+        "end": 3264,
+        "line": 101,
         "column": 60,
         "message": "related entity `design.analyses.sim.tran.stop` is here"
       }
@@ -4285,7 +5177,7 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
                 &diagnostics,
                 crate::frontend::DiagnosticFormat::Human,
             ),
-            r###"resource.circuitc:73:3: CC-SIM-LOWER-005 [design.analyses]: deterministic simulation inputs exceed the 0-byte aggregate generated-artifact budget (bytes 1787..1822)"###
+            r###"resource.circuitc:101:3: CC-SIM-LOWER-005 [design.analyses]: deterministic simulation inputs exceed the 0-byte aggregate generated-artifact budget (bytes 3189..3224)"###
         );
         assert_eq!(
             crate::frontend::render_diagnostics(
@@ -4296,9 +5188,9 @@ i10-main.circuitc:61:138: CC-SIM-ASSERTION-010 [design.assertions.checks.negativ
   {
     "code": "CC-SIM-LOWER-005",
     "filename": "resource.circuitc",
-    "start": 1787,
-    "end": 1822,
-    "line": 73,
+    "start": 3189,
+    "end": 3224,
+    "line": 101,
     "column": 3,
     "semantic_path": "design.analyses",
     "message": "deterministic simulation inputs exceed the 0-byte aggregate generated-artifact budget",
