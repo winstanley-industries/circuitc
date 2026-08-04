@@ -183,7 +183,36 @@ Distinct exact transient controls or assertion samples that alias at the
 ngspice is an independent numerical authority for overlapping coverage. The
 initial differential gate requires ngspice 45.2 and remains a Bazel-owned
 `local`/`manual` host gate until that executable is provisioned hermetically in
-CI. Its unavailability is reported, never treated as passing evidence.
+CI. Its unavailability is reported, never treated as passing evidence. The
+gate compiles the committed checked voltage-divider fixture through the real
+Bazel-owned Ohmnivore CPU path and authenticates every request, map, result,
+report, and generated netlist before invoking ngspice.
+
+The initial comparison inventory is every mapped non-ground net voltage for
+the supported resistor and independent DC-voltage-source subset. DC compares
+the scalar operating point. Linear AC compares voltage magnitude at every
+declared sweep ordinal. Transient compares every explicitly authored assertion
+time; the fixture authenticates the complete `0`, `125`, `250`, `375`, and
+`500 ms` comparison series. ngspice's adaptive transient rows are converted to
+that declared output grid with its `linearize` operation. This resampling is
+ephemeral host-test evidence and never becomes a CircuitC normalized result.
+Axes must align by ordinal within
+`1e-12 * max(1, abs(declared_sample))`. Voltage comparisons use the independent
+named inclusive tolerance `abs(ohmnivore - ngspice) <= 1e-6 V`, with no
+relative term; source assertion tolerances do not control the differential
+gate.
+
+The selected executable is opened once and copied into the private work root
+before any process starts; that pinned regular-file copy must produce exactly
+one `ngspice-45.2` version banner and is used for every analysis. It is invoked
+with user startup disabled, a cleared fixed environment, a five-second wall
+limit, CPU/file/descriptor/core limits (plus a Linux address-space limit),
+private inputs, and exact static control instrumentation.
+Raw output, dates, paths, timing, logs, and host metadata remain ephemeral. The
+strict parser requires one finite complete plot, contiguous variables and rows,
+the expected real or complex shape, and an exact case-insensitive backend-token
+join through the authenticated identity map. Only canonical identities and
+normalized finite comparison values enter the repeatable test report.
 
 ## Consequences
 

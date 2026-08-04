@@ -78,6 +78,54 @@ rust_binary(
     deps = [":circuitc"],
 )
 
+rust_binary(
+    name = "ngspice_differential_gate",
+    testonly = True,
+    srcs = ["tools/simulation/ngspice_differential.rs"],
+    crate_name = "ngspice_differential_gate",
+    edition = "2024",
+    rustc_flags = RUSTC_FLAGS,
+    deps = [
+        ":circuitc",
+        "@crates//libc",
+        "@crates//serde",
+        "@crates//serde_json",
+    ],
+)
+
+rust_binary(
+    name = "ngspice_differential_fake",
+    testonly = True,
+    srcs = ["tools/simulation/ngspice_differential_fake.rs"],
+    crate_name = "ngspice_differential_fake",
+    edition = "2024",
+    rustc_flags = RUSTC_FLAGS,
+    deps = ["@crates//libc"],
+)
+
+rust_binary(
+    name = "ngspice_differential_hang_fake",
+    testonly = True,
+    srcs = ["tools/simulation/ngspice_differential_hang_fake.rs"],
+    crate_name = "ngspice_differential_hang_fake",
+    edition = "2024",
+    rustc_flags = RUSTC_FLAGS,
+)
+
+rust_test(
+    name = "ngspice_differential_unit_test",
+    srcs = ["tools/simulation/ngspice_differential.rs"],
+    crate_name = "ngspice_differential_unit_test",
+    edition = "2024",
+    rustc_flags = RUSTC_FLAGS,
+    deps = [
+        ":circuitc",
+        "@crates//libc",
+        "@crates//serde",
+        "@crates//serde_json",
+    ],
+)
+
 sh_test(
     name = "ohmnivore_cpu_test",
     srcs = ["tools/simulation/ohmnivore_cpu_test.sh"],
@@ -112,6 +160,41 @@ sh_test(
     ],
 )
 
+sh_test(
+    name = "ngspice45_differential_test",
+    timeout = "short",
+    srcs = ["tools/simulation/ngspice45_differential_test.sh"],
+    args = [
+        "$(location :ngspice_differential_gate)",
+        "$(location tools/simulation/fixtures/checked_voltage_divider.circuitc)",
+    ],
+    data = [
+        "tools/simulation/fixtures/checked_voltage_divider.circuitc",
+        ":ngspice_differential_gate",
+    ],
+    tags = [
+        "local",
+        "manual",
+    ],
+)
+
+sh_test(
+    name = "ngspice_differential_process_test",
+    srcs = ["tools/simulation/ngspice_differential_process_test.sh"],
+    args = [
+        "$(location :ngspice_differential_gate)",
+        "$(location :ngspice_differential_fake)",
+        "$(location :ngspice_differential_hang_fake)",
+        "$(location tools/simulation/fixtures/checked_voltage_divider.circuitc)",
+    ],
+    data = [
+        "tools/simulation/fixtures/checked_voltage_divider.circuitc",
+        ":ngspice_differential_fake",
+        ":ngspice_differential_gate",
+        ":ngspice_differential_hang_fake",
+    ],
+)
+
 rust_test(
     name = "circuitc_test",
     crate = ":circuitc",
@@ -142,6 +225,9 @@ rustfmt_test(
     targets = [
         ":circuitc",
         ":frontend_equivalence",
+        ":ngspice_differential_fake",
+        ":ngspice_differential_gate",
+        ":ngspice_differential_hang_fake",
         ":ohmnivore_provenance_writer",
         ":simulation_runner_gate",
         ":voltage_divider",
@@ -155,6 +241,10 @@ rust_clippy(
     deps = [
         ":circuitc",
         ":frontend_equivalence",
+        ":ngspice_differential_fake",
+        ":ngspice_differential_gate",
+        ":ngspice_differential_hang_fake",
+        ":ngspice_differential_unit_test",
         ":ohmnivore_provenance_writer",
         ":simulation_runner_gate",
         ":voltage_divider",

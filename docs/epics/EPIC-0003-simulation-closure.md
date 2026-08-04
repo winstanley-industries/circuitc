@@ -42,4 +42,13 @@ when an assertion is not satisfied.
 
 ## Completion evidence
 
-Not yet complete.
+The dependency-ordered implementation stack provides versioned simulation
+contracts; typed DC, linear-AC, and transient intent; deterministic lowering;
+bounded Bazel-owned Ohmnivore CPU execution; authenticated normalized results;
+checked assertions; transactional publication; and the explicit
+`//:ngspice45_differential_test` host gate. ADR-0006 records the compared signal
+inventory, axis policy, and named numerical tolerances.
+
+The epic remains incomplete until the stack is merged and the final
+clean-checkout Bazel, strict-lockfile, exact ngspice 45.2 host, and integration
+audit evidence is recorded here.

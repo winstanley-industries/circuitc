@@ -69,6 +69,10 @@ design checked_voltage_divider {
   analysis ac_linear_sweep simulation.ac source divider.analysis.input points 4 start_frequency 1 Hz stop_frequency 4 Hz magnitude 1 V phase 0 deg;
   assert net_voltage checks.ac analysis simulation.ac net VOUT sample frequency 3 Hz expected 0.5 V absolute_tolerance 0.000001 V relative_tolerance 0 ratio;
   analysis transient simulation.transient step 125 ms stop 500 ms start 0 s uic false;
+  assert net_voltage checks.transient_000 analysis simulation.transient net VOUT sample time 0 ms expected 5 V absolute_tolerance 0.000001 V relative_tolerance 0 ratio;
+  assert net_voltage checks.transient_125 analysis simulation.transient net VOUT sample time 125 ms expected 5 V absolute_tolerance 0.000001 V relative_tolerance 0 ratio;
+  assert net_voltage checks.transient_250 analysis simulation.transient net VOUT sample time 250 ms expected 5 V absolute_tolerance 0.000001 V relative_tolerance 0 ratio;
+  assert net_voltage checks.transient_375 analysis simulation.transient net VOUT sample time 375 ms expected 5 V absolute_tolerance 0.000001 V relative_tolerance 0 ratio;
   assert net_voltage checks.transient analysis simulation.transient net VOUT sample time 500 ms expected 5 V absolute_tolerance 0.000001 V relative_tolerance 0 ratio;
 
   board {
