@@ -1541,6 +1541,79 @@ mod tests {
             "CC-RELEASE-COMPILER-001"
         );
 
+        let mut stale_product = fixture.product.clone();
+        let stale_resolution: Value = serde_json::from_str(&stale_product.resolution_json).unwrap();
+        let catalog_snapshot_id = stale_resolution["catalog_snapshot_id"].as_str().unwrap();
+        let catalog_snapshot_token = format!(
+            "\"catalog_snapshot_id\":{}",
+            serde_json::to_string(catalog_snapshot_id).unwrap()
+        );
+        let forged_snapshot_id = format!("{catalog_snapshot_id}-forged");
+        assert_eq!(
+            stale_product
+                .resolution_json
+                .matches(&catalog_snapshot_token)
+                .count(),
+            1
+        );
+        let original_resolution_sha256 = sha256_hex(stale_product.resolution_json.as_bytes());
+        stale_product.resolution_json = stale_product.resolution_json.replacen(
+            &catalog_snapshot_token,
+            &format!(
+                "\"catalog_snapshot_id\":{}",
+                serde_json::to_string(&forged_snapshot_id).unwrap()
+            ),
+            1,
+        );
+        let forged_resolution_sha256 = sha256_hex(stale_product.resolution_json.as_bytes());
+        let resolution_digest_token =
+            format!("\"product_resolution_sha256\":\"{original_resolution_sha256}\"");
+        let forged_resolution_digest =
+            format!("\"product_resolution_sha256\":\"{forged_resolution_sha256}\"");
+        for derived_json in [
+            &mut stale_product.bom_json,
+            &mut stale_product.placement_json,
+            &mut stale_product.assembly_json,
+        ] {
+            assert_eq!(derived_json.matches(&resolution_digest_token).count(), 1);
+            *derived_json =
+                derived_json.replacen(&resolution_digest_token, &forged_resolution_digest, 1);
+        }
+        let stale_product_inputs = ReleaseInputs {
+            product: &stale_product,
+            ..inputs
+        };
+        assert_eq!(
+            bind_release(&stale_product_inputs).unwrap_err().code,
+            "CC-RELEASE-PRODUCT-001"
+        );
+
+        let mut stale_fabrication = fixture.fabrication.clone();
+        let expected_version_token = format!("\"expected_version\":\"{ADAPTER_VERSION}\"");
+        assert_eq!(
+            stale_fabrication
+                .request_json()
+                .matches(&expected_version_token)
+                .count(),
+            1
+        );
+        stale_fabrication.request_json = stale_fabrication.request_json().replacen(
+            &expected_version_token,
+            "\"expected_version\":\"10.0.4\"",
+            1,
+        );
+        let stale_fabrication_inputs = ReleaseInputs {
+            fabrication: ReleaseFabricationEvidence {
+                bundle: &stale_fabrication,
+                ..inputs.fabrication
+            },
+            ..inputs
+        };
+        assert_eq!(
+            bind_release(&stale_fabrication_inputs).unwrap_err().code,
+            "CC-RELEASE-FABRICATION-001"
+        );
+
         let mut failing_host = host_evidence.clone();
         let mut drc: Value = serde_json::from_slice(&failing_host.drc_report_json).unwrap();
         drc["violations"] = Value::Array(vec![dirty_finding(&fixture, "clearance")]);
