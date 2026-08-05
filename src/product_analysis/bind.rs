@@ -978,6 +978,7 @@ pub fn verify_kicad10_board_analysis_noncompletion(
 mod tests {
     use std::env;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt as _;
     use std::path::PathBuf;
 
     use serde_json::{Value, json};
@@ -986,8 +987,9 @@ mod tests {
     use crate::manufacturing::{FabricationHostFile, bind_kicad10_fabrication};
     use crate::product::compile_product_artifacts;
     use crate::release::{
-        ReleaseAnalysisEvidence, ReleaseFabricationEvidence, ReleaseInputs, ReleaseRoutingEvidence,
-        ReleaseToolchainEvidence, assemble_release, bind_release, verify_release,
+        PublicationDurability, ReleaseAnalysisEvidence, ReleaseDestination,
+        ReleaseFabricationEvidence, ReleaseInputs, ReleaseRoutingEvidence,
+        ReleaseToolchainEvidence, assemble_release, bind_release, publish_release, verify_release,
     };
     use crate::simulation::assert::evaluate_assertions;
     use crate::simulation::{canonical_f64, parse_result};
@@ -1456,7 +1458,29 @@ mod tests {
         assert!(first.root().as_str().starts_with("release/"));
         assert!(first.request_json().ends_with('\n'));
         assert!(first.manifest_json().ends_with('\n'));
-        verify_release(&inputs, &first).unwrap();
+        let verified = verify_release(&inputs, &first).unwrap();
+        let publication_root = env::var_os("TEST_TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(env::temp_dir)
+            .join(format!("verified-static-release-{}", std::process::id()));
+        fs::create_dir(&publication_root).unwrap();
+        fs::set_permissions(&publication_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let publication_root = fs::canonicalize(publication_root).unwrap();
+        let destination = ReleaseDestination::open(&publication_root).unwrap();
+        let publication = publish_release(&destination, &verified).unwrap();
+        assert_eq!(publication.durability, PublicationDurability::Durable);
+        assert!(publication.warnings.is_empty());
+        for file in first.files() {
+            assert_eq!(
+                fs::read(
+                    publication_root
+                        .join(first.root().as_path())
+                        .join(file.path.as_path())
+                )
+                .unwrap(),
+                file.contents
+            );
+        }
         let assembled = assemble_release(first.root().clone(), first.files().to_vec()).unwrap();
         verify_release(&inputs, &assembled).unwrap();
 

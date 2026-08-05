@@ -1,6 +1,6 @@
 # EPIC-0005: Product and manufacturing closure
 
-- Status: Planned
+- Status: Active
 - Architecture milestone: M4
 - Depends on: EPIC-0002; routing-dependent releases also depend on EPIC-0004
 
@@ -265,6 +265,15 @@ no-follow traversal, held identity, rollback, concurrency, and post-rename
 durability-warning behavior follow the hardened CircuitC publication boundary;
 packaging, signing, upload, and registries remain future separate authorities.
 
+The implemented boundary retains a descriptor capability for an absolute,
+caller-owned mode-0700 destination and never re-resolves its pathname. It
+creates each release in a private sibling transaction, writes and synchronizes
+the verified bytes with `manifest.json` last, seals the exact tree read-only,
+reverifies the held staging identity and inventory, and performs one atomic
+no-replace rename. Cleanup is identity-scoped and fail-safe; post-rename sync
+or verification failures report a published-with-warning state without
+deleting the visible release.
+
 ## Non-goals
 
 - Operating a live procurement marketplace.
@@ -287,4 +296,22 @@ packaging, signing, upload, and registries remain future separate authorities.
 
 ## Completion evidence
 
-Not yet complete.
+Not yet complete. The seven-layer implementation stack is locally committed
+and validated, but GitHub publication, policy-facing CI, automated review,
+dependency-ordered merge, and the integrated-main audit require separate
+external-write authority and remain pending. Earlier layer evidence is
+historical until the final stack is merged and revalidated on `main`.
+
+| Requirements | Local implementation evidence |
+| --- | --- |
+| `CC-REQ-PROD-001`, `CC-REQ-PROD-002`, `CC-REQ-PROD-004` | Product intent `5400a36c74b2770469ef16d6d61c63df5536edc3`; pinned catalog verification `8dce8a684ace68beae083649c71865b4253545a8` |
+| `CC-REQ-PROD-002`, `CC-REQ-PROD-003` | Deterministic product artifacts `be09b35c351990a0783eb9a269268f0df32d917e`; normalized KiCad fabrication evidence `41a379eef9609bb533a70073f8b1ab05a879b697` |
+| `CC-REQ-PROD-005` | Capability-declared board analysis `719fdf8a865f2e657be715b10ed1f8177e6484fd` |
+| `CC-REQ-PROD-006`, `CC-REQ-PROD-007` | Independently verified release closure `fa8e41ffb8c3f48f937a5389b7fa2c22beecf59c`; immutable transactional publication `dd6db80b946bba18d142bd1b733c7baa843b22bf` |
+
+The final local stack passed `bazel lint //...`, repository-wide build and
+test, strict-lockfile build and test, and strict module graph resolution. The
+KiCad 10 host gates for analysis, DRC, and manufacturing ran uncached and
+passed. These results will be rerun and bound to the final committed local head
+before publication, then rerun on integrated `main` before this status changes
+to Complete.

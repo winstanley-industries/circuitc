@@ -81,7 +81,16 @@ cannot represent; it may not silently discard or reinterpret them.
     analysis/simulation/routing artifacts, and exact tool images. Its manifest
     records that closure but does not become authority for omitted or stale
     predecessors. One content-addressed release directory is immutable and is
-    exposed only by atomic no-replace publication.
+    exposed only by atomic no-replace publication. Publication accepts only an
+    opaque independently verified closure, walks a caller-owned private
+    destination with retained no-follow directory descriptors, and writes a
+    private same-filesystem sibling before the one visibility point. Before
+    visibility, every failure rolls back only identity-matched transaction
+    entries. After visibility, sync or exact-tree verification failure is a
+    durable machine-readable warning and never authorizes deletion or repair
+    of the immutable root. The destination's effective-UID owner is this
+    boundary's security authority; isolation from malicious code with that
+    same UID requires a separate account or operating-system sandbox.
 
 Edits made only to generated KiCad files are not round-tripped. Code-authored
 placement and routing belong in CircuitC source. A future importer may help
