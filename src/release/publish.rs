@@ -319,6 +319,10 @@ fn publish_with_hooks(
         if final_identity
             .as_ref()
             .is_ok_and(|identity| *identity == staging.identity)
+            && matches!(
+                source_identity.as_ref(),
+                Err(error) if error.kind() == io::ErrorKind::NotFound
+            )
         {
             staging.disarm();
             warnings.push(publication_warning(
@@ -1916,6 +1920,78 @@ mod tests {
             b"{\"all_pass\":true}\n"
         );
         assert_eq!(release_entries(&test), vec![IDENTITY]);
+    }
+
+    #[test]
+    fn ambiguous_source_probes_keep_committed_rename_indeterminate() {
+        #[derive(Clone, Copy, Debug)]
+        enum SourceProbe {
+            StalePositive,
+            Io,
+        }
+
+        struct AmbiguousSourceAfterRename {
+            source_probe: SourceProbe,
+            source_identity: Option<(u64, u64)>,
+        }
+        impl PublicationHooks for AmbiguousSourceAfterRename {
+            fn rename_release(
+                &mut self,
+                old_directory: &Directory,
+                old_name: &CStr,
+                new_directory: &Directory,
+                new_name: &CStr,
+            ) -> io::Result<()> {
+                self.source_identity = Some(old_directory.open_child(old_name)?.identity()?);
+                rename_noreplace(old_directory, old_name, new_directory, new_name)?;
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            }
+
+            fn probe_rename_identity(
+                &mut self,
+                directory: &Directory,
+                name: &CStr,
+            ) -> io::Result<(u64, u64)> {
+                if name.to_bytes() == IDENTITY.as_bytes() {
+                    directory.probe_entry_identity(name)
+                } else {
+                    match self.source_probe {
+                        SourceProbe::StalePositive => Ok(self
+                            .source_identity
+                            .expect("rename hook captured the staging identity")),
+                        SourceProbe::Io => Err(io::Error::from_raw_os_error(libc::EIO)),
+                    }
+                }
+            }
+        }
+
+        for source_probe in [SourceProbe::StalePositive, SourceProbe::Io] {
+            let test = TestDirectory::new(&format!("ambiguous-source-{source_probe:?}"));
+            let destination = ReleaseDestination::open(test.path()).unwrap();
+            let outcome = publish_with_hooks(
+                &destination,
+                &verified_release(),
+                &mut AmbiguousSourceAfterRename {
+                    source_probe,
+                    source_identity: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                outcome.durability,
+                PublicationDurability::VisibilityIndeterminate
+            );
+            assert!(
+                outcome.warnings.iter().any(|warning| {
+                    warning.code == "CC-RELEASE-PUBLISH-RENAME-INDETERMINATE-001"
+                })
+            );
+            assert_eq!(
+                fs::read(visible_root(&test).join("manifest.json")).unwrap(),
+                b"{\"all_pass\":true}\n"
+            );
+            assert_eq!(release_entries(&test), vec![IDENTITY]);
+        }
     }
 
     #[test]

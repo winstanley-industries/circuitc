@@ -315,9 +315,13 @@ agreement cannot legitimize an extra or stale row.
 The initial manufacturability intent is limited to KiCad major version 10 and
 stable assertions for clean ERC, clean DRC, clean unconnected and
 schematic-parity results, and a complete fabrication inventory. This is
-canonical requested intent only. Manufacturing export, normalized analysis
-evidence, and release-manifest closure remain separate compiled boundaries and
-require later accepted decisions before CircuitC can claim a release.
+canonical requested intent only. Separate compiled boundaries authenticate and
+normalize the KiCad fabrication inventory, evaluate the five declared board
+analysis capabilities, close one independently verified content-addressed
+release, and materialize that exact closure with immutable transactional
+publication. Each boundary rederives its inputs; no downstream manifest or
+filesystem transaction can make stale or incomplete predecessor evidence
+authoritative.
 The authority and initial field-level contract are recorded in
 [ADR-0008](adr/0008-product-intent-and-pinned-catalog-evidence.md).
 The strict snapshot and offline resolution contract are recorded in
@@ -329,6 +333,19 @@ The deterministic product bundle and its strict schemas are recorded in
 [`bom/v1`](../schemas/bom/v1.md),
 [`placement/v1`](../schemas/placement/v1.md), and
 [`assembly/v1`](../schemas/assembly/v1.md).
+The deterministic fabrication boundary is recorded in
+[ADR-0011](adr/0011-deterministic-kicad-fabrication-evidence.md),
+[`fabrication_request/v1`](../schemas/fabrication_request/v1.md), and
+[`fabrication_manifest/v1`](../schemas/fabrication_manifest/v1.md). The
+capability-declared analysis boundary is recorded in
+[ADR-0012](adr/0012-capability-declared-kicad-board-analysis.md),
+[`board_analysis_request/v1`](../schemas/board_analysis_request/v1.md),
+[`board_analysis_result/v1`](../schemas/board_analysis_result/v1.md), and
+[`board_analysis_report/v1`](../schemas/board_analysis_report/v1.md). Verified
+release closure and immutable materialization are recorded in
+[ADR-0013](adr/0013-content-addressed-release-closure.md),
+[`release_request/v1`](../schemas/release_request/v1.md), and
+[`release_manifest/v1`](../schemas/release_manifest/v1.md).
 
 This directly avoids hosted-backend availability becoming a build dependency.
 

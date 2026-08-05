@@ -14,7 +14,7 @@ lists or implementation assignments.
 | [EPIC-0002](EPIC-0002-kicad-project-compiler.md) | Complete | M1B | Complete, reproducible KiCad schematic, PCB, and project generation |
 | [EPIC-0003](EPIC-0003-simulation-closure.md) | Complete | M2 | Simulation models, analyses, and assertions as checked compiler phases |
 | [EPIC-0004](EPIC-0004-apgar-routing-integration.md) | Complete | M3 | APGAR route generation imported with exact validation and provenance |
-| [EPIC-0005](EPIC-0005-product-and-manufacturing.md) | Active | M4 | Reproducible product, BOM, fabrication, assembly, and release outputs |
+| [EPIC-0005](EPIC-0005-product-and-manufacturing.md) | Complete | M4 | Reproducible product, BOM, fabrication, assembly, and release outputs |
 
 ## Document authority
 

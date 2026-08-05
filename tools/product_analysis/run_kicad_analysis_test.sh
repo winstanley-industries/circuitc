@@ -104,6 +104,7 @@ cmp "${TEST_TMPDIR}/output/receipt.json" \
   --output-root "${TEST_TMPDIR}/exact-stdout-output"
 
 python3 -I - "${runner}" "${TEST_TMPDIR}" <<'PY'
+import errno
 import importlib.util
 import os
 import pathlib
@@ -179,6 +180,171 @@ with tempfile.TemporaryDirectory(dir=sys.argv[2]) as directory:
         pass
     else:
         raise AssertionError("accepted a file one byte over its limit")
+
+publication_outputs = {
+    "drc.normalized.json": b'{"drc":"exact"}\n',
+    "erc.normalized.json": b'{"erc":"exact"}\n',
+    "receipt.json": b'{"receipt":"exact"}\n',
+}
+
+
+def assert_exact_flat_tree(root, expected):
+    actual = {entry.name: entry.read_bytes() for entry in root.iterdir()}
+    assert actual == expected
+
+
+with tempfile.TemporaryDirectory(dir=sys.argv[2]) as directory:
+    parent = pathlib.Path(directory)
+    output_root = parent / "committed-after-error"
+    original_rename = runner._rename_noreplace
+
+    def commit_then_eio(parent_fd, source, destination):
+        original_rename(parent_fd, source, destination)
+        raise OSError(errno.EIO, os.strerror(errno.EIO))
+
+    runner._rename_noreplace = commit_then_eio
+    try:
+        runner._publish(output_root, publication_outputs)
+    finally:
+        runner._rename_noreplace = original_rename
+    assert_exact_flat_tree(output_root, publication_outputs)
+    assert not list(parent.glob(f".{output_root.name}.circuitc-*"))
+
+with tempfile.TemporaryDirectory(dir=sys.argv[2]) as directory:
+    parent = pathlib.Path(directory)
+    output_root = parent / "different-final-output"
+    original_rename = runner._rename_noreplace
+
+    def install_different_final(parent_fd, _source, destination):
+        os.mkdir(destination, mode=0o700, dir_fd=parent_fd)
+        final_fd = os.open(destination, runner._directory_flags(), dir_fd=parent_fd)
+        try:
+            marker = os.open(
+                "different-final-marker",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=final_fd,
+            )
+            os.close(marker)
+        finally:
+            os.close(final_fd)
+        raise OSError(errno.EEXIST, os.strerror(errno.EEXIST))
+
+    runner._rename_noreplace = install_different_final
+    try:
+        try:
+            runner._publish(output_root, publication_outputs)
+        except runner.AnalysisHostError as error:
+            assert "already exists" in str(error)
+        else:
+            raise AssertionError("accepted a different final inode after rename failure")
+    finally:
+        runner._rename_noreplace = original_rename
+    assert (output_root / "different-final-marker").is_file()
+    assert not list(parent.glob(f".{output_root.name}.circuitc-*"))
+
+for rejection_errno in sorted(runner._PREEXECUTION_RENAME_ERRORS):
+    with tempfile.TemporaryDirectory(dir=sys.argv[2]) as directory:
+        parent = pathlib.Path(directory)
+        output_root = parent / f"rejected-{rejection_errno}"
+        original_rename = runner._rename_noreplace
+
+        def reject_before_execution(
+            _parent_fd, _source, _destination, value=rejection_errno
+        ):
+            raise OSError(value, os.strerror(value))
+
+        runner._rename_noreplace = reject_before_execution
+        try:
+            try:
+                runner._publish(output_root, publication_outputs)
+            except runner.AnalysisHostError as error:
+                assert "no atomic no-replace" in str(error)
+            else:
+                raise AssertionError(f"accepted primitive rejection {rejection_errno}")
+        finally:
+            runner._rename_noreplace = original_rename
+        assert not output_root.exists()
+        assert not list(parent.glob(f".{output_root.name}.circuitc-*"))
+
+for source_probe in ("stale-identity", "io-error"):
+    with tempfile.TemporaryDirectory(dir=sys.argv[2]) as directory:
+        parent = pathlib.Path(directory)
+        output_root = parent / f"committed-inconclusive-{source_probe}"
+        original_cleanup = runner._cleanup_staged_publication
+        original_rename = runner._rename_noreplace
+        original_stat = runner.os.stat
+        rename_state = {}
+
+        def reject_cleanup(*_args):
+            raise AssertionError("cleanup ran after an indeterminate committed rename")
+
+        def commit_then_eio(parent_fd, source, destination):
+            rename_state["source"] = source
+            rename_state["metadata"] = original_stat(
+                source, dir_fd=parent_fd, follow_symlinks=False
+            )
+            original_rename(parent_fd, source, destination)
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+
+        def spoof_source_probe(path, *args, **kwargs):
+            if (
+                path == rename_state.get("source")
+                and kwargs.get("dir_fd") is not None
+            ):
+                if source_probe == "stale-identity":
+                    return rename_state["metadata"]
+                raise OSError(errno.EIO, os.strerror(errno.EIO))
+            return original_stat(path, *args, **kwargs)
+
+        runner._cleanup_staged_publication = reject_cleanup
+        runner._rename_noreplace = commit_then_eio
+        runner.os.stat = spoof_source_probe
+        try:
+            try:
+                runner._publish(output_root, publication_outputs)
+            except runner.AnalysisHostError as error:
+                assert "publication visibility is indeterminate" in str(error)
+            else:
+                raise AssertionError("accepted an inconclusive source-name probe")
+        finally:
+            runner.os.stat = original_stat
+            runner._rename_noreplace = original_rename
+            runner._cleanup_staged_publication = original_cleanup
+        assert_exact_flat_tree(output_root, publication_outputs)
+        assert not list(parent.glob(f".{output_root.name}.circuitc-*"))
+
+for probe_errno in (errno.EIO, errno.ENOENT):
+    with tempfile.TemporaryDirectory(dir=sys.argv[2]) as directory:
+        parent = pathlib.Path(directory)
+        output_root = parent / f"inconclusive-{probe_errno}"
+        original_rename = runner._rename_noreplace
+        original_stat = runner.os.stat
+
+        def fail_before_rename(_parent_fd, _source, _destination):
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+
+        def fail_final_probe(path, *args, **kwargs):
+            if path == output_root.name and kwargs.get("dir_fd") is not None:
+                raise OSError(probe_errno, os.strerror(probe_errno))
+            return original_stat(path, *args, **kwargs)
+
+        runner._rename_noreplace = fail_before_rename
+        runner.os.stat = fail_final_probe
+        try:
+            try:
+                runner._publish(output_root, publication_outputs)
+            except runner.AnalysisHostError as error:
+                assert "publication visibility is indeterminate" in str(error)
+            else:
+                raise AssertionError("accepted an inconclusive publication probe")
+        finally:
+            runner.os.stat = original_stat
+            runner._rename_noreplace = original_rename
+        assert not output_root.exists()
+        residue = list(parent.glob(f".{output_root.name}.circuitc-*"))
+        assert len(residue) == 1
+        assert_exact_flat_tree(residue[0], publication_outputs)
 PY
 
 expect_failure() {
