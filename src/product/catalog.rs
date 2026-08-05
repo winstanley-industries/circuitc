@@ -118,7 +118,7 @@ pub fn verify_product_catalog(
 ) -> Result<CatalogResolution, Vec<CatalogDiagnostic>> {
     if design.validate().is_err() {
         return Err(vec![diagnostic(
-            "CC-CATALOG-DESIGN-001",
+            "CC-CATALOG-CONTRACT-008",
             "design",
             "catalog resolution requires a valid canonical Design IR",
         )]);
@@ -173,13 +173,13 @@ pub fn verify_product_catalog(
     let mut components: Vec<_> = design
         .components
         .iter()
-        .filter(|component| component.physical.is_some())
+        .filter(|component| component.part.manufacturer.is_some())
         .collect();
     components.sort_by(|left, right| left.path.cmp(&right.path));
     let resolution_entries = resolution_entry_count(&components);
     if resolution_entries.is_none_or(|entries| entries > MAX_RESOLUTION_ENTRIES) {
         return Err(vec![diagnostic(
-            "CC-CATALOG-RESOURCE-001",
+            "CC-CATALOG-RESOLVE-007",
             "design.components",
             format!(
                 "catalog resolution exceeds the {MAX_RESOLUTION_ENTRIES}-entry primary-and-alternate limit"
@@ -755,7 +755,7 @@ mod tests {
             substitutions.reverse();
         }
         for component in &mut design.components {
-            if component.physical.is_some() {
+            if component.part.manufacturer.is_some() {
                 component.part.approved_substitutions = substitutions.clone();
             }
         }
@@ -778,6 +778,67 @@ mod tests {
     }
 
     #[test]
+    fn manufacturer_identified_parts_resolve_without_board_placement() {
+        let mut design = design();
+        let component_path = design.components[0].path.clone();
+        design.components[0].physical = None;
+        assert_eq!(design.validate(), Ok(()));
+
+        let resolution = verify_product_catalog(&design, SNAPSHOT).unwrap();
+        assert_eq!(resolution.parts.len(), 4);
+        assert_eq!(
+            resolution
+                .parts
+                .iter()
+                .filter(|part| part.component_path == component_path)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn exact_catalog_value_rules_cover_signed_voltage_and_positive_resistance() {
+        for coefficient in [-1, 0, 1] {
+            assert!(catalog_value_is_valid(
+                "dc_voltage_source",
+                &CatalogValue {
+                    kind: ValueKind::DcVoltage,
+                    coefficient,
+                    exponent: 0,
+                    unit: ValueUnit::Volt,
+                }
+            ));
+        }
+        assert!(catalog_value_is_valid(
+            "resistor",
+            &CatalogValue {
+                kind: ValueKind::Resistance,
+                coefficient: 1,
+                exponent: 0,
+                unit: ValueUnit::Ohm,
+            }
+        ));
+        for coefficient in [-1, 0] {
+            let mut invalid = snapshot();
+            invalid.parts[0].value.coefficient = coefficient;
+            invalid.parts[0].value.exponent = 0;
+            assert_eq!(
+                verify_rebound(&render_snapshot(&invalid)).unwrap_err()[0].code,
+                "CC-CATALOG-CONTRACT-003"
+            );
+        }
+        assert!(!catalog_value_is_valid(
+            "resistor",
+            &CatalogValue {
+                kind: ValueKind::DcVoltage,
+                coefficient: -1,
+                exponent: 0,
+                unit: ValueUnit::Volt,
+            }
+        ));
+    }
+
+    #[test]
     fn exact_bytes_and_canonical_encoding_are_authenticated() {
         let mut stale = design();
         stale.product.catalog.as_mut().unwrap().sha256 = "0".repeat(64);
@@ -793,6 +854,17 @@ mod tests {
         assert_eq!(
             verify_product_catalog(&rebound, &noncanonical).unwrap_err()[0].code,
             "CC-CATALOG-CONTRACT-007"
+        );
+    }
+
+    #[test]
+    fn invalid_design_uses_the_declared_catalog_contract_family() {
+        let mut invalid = design();
+        invalid.name.clear();
+        assert!(invalid.validate().is_err());
+        assert_eq!(
+            verify_product_catalog(&invalid, SNAPSHOT).unwrap_err()[0].code,
+            "CC-CATALOG-CONTRACT-008"
         );
     }
 
@@ -1109,7 +1181,7 @@ mod tests {
         assert_eq!(oversized.validate(), Ok(()));
         assert_eq!(
             verify_product_catalog(&oversized, SNAPSHOT).unwrap_err()[0].code,
-            "CC-CATALOG-RESOURCE-001"
+            "CC-CATALOG-RESOLVE-007"
         );
 
         let mut exact_design = design();
@@ -1190,7 +1262,7 @@ mod tests {
                 .into_bytes();
             let mut design = design();
             for component in &mut design.components {
-                if component.physical.is_some() {
+                if component.part.manufacturer.is_some() {
                     component.part.lifecycle = Some(required);
                 }
             }
