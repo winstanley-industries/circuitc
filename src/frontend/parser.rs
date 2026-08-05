@@ -1,13 +1,14 @@
 use super::diagnostic::{SourceDiagnostic, sort_diagnostics};
 use super::lexer::{Token, TokenKind, lex, token_word};
 use super::syntax::{
-    AutorouteSyntax, BindingSyntax, BoardItemSyntax, BoardSyntax, ComponentItemSyntax,
-    ComponentKindSyntax, ComponentSyntax, ConnectionStateSyntax, DeclarationSyntax, DesignSyntax,
-    FootprintItemSyntax, FootprintSyntax, ModuleSyntax, NetSyntax, PartSyntax, PlacementSyntax,
-    PointSyntax, PortSyntax, QuantitySyntax, RectangleSyntax, RouteSyntax,
+    AutorouteSyntax, BindingSyntax, BoardItemSyntax, BoardSyntax, CatalogSnapshotSyntax,
+    ComponentItemSyntax, ComponentKindSyntax, ComponentSyntax, ConnectionStateSyntax,
+    DeclarationSyntax, DesignSyntax, FootprintItemSyntax, FootprintSyntax, LifecycleSyntax,
+    ManufacturabilityAssertionSyntax, ManufacturabilitySyntax, ModuleSyntax, NetSyntax, PartSyntax,
+    PlacementSyntax, PointSyntax, PortSyntax, QuantitySyntax, RectangleSyntax, RouteSyntax,
     SchematicPlacementSyntax, SimulationAnalysisKindSyntax, SimulationAnalysisSyntax,
-    SimulationAssertionSyntax, SimulationSampleSyntax, SourceFile, Span, Spanned, SymbolPinSyntax,
-    SymbolSyntax, SyntaxTree,
+    SimulationAssertionSyntax, SimulationSampleSyntax, SourceFile, SourcingSyntax, Span, Spanned,
+    SubstituteSyntax, SymbolPinSyntax, SymbolSyntax, SyntaxTree, VariantItemSyntax, VariantSyntax,
 };
 
 pub(crate) fn parse(source: SourceFile) -> Result<SyntaxTree, Vec<SourceDiagnostic>> {
@@ -107,6 +108,19 @@ impl Parser<'_> {
                 .parse_component(ComponentKindSyntax::DcSource)
                 .map(DeclarationSyntax::Component);
         }
+        if self.at_keyword("catalog_snapshot") {
+            return self
+                .parse_catalog_snapshot()
+                .map(DeclarationSyntax::CatalogSnapshot);
+        }
+        if self.at_keyword("variant") {
+            return self.parse_variant().map(DeclarationSyntax::Variant);
+        }
+        if self.at_keyword("manufacturability") {
+            return self
+                .parse_manufacturability()
+                .map(DeclarationSyntax::Manufacturability);
+        }
         if self.at_keyword("analysis") {
             return self
                 .parse_simulation_analysis()
@@ -123,6 +137,164 @@ impl Parser<'_> {
         self.unsupported("design declaration");
         self.recover_item();
         None
+    }
+
+    fn parse_catalog_snapshot(&mut self) -> Option<CatalogSnapshotSyntax> {
+        let start = self.take().span;
+        let id = self.expect_string("quoted catalog snapshot identifier")?;
+        self.require_keyword("sha256")?;
+        let sha256 = self.expect_string("quoted catalog snapshot SHA-256 digest")?;
+        self.require_keyword("evaluated_on")?;
+        let evaluated_on = self.expect_string("quoted catalog evaluation date")?;
+        let end = self.expect_semicolon()?;
+        Some(CatalogSnapshotSyntax {
+            id,
+            sha256,
+            evaluated_on,
+            span: start.through(end),
+        })
+    }
+
+    fn parse_variant(&mut self) -> Option<VariantSyntax> {
+        let start = self.take().span;
+        let path = self.expect_name("product variant semantic path")?;
+        self.require_keyword("build_quantity")?;
+        let build_quantity = self.expect_number("product variant build quantity integer")?;
+        if !self.expect_kind(TokenKind::LeftBrace, "`{` to open the product variant") {
+            self.recover_item();
+            return None;
+        }
+        let mut items = Vec::new();
+        while !self.at_kind(&TokenKind::RightBrace) && !self.at_end() {
+            let before = self.cursor;
+            let item = if self.at_keyword("fit") {
+                self.parse_variant_component(true)
+            } else if self.at_keyword("not_fitted") {
+                self.parse_variant_component(false)
+            } else if self.at_keyword("alternate") {
+                self.parse_variant_alternate()
+            } else if self.at_keyword("configure") {
+                self.parse_variant_configuration()
+            } else {
+                self.unsupported("product variant declaration");
+                self.recover_item();
+                None
+            };
+            if let Some(item) = item {
+                items.push(item);
+            }
+            if self.cursor == before {
+                self.advance();
+            }
+        }
+        let end = self.expect_closing_brace("product variant")?;
+        Some(VariantSyntax {
+            path,
+            build_quantity,
+            items,
+            span: start.through(end),
+        })
+    }
+
+    fn parse_variant_component(&mut self, fitted: bool) -> Option<VariantItemSyntax> {
+        let start = self.take().span;
+        let component_path = self.expect_name("variant component semantic path")?;
+        let end = self.expect_semicolon()?;
+        if fitted {
+            Some(VariantItemSyntax::Fit {
+                component_path,
+                span: start.through(end),
+            })
+        } else {
+            Some(VariantItemSyntax::NotFitted {
+                component_path,
+                span: start.through(end),
+            })
+        }
+    }
+
+    fn parse_variant_alternate(&mut self) -> Option<VariantItemSyntax> {
+        let start = self.take().span;
+        let component_path = self.expect_name("variant component semantic path")?;
+        self.require_keyword("manufacturer")?;
+        let manufacturer = self.expect_string("quoted alternate manufacturer identity")?;
+        self.require_keyword("number")?;
+        let manufacturer_part_number =
+            self.expect_string("quoted alternate manufacturer part number")?;
+        self.require_keyword("package")?;
+        let package = self.expect_string("quoted alternate package identity")?;
+        let end = self.expect_semicolon()?;
+        Some(VariantItemSyntax::Alternate {
+            component_path,
+            manufacturer,
+            manufacturer_part_number,
+            package,
+            span: start.through(end),
+        })
+    }
+
+    fn parse_variant_configuration(&mut self) -> Option<VariantItemSyntax> {
+        let start = self.take().span;
+        let key = self.expect_name("product configuration key")?;
+        let value = self.expect_string("quoted product configuration value")?;
+        let end = self.expect_semicolon()?;
+        Some(VariantItemSyntax::Configure {
+            key,
+            value,
+            span: start.through(end),
+        })
+    }
+
+    fn parse_manufacturability(&mut self) -> Option<ManufacturabilitySyntax> {
+        let start = self.take().span;
+        let path = self.expect_name("manufacturability analysis semantic path")?;
+        self.require_keyword("adapter")?;
+        let adapter = self.expect_string("quoted manufacturability adapter identity")?;
+        self.require_keyword("version")?;
+        let version = self.expect_string("quoted manufacturability adapter version")?;
+        if !self.expect_kind(
+            TokenKind::LeftBrace,
+            "`{` to open the manufacturability analysis",
+        ) {
+            self.recover_item();
+            return None;
+        }
+        let mut assertions = Vec::new();
+        while !self.at_kind(&TokenKind::RightBrace) && !self.at_end() {
+            let before = self.cursor;
+            if self.at_keyword("assert") {
+                if let Some(assertion) = self.parse_manufacturability_assertion() {
+                    assertions.push(assertion);
+                }
+            } else {
+                self.unsupported("manufacturability analysis declaration");
+                self.recover_item();
+            }
+            if self.cursor == before {
+                self.advance();
+            }
+        }
+        let end = self.expect_closing_brace("manufacturability analysis")?;
+        Some(ManufacturabilitySyntax {
+            path,
+            adapter,
+            version,
+            assertions,
+            span: start.through(end),
+        })
+    }
+
+    fn parse_manufacturability_assertion(&mut self) -> Option<ManufacturabilityAssertionSyntax> {
+        let start = self.take().span;
+        let path = self.expect_name("manufacturability assertion semantic path")?;
+        self.require_keyword("capability")?;
+        let capability = self.expect_name("manufacturability capability")?;
+        let end = self.expect_semicolon()?;
+        Some(ManufacturabilityAssertionSyntax {
+            path,
+            capability,
+            span: start.through(end),
+        })
     }
 
     fn parse_simulation_analysis(&mut self) -> Option<SimulationAnalysisSyntax> {
@@ -325,6 +497,12 @@ impl Parser<'_> {
             let before = self.cursor;
             let item = if self.at_keyword("part") {
                 self.parse_part().map(ComponentItemSyntax::Part)
+            } else if self.at_keyword("lifecycle") {
+                self.parse_lifecycle().map(ComponentItemSyntax::Lifecycle)
+            } else if self.at_keyword("sourcing") {
+                self.parse_sourcing().map(ComponentItemSyntax::Sourcing)
+            } else if self.at_keyword("substitute") {
+                self.parse_substitute().map(ComponentItemSyntax::Substitute)
             } else if self.at_keyword("symbol") {
                 self.parse_symbol().map(ComponentItemSyntax::Symbol)
             } else if self.at_keyword("model") {
@@ -366,22 +544,70 @@ impl Parser<'_> {
 
     fn parse_part(&mut self) -> Option<PartSyntax> {
         let start = self.take().span;
-        let logical_device = self.expect_string("quoted logical device identity")?;
-        let (manufacturer, manufacturer_part_number) = if self.at_keyword("virtual") {
+        let logical_function = self.expect_string("quoted logical function identity")?;
+        let (manufacturer, manufacturer_part_number, package) = if self.at_keyword("virtual") {
             self.advance();
-            (None, None)
+            (None, None, None)
         } else {
             self.require_keyword("manufacturer")?;
             let manufacturer = self.expect_string("quoted manufacturer identity")?;
             self.require_keyword("number")?;
             let number = self.expect_string("quoted manufacturer part number")?;
-            (Some(manufacturer), Some(number))
+            self.require_keyword("package")?;
+            let package = self.expect_string("quoted physical package identity")?;
+            (Some(manufacturer), Some(number), Some(package))
         };
         let end = self.expect_semicolon()?;
         Some(PartSyntax {
-            logical_device,
+            logical_function,
             manufacturer,
             manufacturer_part_number,
+            package,
+            span: start.through(end),
+        })
+    }
+
+    fn parse_lifecycle(&mut self) -> Option<LifecycleSyntax> {
+        let start = self.take().span;
+        let status = self.expect_name("component lifecycle status")?;
+        let end = self.expect_semicolon()?;
+        Some(LifecycleSyntax {
+            status,
+            span: start.through(end),
+        })
+    }
+
+    fn parse_sourcing(&mut self) -> Option<SourcingSyntax> {
+        let start = self.take().span;
+        self.require_keyword("minimum_available")?;
+        let minimum_available = self.expect_number("minimum available integer quantity")?;
+        self.require_keyword("maximum_lead_time_days")?;
+        let maximum_lead_time_days = self.expect_number("maximum lead time integer days")?;
+        self.require_keyword("region")?;
+        let region = self.expect_string("quoted sourcing region")?;
+        let end = self.expect_semicolon()?;
+        Some(SourcingSyntax {
+            minimum_available,
+            maximum_lead_time_days,
+            region,
+            span: start.through(end),
+        })
+    }
+
+    fn parse_substitute(&mut self) -> Option<SubstituteSyntax> {
+        let start = self.take().span;
+        self.require_keyword("manufacturer")?;
+        let manufacturer = self.expect_string("quoted substitute manufacturer identity")?;
+        self.require_keyword("number")?;
+        let manufacturer_part_number =
+            self.expect_string("quoted substitute manufacturer part number")?;
+        self.require_keyword("package")?;
+        let package = self.expect_string("quoted substitute package identity")?;
+        let end = self.expect_semicolon()?;
+        Some(SubstituteSyntax {
+            manufacturer,
+            manufacturer_part_number,
+            package,
             span: start.through(end),
         })
     }
@@ -878,7 +1104,7 @@ impl Parser<'_> {
 #[cfg(test)]
 mod tests {
     use super::{Parser, lex, parse};
-    use crate::frontend::syntax::{DeclarationSyntax, SourceFile};
+    use crate::frontend::syntax::{ComponentItemSyntax, DeclarationSyntax, SourceFile};
 
     #[test]
     fn parses_minimal_design() {
@@ -1073,5 +1299,99 @@ mod tests {
             );
             assert_eq!(diagnostic.semantic_path.as_deref(), Some(path));
         }
+    }
+
+    #[test]
+    fn parses_product_and_manufacturing_intent_without_compatibility_forms() {
+        let text = r#"design d {
+  catalog_snapshot "catalog-2026-08-04" sha256 "0123456789abcdef" evaluated_on "2026-08-04";
+  resistor root.r R1 {
+    part "resistor" manufacturer "Yageo" number "RC0603" package "0603";
+    lifecycle not_recommended_for_new_designs;
+    sourcing minimum_available 100 maximum_lead_time_days 30 region "US";
+    substitute manufacturer "Panasonic" number "ERJ3" package "0603";
+  }
+  variant product.us build_quantity 25 {
+    fit root.r;
+    not_fitted root.optional;
+    alternate root.r manufacturer "Panasonic" number "ERJ3" package "0603";
+    configure finish "lead_free";
+  }
+  manufacturability release.dfm adapter "factory-check" version "1.2.3" {
+    assert release.dfm.erc capability erc_clean;
+    assert release.dfm.inventory capability fabrication_inventory_complete;
+  }
+}"#;
+        let tree = parse(SourceFile::new("product.circuitc", text))
+            .expect("all product and manufacturability forms must parse");
+        assert_eq!(tree.design.declarations.len(), 4);
+
+        let DeclarationSyntax::CatalogSnapshot(snapshot) = &tree.design.declarations[0] else {
+            panic!("first declaration must be catalog evidence");
+        };
+        assert_eq!(snapshot.id.value, "catalog-2026-08-04");
+        assert_eq!(snapshot.evaluated_on.value, "2026-08-04");
+
+        let DeclarationSyntax::Component(component) = &tree.design.declarations[1] else {
+            panic!("second declaration must be a component");
+        };
+        assert!(matches!(
+            &component.items[0],
+            ComponentItemSyntax::Part(part)
+                if part.logical_function.value == "resistor"
+                    && part.package.as_ref().map(|value| value.value.as_str()) == Some("0603")
+        ));
+        assert!(matches!(
+            &component.items[1],
+            ComponentItemSyntax::Lifecycle(lifecycle)
+                if lifecycle.status.value == "not_recommended_for_new_designs"
+        ));
+        assert!(matches!(
+            &component.items[2],
+            ComponentItemSyntax::Sourcing(sourcing)
+                if sourcing.minimum_available.value == "100"
+                    && sourcing.maximum_lead_time_days.value == "30"
+        ));
+        assert!(matches!(
+            &component.items[3],
+            ComponentItemSyntax::Substitute(substitute)
+                if substitute.manufacturer.value == "Panasonic"
+        ));
+
+        let DeclarationSyntax::Variant(variant) = &tree.design.declarations[2] else {
+            panic!("third declaration must be a variant");
+        };
+        assert_eq!(variant.path.value, "product.us");
+        assert_eq!(variant.build_quantity.value, "25");
+        assert_eq!(variant.items.len(), 4);
+
+        let DeclarationSyntax::Manufacturability(analysis) = &tree.design.declarations[3] else {
+            panic!("fourth declaration must be a manufacturability analysis");
+        };
+        assert_eq!(analysis.path.value, "release.dfm");
+        assert_eq!(analysis.assertions.len(), 2);
+        assert_eq!(
+            analysis.assertions[1].capability.value,
+            "fabrication_inventory_complete"
+        );
+    }
+
+    #[test]
+    fn physical_part_requires_an_explicit_package_at_the_source_boundary() {
+        let text = "design d { resistor root.r R1 { part \"resistor\" manufacturer \"Yageo\" number \"RC0603\"; } }";
+        let diagnostics = parse(SourceFile::new("legacy-part.circuitc", text))
+            .expect_err("the previous package-less physical part form must not parse");
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == "CC-LANG-PARSE-001"
+                    && diagnostic.message.contains("keyword `package`")
+            })
+            .unwrap_or_else(|| panic!("missing package diagnostic: {diagnostics:#?}"));
+        let semicolon = text.find(';').expect("fixture contains a semicolon");
+        assert_eq!(
+            (diagnostic.start, diagnostic.end),
+            (semicolon, semicolon + 1)
+        );
     }
 }

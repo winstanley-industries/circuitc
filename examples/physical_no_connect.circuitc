@@ -18,7 +18,9 @@ design physical_no_connect {
   }
 
   resistor board_only.unused R1 {
-    part "resistor" manufacturer "Yageo" number "RC0603FR-0710KL";
+    part "resistor" manufacturer "Yageo" number "RC0603FR-0710KL" package "0603_1608Metric";
+    lifecycle active;
+    sourcing minimum_available 1 maximum_lead_time_days 365 region "global";
     symbol "CircuitC:R" {
       bind 1 1 passive;
       bind 2 2 passive;
@@ -34,7 +36,9 @@ design physical_no_connect {
   }
 
   resistor board_only.load R2 {
-    part "resistor" manufacturer "Yageo" number "RC0603FR-0710KL";
+    part "resistor" manufacturer "Yageo" number "RC0603FR-0710KL" package "0603_1608Metric";
+    lifecycle active;
+    sourcing minimum_available 1 maximum_lead_time_days 365 region "global";
     symbol "CircuitC:R" {
       bind 1 1 passive;
       bind 2 2 passive;
@@ -49,6 +53,14 @@ design physical_no_connect {
       bind 1 1;
       bind 2 2;
     }
+  }
+
+  catalog_snapshot "layer1-contract-fixture" sha256 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" evaluated_on "2026-08-04";
+
+  variant production build_quantity 1 {
+    fit board_only.unused;
+    fit board_only.load;
+    configure assembly_revision "A";
   }
 
   board {

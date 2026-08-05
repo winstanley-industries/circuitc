@@ -130,6 +130,9 @@ pub(crate) enum DeclarationSyntax {
     Net(NetSyntax),
     Module(ModuleSyntax),
     Component(ComponentSyntax),
+    CatalogSnapshot(CatalogSnapshotSyntax),
+    Variant(VariantSyntax),
+    Manufacturability(ManufacturabilitySyntax),
     SimulationAnalysis(SimulationAnalysisSyntax),
     SimulationAssertion(SimulationAssertionSyntax),
     Board(BoardSyntax),
@@ -182,6 +185,9 @@ pub(crate) struct ComponentSyntax {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ComponentItemSyntax {
     Part(PartSyntax),
+    Lifecycle(LifecycleSyntax),
+    Sourcing(SourcingSyntax),
+    Substitute(SubstituteSyntax),
     Symbol(SymbolSyntax),
     Model {
         library_id: Spanned<String>,
@@ -211,9 +217,88 @@ pub(crate) enum ComponentItemSyntax {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PartSyntax {
-    pub logical_device: Spanned<String>,
+    pub logical_function: Spanned<String>,
     pub manufacturer: Option<Spanned<String>>,
     pub manufacturer_part_number: Option<Spanned<String>>,
+    pub package: Option<Spanned<String>>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LifecycleSyntax {
+    pub status: Spanned<String>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SourcingSyntax {
+    pub minimum_available: Spanned<String>,
+    pub maximum_lead_time_days: Spanned<String>,
+    pub region: Spanned<String>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SubstituteSyntax {
+    pub manufacturer: Spanned<String>,
+    pub manufacturer_part_number: Spanned<String>,
+    pub package: Spanned<String>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CatalogSnapshotSyntax {
+    pub id: Spanned<String>,
+    pub sha256: Spanned<String>,
+    pub evaluated_on: Spanned<String>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct VariantSyntax {
+    pub path: Spanned<String>,
+    pub build_quantity: Spanned<String>,
+    pub items: Vec<VariantItemSyntax>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum VariantItemSyntax {
+    Fit {
+        component_path: Spanned<String>,
+        span: Span,
+    },
+    NotFitted {
+        component_path: Spanned<String>,
+        span: Span,
+    },
+    Alternate {
+        component_path: Spanned<String>,
+        manufacturer: Spanned<String>,
+        manufacturer_part_number: Spanned<String>,
+        package: Spanned<String>,
+        span: Span,
+    },
+    Configure {
+        key: Spanned<String>,
+        value: Spanned<String>,
+        span: Span,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ManufacturabilitySyntax {
+    pub path: Spanned<String>,
+    pub adapter: Spanned<String>,
+    pub version: Spanned<String>,
+    pub assertions: Vec<ManufacturabilityAssertionSyntax>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ManufacturabilityAssertionSyntax {
+    pub path: Spanned<String>,
+    pub capability: Spanned<String>,
     pub span: Span,
 }
 

@@ -22,6 +22,61 @@ trace every artifact back to source, constraints, and toolchains.
 | `CC-REQ-PROD-006` | A release manifest binds source identity, Design IR identity, generated artifacts, backend versions, validation reports, and checksums. |
 | `CC-REQ-PROD-007` | Release generation fails on stale, inconsistent, unsupported, or unvalidated product and manufacturing intent. |
 
+## Initial capability boundary
+
+[ADR-0008](../adr/0008-product-intent-and-pinned-catalog-evidence.md) defines
+the first product-intent boundary while this epic remains Planned. The active
+unreleased Design IR evolves in place at version 1; no version bump, migration,
+or compatibility adapter is introduced.
+
+- `PartIdentity.logical_device` becomes `logical_function`.
+- Every physical part separately authors manufacturer, manufacturer part
+  number, package, a lifecycle requirement, sourcing constraints, and exact
+  approved substitutions. Lifecycle requirement is one of `active`,
+  `not_recommended_for_new_designs`, or `obsolete`. Sourcing requires positive
+  `u64` minimum available quantity, positive `u32` maximum lead-time days, and
+  a canonical required-region token. Approved substitutions are sorted,
+  unique exact manufacturer, manufacturer-part-number, and package tuples,
+  with at most 256 entries per part. Every approved substitution package must
+  exactly equal the primary package, and the exact primary tuple is invalid as
+  a self-substitution. A later authenticated catalog layer, not this initial
+  product-intent layer, proves logical-function and authored-value
+  compatibility.
+- Virtual parts retain logical function and omit manufacturer, manufacturer
+  part number, package, lifecycle, sourcing, and substitution fields.
+- Every Design has `ProductIntent`: an optional catalog-evidence reference,
+  variants, and manufacturability analyses. A design containing a physical
+  component requires the evidence reference and at least one variant.
+- The evidence reference contains a canonical snapshot ID, the SHA-256 digest
+  of the exact future snapshot-contract bytes, and an authored, calendar-valid
+  `YYYY-MM-DD` evaluation date. Remote observations stay outside Design IR.
+  Freshness is evaluated from authenticated authored data and policy, never
+  wall-clock time or a network lookup during the build.
+- Every variant has a unique path, a positive `u64` build quantity, exactly one
+  fitted, not-fitted, or exact approved-alternate state for every physical
+  component, and unique canonically ordered configuration key/value pairs.
+  A Design has at most 256 variants, each with at most 256 configurations.
+  Configuration keys contain at most 128 UTF-8 bytes and values at most 4096
+  UTF-8 bytes. The checked sum of physical-component-count times variant-count
+  totality work and all submitted component assignments is bounded at 10,000.
+- The initial manufacturability intent permits only adapter `kicad`, major
+  version `10`, with stable assertions over `erc_clean`, `drc_clean`,
+  `unconnected_clean`, `schematic_parity_clean`, and
+  `fabrication_inventory_complete`. A Design has at most 256 analyses and at
+  most 10,000 assertions in aggregate.
+
+Collection counts, checked aggregate workloads, and UTF-8 byte ceilings are
+fail-closed preflight checks. Oversized intent is rejected before expanded
+membership, totality, per-entry semantic, or cross-entry validation and is
+never truncated or partially accepted.
+
+This capability boundary establishes authored intent only. Catalog snapshot
+bytes and verification, BOM/placement/assembly schemas, fabrication export,
+normalized KiCad manufacturing results and reports, release-manifest closure,
+and transactional release publication require later implementation layers and
+ADRs. Parsing, elaboration, and Design IR validation of these forms are not
+manufacturing execution or completion evidence for this epic.
+
 ## Non-goals
 
 - Operating a live procurement marketplace.

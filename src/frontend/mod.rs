@@ -275,7 +275,9 @@ mod tests {
   module root {}
   module root.x {}
   resistor root.x R1 {
-    part "resistor" manufacturer "Yageo" number "RC0603FR-0710KL";
+    part "resistor" manufacturer "Yageo" number "RC0603FR-0710KL" package "0603_1608Metric";
+    lifecycle active;
+    sourcing minimum_available 1 maximum_lead_time_days 365 region "global";
     symbol "CircuitC:R" {
       bind 1 1 passive;
       bind 2 2 passive;
@@ -303,6 +305,10 @@ mod tests {
     terminals p n;
     connect p N;
     connect n GND;
+  }
+  catalog_snapshot "layer1-contract-fixture" sha256 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" evaluated_on "2026-08-04";
+  variant production build_quantity 1 {
+    fit root.x;
   }
   board {
     rectangle at (0 mm, 0 mm) size (10 mm, 10 mm);
@@ -340,7 +346,9 @@ mod tests {
                 "  board {",
                 concat!(
                     "  resistor root.r R1 {\n",
-                    "    part \"resistor\" manufacturer \"Yageo\" number \"RC0603FR-0710KL\";\n",
+                    "    part \"resistor\" manufacturer \"Yageo\" number \"RC0603FR-0710KL\" package \"0603_1608Metric\";\n",
+                    "    lifecycle active;\n",
+                    "    sourcing minimum_available 1 maximum_lead_time_days 365 region \"global\";\n",
                     "    symbol \"CircuitC:R\" {\n",
                     "      bind 1 1 passive;\n",
                     "      bind 2 2 passive;\n",
@@ -353,6 +361,10 @@ mod tests {
                     "      bind 1 1;\n",
                     "      bind 2 2;\n",
                     "    }\n",
+                    "  }\n",
+                    "  catalog_snapshot \"layer1-contract-fixture\" sha256 \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\" evaluated_on \"2026-08-04\";\n",
+                    "  variant production build_quantity 1 {\n",
+                    "    fit root.r;\n",
                     "  }\n",
                     "  board {",
                 ),

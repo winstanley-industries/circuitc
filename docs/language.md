@@ -2,10 +2,13 @@
 
 ## Status and authority
 
-This document defines the active, unreleased CircuitC grammar. It covers the
-current reference circuit, simulation-closure semantics, and initial planar
-routing intent. The grammar may evolve in place before the first language
-release; there is no version declaration or compatibility machinery yet.
+This document defines the active, unreleased CircuitC grammar, including the M4
+product-intent extension. It covers the current reference circuit,
+simulation-closure semantics, initial planar routing intent, and the product
+forms below. Parsing and elaboration of product intent do not claim that
+manufacturing or release backends exist. The grammar may evolve in place
+before the first language release; there is no version declaration or
+compatibility machinery yet.
 
 CircuitC source is authoritative. Parsing and elaboration produce the canonical
 Design IR, and only the existing compiler boundary may lower that IR to KiCad or
@@ -39,6 +42,9 @@ declaration := ("net" | "ground") name ";"
              | component
              | analysis
              | assertion
+             | catalog_snapshot
+             | variant
+             | manufacturability
              | board
 
 module      := "module" path "{" port* "}"
@@ -50,8 +56,17 @@ component   := ("resistor" | "dc_source") path reference
                "{" component_item* "}"
 component_item := part | symbol | model | schematic_position
                 | value | terminals | connection | no_connect | footprint
+                | lifecycle | sourcing | substitute
 part        := "part" string
-               ("manufacturer" string "number" string | "virtual") ";"
+               ("manufacturer" string "number" string "package" string
+                | "virtual") ";"
+lifecycle   := "lifecycle"
+               ("active" | "not_recommended_for_new_designs" | "obsolete") ";"
+sourcing    := "sourcing" "minimum_available" integer
+               "maximum_lead_time_days" integer
+               "region" string ";"
+substitute  := "substitute" "manufacturer" string "number" string
+               "package" string ";"
 symbol      := "symbol" string "{" symbol_pin* "}"
 symbol_pin  := "bind" pin symbol_pin_number electrical_type ";"
 model       := "model" string ";"
@@ -101,7 +116,78 @@ voltage     := decimal "V"
 angle       := decimal "deg"
 ratio       := decimal "ratio"
 boolean     := "true" | "false"
+
+catalog_snapshot := "catalog_snapshot" string "sha256" string
+                    "evaluated_on" string ";"
+
+variant     := "variant" path "build_quantity" integer
+               "{" variant_item* "}"
+variant_item := "fit" path ";"
+              | "not_fitted" path ";"
+              | "alternate" path "manufacturer" string "number" string
+                "package" string ";"
+              | "configure" name string ";"
+
+manufacturability := "manufacturability" path "adapter" string
+                      "version" string
+                      "{" manufacturability_assertion* "}"
+manufacturability_assertion := "assert" path "capability"
+                                ("erc_clean" | "drc_clean"
+                                 | "unconnected_clean"
+                                 | "schematic_parity_clean"
+                                 | "fabrication_inventory_complete") ";"
 ```
+
+The component-kind string in `part` is the canonical `logical_function`.
+Physical parts require the manufacturer, number, and package branch plus
+exactly one `lifecycle` and one `sourcing` item. Their sourcing integers must
+fit their Design IR types and be strictly positive. Region, configuration keys,
+snapshot IDs, and semantic paths validate as canonical tokens; package and
+configuration values validate as non-empty canonical text. A physical part
+may contain zero or more exact `substitute` items; they canonicalize by
+manufacturer, manufacturer part number, and package and duplicates are
+invalid. At most 256 substitutes may be declared for one part. Every
+substitute must have exactly the primary part's package, and the exact primary
+manufacturer, manufacturer-part-number, and package tuple is invalid as a
+self-substitution. Package equality does not prove logical-function or value
+compatibility; a later authenticated catalog-evidence layer must prove both.
+Virtual parts reject `lifecycle`, `sourcing`, `substitute`, and package fields.
+
+A physical design has exactly one `catalog_snapshot` declaration and at least
+one variant. The snapshot SHA-256 is exactly 64 lowercase hexadecimal
+characters, and `evaluated_on` is a calendar-valid `YYYY-MM-DD` date. The date
+is authored input: validation and future freshness policy may not consult the
+host clock. The snapshot declaration binds future pinned evidence but does not
+perform a network lookup or embed remote observations in Design IR.
+
+Every variant path is unique and its build quantity is a positive `u64`.
+Exactly one `component` item names every physical component and no item names a
+virtual component. `fitted` selects the primary part, `not_fitted` excludes it,
+and `alternate` must exactly equal an approved substitution declared on that
+component. Configuration keys are unique, key/value pairs are canonicalized,
+and declaration order does not affect Design IR equality.
+
+A Design declares at most 256 variants. Each variant has at most 256
+configuration entries; a configuration key has at most 128 UTF-8 bytes and a
+configuration value has at most 4096 UTF-8 bytes. The checked sum of the
+physical-component-count times variant-count totality workload and all
+submitted component assignments is limited to 10,000. These limits bound both
+complete and malformed variant inputs.
+
+Manufacturability paths and their assertion paths are stable identities. The
+initial capability accepts only adapter `kicad`, major version `10`, and the
+five listed assertion kinds. Assertion paths are globally unique, and each
+analysis may request one assertion of each kind. These declarations express
+requested intent only. They do not run KiCad manufacturing export, produce
+normalized analysis evidence, bind a release manifest, or publish a
+manufacturing release; those operations require later EPIC-0005 contracts and
+implementation.
+
+A Design declares at most 256 manufacturability analyses and at most 10,000
+assertions in aggregate. Collection counts, aggregate workloads, and UTF-8
+byte lengths are preflighted before expanded membership, totality, per-entry
+semantic, or cross-entry validation. Oversized product intent fails closed;
+it is never truncated or partially validated.
 
 A resistor value uses `ohm` or `kohm`. A DC source value uses `V`. Lengths must
 convert to an exact integer number of nanometres. The frontend rejects
@@ -220,11 +306,13 @@ artifacts.
 Each component has exactly one part, symbol, schematic position, and
 kind-appropriate value, plus at most one footprint. `model` and `terminals` are
 an optional pair: omitting both authors a physical-only component, while
-supplying exactly one is an error. A physical part names a manufacturer and
-manufacturer part number; a non-physical part is explicitly `virtual`. The
-logical device, manufacturer, manufacturer part number, symbol, and optional
-footprint must resolve as one coherent vendored catalog entry. Footprint pad
-geometry is ingested from that catalog rather than copied into source.
+supplying exactly one is an error. A physical part names a manufacturer,
+manufacturer part number, and package and carries explicit lifecycle, sourcing,
+and approved-substitution intent; a non-physical part is explicitly `virtual`
+and omits those physical product fields. The logical function, manufacturer,
+manufacturer part number, symbol, and optional footprint must resolve as one
+coherent vendored catalog entry. Footprint pad geometry is ingested from that
+catalog rather than copied into source.
 For the initial KiCad catalog, each bound symbol pin number must equal its
 corresponding footprint pad number. A cross-mapped but otherwise valid Design
 IR is rejected by the KiCad backend until the catalog grows an explicit
@@ -240,10 +328,12 @@ lowering emits a deterministic backend-only `unconnected-(<ref>-Pad<pad>)` net
 for the corresponding pad so the host parity checker sees the intended open.
 
 Declarations are resolved by identity rather than order. Net, module, port,
-component, symbol-pin binding, footprint binding, placement, and route
-collections are canonicalized before the Design IR is exposed. The optional
-autoroute request retains its semantic identity independent of declaration
-order. Every simulated design has exactly one `ground` declaration.
+component, symbol-pin binding, footprint binding, placement, route,
+substitution, variant, configuration, manufacturability-analysis, and
+manufacturability-assertion collections are canonicalized before the Design IR
+is exposed. The optional autoroute request and catalog-evidence reference
+retain semantic identity independent of declaration order. Every simulated
+design has exactly one `ground` declaration.
 
 ## CLI and exit status
 

@@ -15,7 +15,10 @@ design checked_voltage_divider {
   }
 
   resistor divider.r_top R1 {
-    part "resistor" manufacturer "Yageo" number "RC0603FR-0710KL";
+    part "resistor" manufacturer "Yageo" number "RC0603FR-0710KL" package "0603_1608Metric";
+    lifecycle active;
+    sourcing minimum_available 1 maximum_lead_time_days 365 region "global";
+    substitute manufacturer "Panasonic" number "ERJ-3EKF1002V" package "0603_1608Metric";
     symbol "CircuitC:R" {
       bind 1 1 passive;
       bind 2 2 passive;
@@ -33,7 +36,10 @@ design checked_voltage_divider {
   }
 
   resistor divider.r_bottom R2 {
-    part "resistor" manufacturer "Yageo" number "RC0603FR-0710KL";
+    part "resistor" manufacturer "Yageo" number "RC0603FR-0710KL" package "0603_1608Metric";
+    lifecycle active;
+    sourcing minimum_available 1 maximum_lead_time_days 365 region "global";
+    substitute manufacturer "Panasonic" number "ERJ-3EKF1002V" package "0603_1608Metric";
     symbol "CircuitC:R" {
       bind 1 1 passive;
       bind 2 2 passive;
@@ -62,6 +68,28 @@ design checked_voltage_divider {
     terminals p n;
     connect p VIN;
     connect n GND;
+  }
+
+  catalog_snapshot "layer1-contract-fixture" sha256 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" evaluated_on "2026-08-04";
+
+  variant production build_quantity 10 {
+    fit divider.r_top;
+    fit divider.r_bottom;
+    configure assembly_revision "A";
+  }
+
+  variant prototype_alternate build_quantity 2 {
+    alternate divider.r_top manufacturer "Panasonic" number "ERJ-3EKF1002V" package "0603_1608Metric";
+    not_fitted divider.r_bottom;
+    configure assembly_revision "PROTO-ALT";
+  }
+
+  manufacturability release.manufacturability adapter "kicad" version "10" {
+    assert release.manufacturability.erc capability erc_clean;
+    assert release.manufacturability.drc capability drc_clean;
+    assert release.manufacturability.unconnected capability unconnected_clean;
+    assert release.manufacturability.parity capability schematic_parity_clean;
+    assert release.manufacturability.fabrication capability fabrication_inventory_complete;
   }
 
   analysis dc_operating_point simulation.dc;

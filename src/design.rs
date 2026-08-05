@@ -15,6 +15,22 @@ pub const MAX_SIMULATION_ASSERTIONS: usize = 10_000;
 pub const MAX_SIMULATION_SAMPLES: u32 = 10_000;
 /// Maximum aggregate declared nominal samples across all analyses.
 pub const MAX_SIMULATION_TOTAL_SAMPLES: u32 = 10_000;
+/// Maximum number of product variants in one Design.
+pub const MAX_PRODUCT_VARIANTS: usize = 256;
+/// Maximum aggregate variant-assignment and totality-validation work.
+pub const MAX_PRODUCT_VARIANT_WORK: usize = 10_000;
+/// Maximum number of product configuration entries in one variant.
+pub const MAX_PRODUCT_CONFIGURATIONS: usize = 256;
+/// Maximum UTF-8 byte length of one product configuration key.
+pub const MAX_PRODUCT_CONFIGURATION_KEY_BYTES: usize = 128;
+/// Maximum UTF-8 byte length of one product configuration value.
+pub const MAX_PRODUCT_CONFIGURATION_VALUE_BYTES: usize = 4_096;
+/// Maximum number of exact approved substitutions on one physical part.
+pub const MAX_PRODUCT_SUBSTITUTIONS: usize = 256;
+/// Maximum number of manufacturability analyses in one Design.
+pub const MAX_MANUFACTURABILITY_ANALYSES: usize = 256;
+/// Maximum aggregate number of manufacturability assertions in one Design.
+pub const MAX_MANUFACTURABILITY_ASSERTIONS: usize = 10_000;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct PointNm {
@@ -126,9 +142,34 @@ pub struct ModuleInstance {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PartIdentity {
-    pub logical_device: String,
+    pub logical_function: String,
     pub manufacturer: Option<String>,
     pub manufacturer_part_number: Option<String>,
+    pub package: Option<String>,
+    pub lifecycle: Option<LifecycleStatus>,
+    pub sourcing: Option<SourcingConstraints>,
+    pub approved_substitutions: Vec<ApprovedSubstitution>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum LifecycleStatus {
+    Active,
+    NotRecommendedForNewDesigns,
+    Obsolete,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct SourcingConstraints {
+    pub minimum_available_quantity: u64,
+    pub maximum_lead_time_days: u32,
+    pub required_region: String,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ApprovedSubstitution {
+    pub manufacturer: String,
+    pub manufacturer_part_number: String,
+    pub package: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -379,6 +420,70 @@ pub struct Board {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductIntent {
+    pub catalog: Option<CatalogEvidenceRef>,
+    pub variants: Vec<ProductVariant>,
+    pub manufacturability_analyses: Vec<ManufacturabilityAnalysis>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogEvidenceRef {
+    pub snapshot_id: String,
+    pub sha256: String,
+    pub evaluated_on: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductVariant {
+    pub path: String,
+    pub build_quantity: u64,
+    pub components: Vec<VariantComponent>,
+    pub configurations: Vec<ProductConfiguration>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VariantComponent {
+    pub component_path: String,
+    pub state: PopulationState,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum PopulationState {
+    Fitted,
+    NotFitted,
+    Alternate(ApprovedSubstitution),
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ProductConfiguration {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManufacturabilityAnalysis {
+    pub path: String,
+    pub adapter: String,
+    pub version: String,
+    pub assertions: Vec<ManufacturabilityAssertion>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ManufacturabilityAssertion {
+    pub path: String,
+    pub capability: ManufacturabilityCapability,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ManufacturabilityCapability {
+    ErcClean,
+    DrcClean,
+    UnconnectedClean,
+    SchematicParityClean,
+    FabricationInventoryComplete,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Design {
     pub schema_version: u32,
     pub name: String,
@@ -388,6 +493,7 @@ pub struct Design {
     pub analyses: Vec<SimulationAnalysis>,
     pub assertions: Vec<SimulationAssertion>,
     pub board: Board,
+    pub product: ProductIntent,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -431,6 +537,9 @@ impl Design {
             ))
         });
         for component in &mut self.components {
+            if component.part.approved_substitutions.len() <= MAX_PRODUCT_SUBSTITUTIONS {
+                component.part.approved_substitutions.sort();
+            }
             match &mut component.value {
                 ComponentValue::Resistance(resistance) => {
                     *resistance = resistance.canonicalized();
@@ -486,6 +595,34 @@ impl Design {
         self.board
             .routing_requests
             .sort_by(|left, right| left.path.cmp(&right.path));
+        let physical_component_count = self
+            .components
+            .iter()
+            .filter(|component| is_physical_part(component))
+            .count();
+        if product_variant_resources_are_bounded(&self.product.variants, physical_component_count) {
+            for variant in &mut self.product.variants {
+                variant.components.sort_by(|left, right| {
+                    (&left.component_path, &left.state).cmp(&(&right.component_path, &right.state))
+                });
+                variant.configurations.sort();
+            }
+            self.product
+                .variants
+                .sort_by(|left, right| left.path.cmp(&right.path));
+        }
+        if self.product.manufacturability_analyses.len() <= MAX_MANUFACTURABILITY_ANALYSES {
+            let assertion_count =
+                manufacturability_assertion_count(&self.product.manufacturability_analyses);
+            if assertion_count.is_some_and(|count| count <= MAX_MANUFACTURABILITY_ASSERTIONS) {
+                for analysis in &mut self.product.manufacturability_analyses {
+                    analysis.assertions.sort();
+                }
+                self.product
+                    .manufacturability_analyses
+                    .sort_by(|left, right| left.path.cmp(&right.path));
+            }
+        }
     }
 
     pub fn validate(&self) -> Result<(), Vec<Diagnostic>> {
@@ -650,6 +787,7 @@ impl Design {
             &net_names,
             &mut diagnostics,
         );
+        validate_product_intent(&self.product, &self.components, &mut diagnostics);
         let mut schematic_positions = BTreeMap::new();
         let mut schematic_components: Vec<_> = self.components.iter().collect();
         schematic_components.sort_by(|left, right| left.path.cmp(&right.path));
@@ -1956,39 +2094,7 @@ fn validate_component<'a>(
             "component must have a physical implementation, a simulation model, or both",
         );
     }
-    if component.part.logical_device.trim().is_empty()
-        || component.part.logical_device.chars().any(char::is_control)
-    {
-        push(
-            diagnostics,
-            "CC-PART-001",
-            path,
-            "logical device identity must be non-empty and contain no control characters",
-        );
-    }
-    match (
-        &component.part.manufacturer,
-        &component.part.manufacturer_part_number,
-    ) {
-        (Some(manufacturer), Some(number))
-            if !manufacturer.trim().is_empty()
-                && !number.trim().is_empty()
-                && !manufacturer.chars().any(char::is_control)
-                && !number.chars().any(char::is_control) => {}
-        (None, None) if component.physical.is_none() => {}
-        (None, None) => push(
-            diagnostics,
-            "CC-PART-002",
-            path,
-            "physical component requires manufacturer and manufacturer part number",
-        ),
-        _ => push(
-            diagnostics,
-            "CC-PART-003",
-            path,
-            "manufacturer and manufacturer part number must be supplied together",
-        ),
-    }
+    validate_part_identity(component, path, diagnostics);
 
     if component.symbol.library_id.trim().is_empty()
         || component.symbol.library_id.chars().any(char::is_control)
@@ -2122,6 +2228,558 @@ fn validate_component<'a>(
     }
 }
 
+fn is_physical_part(component: &Component) -> bool {
+    component.part.manufacturer.is_some()
+}
+
+fn validate_part_identity(component: &Component, path: &str, diagnostics: &mut Vec<Diagnostic>) {
+    let part = &component.part;
+    if !token_is_valid(&part.logical_function) {
+        push(
+            diagnostics,
+            "CC-PRODUCT-PART-001",
+            path,
+            "logical function must be a non-empty canonical token",
+        );
+    }
+
+    let physical = is_physical_part(component);
+    if physical
+        && (part.manufacturer.is_none()
+            || part.manufacturer_part_number.is_none()
+            || part.package.is_none()
+            || part.lifecycle.is_none()
+            || part.sourcing.is_none())
+    {
+        push(
+            diagnostics,
+            "CC-PRODUCT-PART-002",
+            path,
+            "physical component requires manufacturer, manufacturer part number, package, lifecycle, and sourcing constraints",
+        );
+    }
+    if !physical
+        && (part.manufacturer.is_some()
+            || part.manufacturer_part_number.is_some()
+            || part.package.is_some()
+            || part.lifecycle.is_some()
+            || part.sourcing.is_some()
+            || !part.approved_substitutions.is_empty())
+    {
+        push(
+            diagnostics,
+            "CC-PRODUCT-PART-003",
+            path,
+            "virtual component must not carry physical identity, lifecycle, sourcing, or substitution intent",
+        );
+    }
+
+    for (field, value) in [
+        ("manufacturer", part.manufacturer.as_deref()),
+        (
+            "manufacturer part number",
+            part.manufacturer_part_number.as_deref(),
+        ),
+        ("package", part.package.as_deref()),
+    ] {
+        if value.is_some_and(|value| !canonical_text_is_valid(value)) {
+            push(
+                diagnostics,
+                "CC-PRODUCT-PART-004",
+                path,
+                format!(
+                    "{field} must be non-empty canonical text without surrounding whitespace or control characters"
+                ),
+            );
+        }
+    }
+
+    if let Some(sourcing) = &part.sourcing {
+        if sourcing.minimum_available_quantity == 0 || sourcing.maximum_lead_time_days == 0 {
+            push(
+                diagnostics,
+                "CC-PRODUCT-PART-005",
+                path,
+                "sourcing minimum available quantity and maximum lead time days must be positive",
+            );
+        }
+        if !token_is_valid(&sourcing.required_region) {
+            push(
+                diagnostics,
+                "CC-PRODUCT-PART-006",
+                path,
+                "sourcing required region must be a non-empty canonical token",
+            );
+        }
+    }
+
+    if part.approved_substitutions.len() > MAX_PRODUCT_SUBSTITUTIONS {
+        push(
+            diagnostics,
+            "CC-PRODUCT-PART-009",
+            path,
+            format!(
+                "part declares {} approved substitutions; the maximum is {MAX_PRODUCT_SUBSTITUTIONS}",
+                part.approved_substitutions.len()
+            ),
+        );
+    } else {
+        let mut substitutions = BTreeSet::new();
+        for substitution in &part.approved_substitutions {
+            if !approved_substitution_is_valid(substitution) {
+                push(
+                    diagnostics,
+                    "CC-PRODUCT-PART-007",
+                    path,
+                    "approved substitution manufacturer, manufacturer part number, and package must be canonical text",
+                );
+            }
+            if !substitutions.insert(substitution) {
+                push(
+                    diagnostics,
+                    "CC-PRODUCT-PART-008",
+                    path,
+                    "approved substitutions must be unique exact manufacturer, part-number, and package tuples",
+                );
+            }
+            if part
+                .package
+                .as_deref()
+                .is_some_and(|package| substitution.package != package)
+            {
+                push(
+                    diagnostics,
+                    "CC-PRODUCT-PART-010",
+                    path,
+                    "approved substitution package must exactly match the base part package",
+                );
+            }
+            if matches!(
+                (
+                    part.manufacturer.as_deref(),
+                    part.manufacturer_part_number.as_deref(),
+                    part.package.as_deref(),
+                ),
+                (Some(manufacturer), Some(number), Some(package))
+                    if substitution.manufacturer == manufacturer
+                        && substitution.manufacturer_part_number == number
+                        && substitution.package == package
+            ) {
+                push(
+                    diagnostics,
+                    "CC-PRODUCT-PART-011",
+                    path,
+                    "approved substitution must not repeat the exact base part identity",
+                );
+            }
+        }
+    }
+}
+
+fn product_variant_work(
+    variants: &[ProductVariant],
+    physical_component_count: usize,
+) -> Option<usize> {
+    variants.iter().try_fold(0_usize, |total, variant| {
+        total
+            .checked_add(variant.components.len())?
+            .checked_add(physical_component_count)
+    })
+}
+
+fn product_variant_resources_are_bounded(
+    variants: &[ProductVariant],
+    physical_component_count: usize,
+) -> bool {
+    variants.len() <= MAX_PRODUCT_VARIANTS
+        && product_variant_work(variants, physical_component_count)
+            .is_some_and(|work| work <= MAX_PRODUCT_VARIANT_WORK)
+        && variants.iter().all(|variant| {
+            variant.configurations.len() <= MAX_PRODUCT_CONFIGURATIONS
+                && variant.configurations.iter().all(|configuration| {
+                    configuration.key.len() <= MAX_PRODUCT_CONFIGURATION_KEY_BYTES
+                        && configuration.value.len() <= MAX_PRODUCT_CONFIGURATION_VALUE_BYTES
+                })
+        })
+}
+
+fn validate_product_variant_resources(
+    variants: &[ProductVariant],
+    physical_component_count: usize,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> bool {
+    let diagnostic_count = diagnostics.len();
+    if variants.len() > MAX_PRODUCT_VARIANTS {
+        push(
+            diagnostics,
+            "CC-PRODUCT-VARIANT-011",
+            "design.product.variants",
+            format!(
+                "design declares {} product variants; the maximum is {MAX_PRODUCT_VARIANTS}",
+                variants.len()
+            ),
+        );
+        return false;
+    }
+    if product_variant_work(variants, physical_component_count)
+        .is_none_or(|work| work > MAX_PRODUCT_VARIANT_WORK)
+    {
+        push(
+            diagnostics,
+            "CC-PRODUCT-VARIANT-012",
+            "design.product.variants",
+            format!(
+                "aggregate product variant assignment and totality work exceeds {MAX_PRODUCT_VARIANT_WORK} entries"
+            ),
+        );
+    }
+    for variant in variants {
+        let variant_path = if variant.path.is_empty() {
+            "design.product.variants[unknown]"
+        } else {
+            variant.path.as_str()
+        };
+        if variant.configurations.len() > MAX_PRODUCT_CONFIGURATIONS {
+            push(
+                diagnostics,
+                "CC-PRODUCT-CONFIG-004",
+                variant_path,
+                format!(
+                    "product variant declares {} configurations; the maximum is {MAX_PRODUCT_CONFIGURATIONS}",
+                    variant.configurations.len()
+                ),
+            );
+            continue;
+        }
+        for configuration in &variant.configurations {
+            if configuration.key.len() > MAX_PRODUCT_CONFIGURATION_KEY_BYTES {
+                push(
+                    diagnostics,
+                    "CC-PRODUCT-CONFIG-005",
+                    variant_path,
+                    format!(
+                        "product configuration key exceeds {MAX_PRODUCT_CONFIGURATION_KEY_BYTES} UTF-8 bytes"
+                    ),
+                );
+            }
+            if configuration.value.len() > MAX_PRODUCT_CONFIGURATION_VALUE_BYTES {
+                push(
+                    diagnostics,
+                    "CC-PRODUCT-CONFIG-006",
+                    variant_path,
+                    format!(
+                        "product configuration value exceeds {MAX_PRODUCT_CONFIGURATION_VALUE_BYTES} UTF-8 bytes"
+                    ),
+                );
+            }
+        }
+    }
+    diagnostics.len() == diagnostic_count
+}
+
+fn manufacturability_assertion_count(analyses: &[ManufacturabilityAnalysis]) -> Option<usize> {
+    analyses.iter().try_fold(0_usize, |total, analysis| {
+        total.checked_add(analysis.assertions.len())
+    })
+}
+
+fn validate_product_intent(
+    product: &ProductIntent,
+    components: &[Component],
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let component_by_path: BTreeMap<_, _> = components
+        .iter()
+        .map(|component| (component.path.as_str(), component))
+        .collect();
+    let physical_paths: BTreeSet<_> = components
+        .iter()
+        .filter(|component| is_physical_part(component))
+        .map(|component| component.path.as_str())
+        .collect();
+
+    if !physical_paths.is_empty() && product.catalog.is_none() {
+        push(
+            diagnostics,
+            "CC-PRODUCT-CATALOG-001",
+            "design.product.catalog",
+            "a design with physical components requires pinned catalog evidence",
+        );
+    }
+    if let Some(catalog) = &product.catalog {
+        if !token_is_valid(&catalog.snapshot_id) {
+            push(
+                diagnostics,
+                "CC-PRODUCT-CATALOG-002",
+                "design.product.catalog.snapshot_id",
+                "catalog snapshot identity must be a non-empty canonical token",
+            );
+        }
+        if !sha256_is_valid(&catalog.sha256) {
+            push(
+                diagnostics,
+                "CC-PRODUCT-CATALOG-003",
+                "design.product.catalog.sha256",
+                "catalog digest must be exactly 64 lowercase hexadecimal SHA-256 characters",
+            );
+        }
+        if !date_is_valid(&catalog.evaluated_on) {
+            push(
+                diagnostics,
+                "CC-PRODUCT-CATALOG-004",
+                "design.product.catalog.evaluated_on",
+                "catalog evaluation date must be a real Gregorian date in YYYY-MM-DD form",
+            );
+        }
+    }
+
+    if !physical_paths.is_empty() && product.variants.is_empty() {
+        push(
+            diagnostics,
+            "CC-PRODUCT-VARIANT-001",
+            "design.product.variants",
+            "a design with physical components requires at least one product variant",
+        );
+    }
+
+    if validate_product_variant_resources(&product.variants, physical_paths.len(), diagnostics) {
+        let mut variants: Vec<_> = product.variants.iter().collect();
+        variants.sort_by(|left, right| left.path.cmp(&right.path));
+        let mut variant_paths = BTreeSet::new();
+        for variant in variants {
+            let variant_path = if variant.path.is_empty() {
+                "design.product.variants[unknown]"
+            } else {
+                variant.path.as_str()
+            };
+            if !semantic_path_is_valid(&variant.path) {
+                push(
+                    diagnostics,
+                    "CC-PRODUCT-VARIANT-002",
+                    variant_path,
+                    "product variant path must be a canonical semantic path",
+                );
+            }
+            if !variant_paths.insert(variant.path.as_str()) {
+                push(
+                    diagnostics,
+                    "CC-PRODUCT-VARIANT-003",
+                    variant_path,
+                    "product variant paths must be unique",
+                );
+            }
+            if variant.build_quantity == 0 {
+                push(
+                    diagnostics,
+                    "CC-PRODUCT-VARIANT-004",
+                    variant_path,
+                    "product variant build quantity must be positive",
+                );
+            }
+
+            let mut assignments: Vec<_> = variant.components.iter().collect();
+            assignments.sort_by(|left, right| {
+                (&left.component_path, &left.state).cmp(&(&right.component_path, &right.state))
+            });
+            let mut assigned_paths = BTreeSet::new();
+            for assignment in assignments {
+                if !semantic_path_is_valid(&assignment.component_path) {
+                    push(
+                        diagnostics,
+                        "CC-PRODUCT-VARIANT-005",
+                        variant_path,
+                        format!(
+                            "variant component path {} is not a canonical semantic path",
+                            assignment.component_path
+                        ),
+                    );
+                }
+                if !assigned_paths.insert(assignment.component_path.as_str()) {
+                    push(
+                        diagnostics,
+                        "CC-PRODUCT-VARIANT-006",
+                        variant_path,
+                        format!(
+                            "physical component {} is assigned more than once",
+                            assignment.component_path
+                        ),
+                    );
+                }
+                match component_by_path.get(assignment.component_path.as_str()) {
+                    None => push(
+                        diagnostics,
+                        "CC-PRODUCT-VARIANT-007",
+                        variant_path,
+                        format!(
+                            "variant assignment references unknown component {}",
+                            assignment.component_path
+                        ),
+                    ),
+                    Some(component) if !is_physical_part(component) => push(
+                        diagnostics,
+                        "CC-PRODUCT-VARIANT-008",
+                        variant_path,
+                        format!(
+                            "variant assignment references virtual component {}",
+                            assignment.component_path
+                        ),
+                    ),
+                    Some(component) => {
+                        if let PopulationState::Alternate(substitution) = &assignment.state
+                            && !component.part.approved_substitutions.contains(substitution)
+                        {
+                            push(
+                                diagnostics,
+                                "CC-PRODUCT-VARIANT-010",
+                                variant_path,
+                                format!(
+                                    "alternate for component {} is not an exact approved substitution",
+                                    assignment.component_path
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+            for physical_path in &physical_paths {
+                if !assigned_paths.contains(physical_path) {
+                    push(
+                        diagnostics,
+                        "CC-PRODUCT-VARIANT-009",
+                        variant_path,
+                        format!("physical component {physical_path} has no variant assignment"),
+                    );
+                }
+            }
+
+            let mut configurations: Vec<_> = variant.configurations.iter().collect();
+            configurations.sort();
+            let mut configuration_keys = BTreeSet::new();
+            for configuration in configurations {
+                if !token_is_valid(&configuration.key) {
+                    push(
+                        diagnostics,
+                        "CC-PRODUCT-CONFIG-001",
+                        variant_path,
+                        "product configuration key must be a non-empty canonical token",
+                    );
+                }
+                if !canonical_text_is_valid(&configuration.value) {
+                    push(
+                        diagnostics,
+                        "CC-PRODUCT-CONFIG-002",
+                        variant_path,
+                        "product configuration value must be non-empty canonical text",
+                    );
+                }
+                if !configuration_keys.insert(configuration.key.as_str()) {
+                    push(
+                        diagnostics,
+                        "CC-PRODUCT-CONFIG-003",
+                        variant_path,
+                        format!("duplicate product configuration key {}", configuration.key),
+                    );
+                }
+            }
+        }
+    }
+
+    if product.manufacturability_analyses.len() > MAX_MANUFACTURABILITY_ANALYSES {
+        push(
+            diagnostics,
+            "CC-PRODUCT-ANALYSIS-004",
+            "design.product.manufacturability_analyses",
+            format!(
+                "design declares {} manufacturability analyses; the maximum is {MAX_MANUFACTURABILITY_ANALYSES}",
+                product.manufacturability_analyses.len()
+            ),
+        );
+    } else if manufacturability_assertion_count(&product.manufacturability_analyses)
+        .is_none_or(|count| count > MAX_MANUFACTURABILITY_ASSERTIONS)
+    {
+        push(
+            diagnostics,
+            "CC-PRODUCT-ASSERTION-004",
+            "design.product.manufacturability_analyses",
+            format!(
+                "aggregate manufacturability assertions exceed {MAX_MANUFACTURABILITY_ASSERTIONS} entries"
+            ),
+        );
+    } else {
+        let mut analyses: Vec<_> = product.manufacturability_analyses.iter().collect();
+        analyses.sort_by(|left, right| left.path.cmp(&right.path));
+        let mut analysis_paths = BTreeSet::new();
+        let mut assertion_paths = BTreeSet::new();
+        for analysis in analyses {
+            let analysis_path = if analysis.path.is_empty() {
+                "design.product.manufacturability_analyses[unknown]"
+            } else {
+                analysis.path.as_str()
+            };
+            if !semantic_path_is_valid(&analysis.path) {
+                push(
+                    diagnostics,
+                    "CC-PRODUCT-ANALYSIS-001",
+                    analysis_path,
+                    "manufacturability analysis path must be a canonical semantic path",
+                );
+            }
+            if !analysis_paths.insert(analysis.path.as_str()) {
+                push(
+                    diagnostics,
+                    "CC-PRODUCT-ANALYSIS-002",
+                    analysis_path,
+                    "manufacturability analysis paths must be unique",
+                );
+            }
+            if analysis.adapter != "kicad" || analysis.version != "10" {
+                push(
+                    diagnostics,
+                    "CC-PRODUCT-ANALYSIS-003",
+                    analysis_path,
+                    "initial manufacturability analysis adapter must be exactly kicad version 10",
+                );
+            }
+
+            let mut assertions: Vec<_> = analysis.assertions.iter().collect();
+            assertions.sort();
+            let mut capabilities = BTreeSet::new();
+            for assertion in assertions {
+                if !semantic_path_is_valid(&assertion.path) {
+                    push(
+                        diagnostics,
+                        "CC-PRODUCT-ASSERTION-001",
+                        analysis_path,
+                        format!(
+                            "manufacturability assertion path {} is not a canonical semantic path",
+                            assertion.path
+                        ),
+                    );
+                }
+                if !assertion_paths.insert(assertion.path.as_str()) {
+                    push(
+                        diagnostics,
+                        "CC-PRODUCT-ASSERTION-002",
+                        analysis_path,
+                        format!(
+                            "duplicate manufacturability assertion path {}",
+                            assertion.path
+                        ),
+                    );
+                }
+                if !capabilities.insert(assertion.capability) {
+                    push(
+                        diagnostics,
+                        "CC-PRODUCT-ASSERTION-003",
+                        analysis_path,
+                        "manufacturability capabilities must be unique within one analysis",
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn validate_component_value(component: &Component, path: &str, diagnostics: &mut Vec<Diagnostic>) {
     let quantity = component.value.quantity();
     if !quantity.is_canonical() {
@@ -2146,7 +2804,7 @@ fn validate_component_value(component: &Component, path: &str, diagnostics: &mut
 
     match &component.value {
         ComponentValue::Resistance(resistance) => {
-            if component.part.logical_device != "resistor" {
+            if component.part.logical_function != "resistor" {
                 push(
                     diagnostics,
                     "CC-VALUE-003",
@@ -2164,7 +2822,7 @@ fn validate_component_value(component: &Component, path: &str, diagnostics: &mut
             }
         }
         ComponentValue::DcVoltage(voltage) => {
-            if component.part.logical_device != "dc_voltage_source" {
+            if component.part.logical_function != "dc_voltage_source" {
                 push(
                     diagnostics,
                     "CC-VALUE-003",
@@ -2398,7 +3056,7 @@ fn validate_simulation(
 
     match simulation {
         SimulationModel::Resistor { model_id, .. } => {
-            if component.part.logical_device != "resistor" {
+            if component.part.logical_function != "resistor" {
                 push(
                     diagnostics,
                     "CC-SIM-011",
@@ -2416,7 +3074,7 @@ fn validate_simulation(
             }
         }
         SimulationModel::DcVoltageSource { model_id, .. } => {
-            if component.part.logical_device != "dc_voltage_source" {
+            if component.part.logical_function != "dc_voltage_source" {
                 push(
                     diagnostics,
                     "CC-SIM-011",
@@ -2434,6 +3092,53 @@ fn validate_simulation(
             }
         }
     }
+}
+
+fn canonical_text_is_valid(value: &str) -> bool {
+    !value.is_empty() && value.trim() == value && !value.chars().any(char::is_control)
+}
+
+fn approved_substitution_is_valid(substitution: &ApprovedSubstitution) -> bool {
+    canonical_text_is_valid(&substitution.manufacturer)
+        && canonical_text_is_valid(&substitution.manufacturer_part_number)
+        && canonical_text_is_valid(&substitution.package)
+}
+
+fn sha256_is_valid(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn date_is_valid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    let decimal = |mut range: std::ops::Range<usize>| {
+        range.try_fold(0_u32, |result, index| {
+            bytes[index]
+                .is_ascii_digit()
+                .then(|| result * 10 + u32::from(bytes[index] - b'0'))
+        })
+    };
+    let (Some(year), Some(month), Some(day)) = (decimal(0..4), decimal(5..7), decimal(8..10))
+    else {
+        return false;
+    };
+    if year == 0 || !(1..=12).contains(&month) {
+        return false;
+    }
+    let leap_year =
+        year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let maximum_day = match month {
+        2 if leap_year => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    (1..=maximum_day).contains(&day)
 }
 
 fn token_is_valid(value: &str) -> bool {
@@ -2497,11 +3202,17 @@ mod tests {
     use crate::quantity::{Quantity, Unit};
 
     use super::{
-        ComponentValue, ConnectionState, CopperLayer, MAX_ABS_COORDINATE_NM,
+        ApprovedSubstitution, CatalogEvidenceRef, ComponentValue, ConnectionState, CopperLayer,
+        LifecycleStatus, MAX_ABS_COORDINATE_NM, MAX_MANUFACTURABILITY_ANALYSES,
+        MAX_MANUFACTURABILITY_ASSERTIONS, MAX_PRODUCT_CONFIGURATION_KEY_BYTES,
+        MAX_PRODUCT_CONFIGURATION_VALUE_BYTES, MAX_PRODUCT_CONFIGURATIONS,
+        MAX_PRODUCT_SUBSTITUTIONS, MAX_PRODUCT_VARIANT_WORK, MAX_PRODUCT_VARIANTS,
         MAX_SIMULATION_ANALYSES, MAX_SIMULATION_ASSERTIONS, MAX_SIMULATION_SAMPLES,
-        MAX_SIMULATION_TOTAL_SAMPLES, PinPadBinding, Placement, PointNm, RoutingRequest,
-        SimulationAnalysis, SimulationAnalysisKind, SimulationAssertion, SimulationSample,
-        TransientGridLocation, ac_grid_index, transient_grid_location,
+        MAX_SIMULATION_TOTAL_SAMPLES, ManufacturabilityAnalysis, ManufacturabilityAssertion,
+        ManufacturabilityCapability, PinPadBinding, Placement, PointNm, PopulationState,
+        ProductConfiguration, ProductIntent, ProductVariant, RoutingRequest, SimulationAnalysis,
+        SimulationAnalysisKind, SimulationAssertion, SimulationSample, SourcingConstraints,
+        TransientGridLocation, VariantComponent, ac_grid_index, transient_grid_location,
     };
 
     fn has_code(diagnostics: &[super::Diagnostic], code: &str) -> bool {
@@ -2516,6 +3227,135 @@ mod tests {
             has_code(&diagnostics, code),
             "missing diagnostic {code}: {diagnostics:#?}"
         );
+    }
+
+    fn rejected_diagnostics(design: super::Design) -> Vec<super::Diagnostic> {
+        design
+            .validate()
+            .expect_err("mutated Design IR must be rejected")
+    }
+
+    fn approved_substitution() -> ApprovedSubstitution {
+        ApprovedSubstitution {
+            manufacturer: "Panasonic".to_owned(),
+            manufacturer_part_number: "ERJ-3EKF1002V".to_owned(),
+            package: "0603".to_owned(),
+        }
+    }
+
+    fn product_design() -> super::Design {
+        let mut design = voltage_divider();
+        for component in &mut design.components {
+            if component.physical.is_some() {
+                component.part.package = Some("0603".to_owned());
+                component.part.lifecycle = Some(LifecycleStatus::Active);
+                component.part.sourcing = Some(SourcingConstraints {
+                    minimum_available_quantity: 100,
+                    maximum_lead_time_days: 30,
+                    required_region: "US".to_owned(),
+                });
+                component.part.approved_substitutions = vec![approved_substitution()];
+            } else {
+                component.part.manufacturer = None;
+                component.part.manufacturer_part_number = None;
+                component.part.package = None;
+                component.part.lifecycle = None;
+                component.part.sourcing = None;
+                component.part.approved_substitutions.clear();
+            }
+        }
+        design.product = ProductIntent {
+            catalog: Some(CatalogEvidenceRef {
+                snapshot_id: "catalog-2026-08-04".to_owned(),
+                sha256: "a".repeat(64),
+                evaluated_on: "2026-08-04".to_owned(),
+            }),
+            variants: vec![ProductVariant {
+                path: "product.variants.default".to_owned(),
+                build_quantity: 100,
+                components: vec![
+                    VariantComponent {
+                        component_path: "divider.r_bottom".to_owned(),
+                        state: PopulationState::Fitted,
+                    },
+                    VariantComponent {
+                        component_path: "divider.r_top".to_owned(),
+                        state: PopulationState::Fitted,
+                    },
+                ],
+                configurations: vec![
+                    ProductConfiguration {
+                        key: "finish".to_owned(),
+                        value: "lead-free".to_owned(),
+                    },
+                    ProductConfiguration {
+                        key: "assembly_line".to_owned(),
+                        value: "line-a".to_owned(),
+                    },
+                ],
+            }],
+            manufacturability_analyses: vec![ManufacturabilityAnalysis {
+                path: "product.manufacturability.kicad10".to_owned(),
+                adapter: "kicad".to_owned(),
+                version: "10".to_owned(),
+                assertions: vec![
+                    ManufacturabilityAssertion {
+                        path: "product.assertions.fabrication_inventory".to_owned(),
+                        capability: ManufacturabilityCapability::FabricationInventoryComplete,
+                    },
+                    ManufacturabilityAssertion {
+                        path: "product.assertions.schematic_parity".to_owned(),
+                        capability: ManufacturabilityCapability::SchematicParityClean,
+                    },
+                    ManufacturabilityAssertion {
+                        path: "product.assertions.unconnected".to_owned(),
+                        capability: ManufacturabilityCapability::UnconnectedClean,
+                    },
+                    ManufacturabilityAssertion {
+                        path: "product.assertions.drc".to_owned(),
+                        capability: ManufacturabilityCapability::DrcClean,
+                    },
+                    ManufacturabilityAssertion {
+                        path: "product.assertions.erc".to_owned(),
+                        capability: ManufacturabilityCapability::ErcClean,
+                    },
+                ],
+            }],
+        };
+        design.canonicalize();
+        design
+    }
+
+    fn physical_part_mut<'a>(
+        design: &'a mut super::Design,
+        reference: &str,
+    ) -> &'a mut super::PartIdentity {
+        &mut design
+            .components
+            .iter_mut()
+            .find(|component| component.reference == reference)
+            .expect("physical product fixture component must exist")
+            .part
+    }
+
+    fn variant_mut(design: &mut super::Design) -> &mut ProductVariant {
+        design
+            .product
+            .variants
+            .iter_mut()
+            .find(|variant| variant.path == "product.variants.default")
+            .expect("default product variant must exist")
+    }
+
+    fn manufacturability_analysis_mut(
+        design: &mut super::Design,
+    ) -> &mut ManufacturabilityAnalysis {
+        design
+            .product
+            .manufacturability_analyses
+            .iter_mut()
+            .find(|analysis| analysis.path == "product.manufacturability.kicad10")
+            .expect("KiCad manufacturability analysis must exist")
     }
 
     fn vout_routing_request() -> RoutingRequest {
@@ -3461,17 +4301,17 @@ mod tests {
         assert_rejected(design, "CC-COMP-007");
 
         let mut design = voltage_divider();
-        design.components[0].part.logical_device.clear();
-        assert_rejected(design, "CC-PART-001");
+        design.components[0].part.logical_function.clear();
+        assert_rejected(design, "CC-PRODUCT-PART-001");
 
         let mut design = voltage_divider();
         design.components[0].part.manufacturer = None;
         design.components[0].part.manufacturer_part_number = None;
-        assert_rejected(design, "CC-PART-002");
+        assert_rejected(design, "CC-PRODUCT-PART-003");
 
         let mut design = voltage_divider();
         design.components[0].part.manufacturer_part_number = None;
-        assert_rejected(design, "CC-PART-003");
+        assert_rejected(design, "CC-PRODUCT-PART-002");
 
         let mut design = voltage_divider();
         design.components[0].symbol.library_id.clear();
@@ -3756,9 +4596,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_simulator_model_that_disagrees_with_logical_device() {
+    fn rejects_simulator_model_that_disagrees_with_logical_function() {
         let mut design = voltage_divider();
-        design.components[0].part.logical_device = "dc_voltage_source".to_owned();
+        design.components[0].part.logical_function = "dc_voltage_source".to_owned();
         let diagnostics = design
             .validate()
             .expect_err("logical device and simulation primitive must agree");
@@ -3897,6 +4737,591 @@ mod tests {
             component.schematic_placement.rotation_degrees += 360;
         }
 
+        permuted.canonicalize();
+
+        assert_eq!(permuted, expected);
+    }
+
+    #[test]
+    fn accepts_complete_canonical_product_intent() {
+        assert_eq!(product_design().validate(), Ok(()));
+    }
+
+    #[test]
+    fn manufacturer_identified_part_remains_physical_without_board_placement() {
+        let mut design = product_design();
+        design
+            .components
+            .iter_mut()
+            .find(|component| component.reference == "R1")
+            .expect("manufacturer-identified fixture component exists")
+            .physical = None;
+
+        assert_eq!(design.validate(), Ok(()));
+    }
+
+    #[test]
+    fn product_part_identity_fails_closed_for_missing_or_virtual_physical_fields() {
+        let mut logical_function = product_design();
+        physical_part_mut(&mut logical_function, "R1").logical_function = "bad function".to_owned();
+        assert_rejected(logical_function, "CC-PRODUCT-PART-001");
+
+        let mut manufacturer = product_design();
+        physical_part_mut(&mut manufacturer, "R1").manufacturer = None;
+        let diagnostics = rejected_diagnostics(manufacturer);
+        assert!(has_code(&diagnostics, "CC-PRODUCT-PART-003"));
+        assert!(has_code(&diagnostics, "CC-PRODUCT-VARIANT-008"));
+        assert!(!has_code(&diagnostics, "CC-PRODUCT-PART-002"));
+
+        let mut package = product_design();
+        physical_part_mut(&mut package, "R1").package = None;
+        assert_rejected(package, "CC-PRODUCT-PART-002");
+
+        let mut lifecycle = product_design();
+        physical_part_mut(&mut lifecycle, "R1").lifecycle = None;
+        assert_rejected(lifecycle, "CC-PRODUCT-PART-002");
+
+        let mut sourcing = product_design();
+        physical_part_mut(&mut sourcing, "R1").sourcing = None;
+        assert_rejected(sourcing, "CC-PRODUCT-PART-002");
+
+        let mut virtual_fields = product_design();
+        let virtual_part = &mut virtual_fields
+            .components
+            .iter_mut()
+            .find(|component| component.reference == "V1")
+            .expect("virtual product fixture component must exist")
+            .part;
+        virtual_part.package = Some("virtual-package".to_owned());
+        virtual_part.approved_substitutions = vec![approved_substitution()];
+        assert_rejected(virtual_fields, "CC-PRODUCT-PART-003");
+    }
+
+    #[test]
+    fn product_part_text_sourcing_and_substitution_guards_are_discriminating() {
+        let mut text = product_design();
+        physical_part_mut(&mut text, "R1").manufacturer = Some(" Yageo".to_owned());
+        assert_rejected(text, "CC-PRODUCT-PART-004");
+
+        let mut sourcing_quantity = product_design();
+        let sourcing = physical_part_mut(&mut sourcing_quantity, "R1")
+            .sourcing
+            .as_mut()
+            .expect("physical product fixture has sourcing constraints");
+        sourcing.minimum_available_quantity = 0;
+        sourcing.maximum_lead_time_days = 0;
+        assert_rejected(sourcing_quantity, "CC-PRODUCT-PART-005");
+
+        let mut region = product_design();
+        physical_part_mut(&mut region, "R1")
+            .sourcing
+            .as_mut()
+            .expect("physical product fixture has sourcing constraints")
+            .required_region = "North America".to_owned();
+        assert_rejected(region, "CC-PRODUCT-PART-006");
+
+        let mut malformed_substitution = product_design();
+        physical_part_mut(&mut malformed_substitution, "R1").approved_substitutions[0].package =
+            " 0603".to_owned();
+        assert_rejected(malformed_substitution, "CC-PRODUCT-PART-007");
+
+        let mut duplicate_substitution = product_design();
+        let duplicate =
+            physical_part_mut(&mut duplicate_substitution, "R1").approved_substitutions[0].clone();
+        physical_part_mut(&mut duplicate_substitution, "R1")
+            .approved_substitutions
+            .push(duplicate);
+        assert_rejected(duplicate_substitution, "CC-PRODUCT-PART-008");
+    }
+
+    #[test]
+    fn substitutions_reject_package_drift_and_the_exact_base_identity() {
+        let mut package_drift = product_design();
+        let mut incompatible = approved_substitution();
+        incompatible.package = "0805".to_owned();
+        physical_part_mut(&mut package_drift, "R1").approved_substitutions =
+            vec![incompatible.clone()];
+        variant_mut(&mut package_drift)
+            .components
+            .iter_mut()
+            .find(|component| component.component_path == "divider.r_top")
+            .expect("R1 variant assignment exists")
+            .state = PopulationState::Alternate(incompatible);
+        assert_rejected(package_drift, "CC-PRODUCT-PART-010");
+
+        let mut self_substitution = product_design();
+        let part = physical_part_mut(&mut self_substitution, "R1");
+        let repeated_base = ApprovedSubstitution {
+            manufacturer: part
+                .manufacturer
+                .clone()
+                .expect("physical fixture manufacturer exists"),
+            manufacturer_part_number: part
+                .manufacturer_part_number
+                .clone()
+                .expect("physical fixture part number exists"),
+            package: part
+                .package
+                .clone()
+                .expect("physical fixture package exists"),
+        };
+        part.approved_substitutions = vec![repeated_base.clone()];
+        variant_mut(&mut self_substitution)
+            .components
+            .iter_mut()
+            .find(|component| component.component_path == "divider.r_top")
+            .expect("R1 variant assignment exists")
+            .state = PopulationState::Alternate(repeated_base);
+        assert_rejected(self_substitution, "CC-PRODUCT-PART-011");
+    }
+
+    #[test]
+    fn approved_substitution_count_accepts_the_boundary_and_skips_one_over() {
+        let substitutions = (0..MAX_PRODUCT_SUBSTITUTIONS)
+            .map(|index| ApprovedSubstitution {
+                manufacturer: format!("Manufacturer{index}"),
+                manufacturer_part_number: format!("Part{index}"),
+                package: "0603".to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let mut boundary = product_design();
+        physical_part_mut(&mut boundary, "R1").approved_substitutions = substitutions;
+        assert_eq!(boundary.validate(), Ok(()));
+
+        let mut one_over = product_design();
+        physical_part_mut(&mut one_over, "R1").approved_substitutions =
+            vec![approved_substitution(); MAX_PRODUCT_SUBSTITUTIONS + 1];
+        let diagnostics = rejected_diagnostics(one_over);
+        assert!(has_code(&diagnostics, "CC-PRODUCT-PART-009"));
+        assert!(!has_code(&diagnostics, "CC-PRODUCT-PART-008"));
+    }
+
+    #[test]
+    fn catalog_evidence_requires_canonical_identity_digest_and_real_date() {
+        let mut missing = product_design();
+        missing.product.catalog = None;
+        assert_rejected(missing, "CC-PRODUCT-CATALOG-001");
+
+        let mut snapshot = product_design();
+        snapshot
+            .product
+            .catalog
+            .as_mut()
+            .expect("product catalog fixture exists")
+            .snapshot_id = "bad snapshot".to_owned();
+        assert_rejected(snapshot, "CC-PRODUCT-CATALOG-002");
+
+        let mut digest = product_design();
+        digest
+            .product
+            .catalog
+            .as_mut()
+            .expect("product catalog fixture exists")
+            .sha256 = "A".repeat(64);
+        assert_rejected(digest, "CC-PRODUCT-CATALOG-003");
+
+        for invalid in ["2026-02-29", "0000-01-01", "2026-13-01", "2026-04-31"] {
+            let mut date = product_design();
+            date.product
+                .catalog
+                .as_mut()
+                .expect("product catalog fixture exists")
+                .evaluated_on = invalid.to_owned();
+            assert_rejected(date, "CC-PRODUCT-CATALOG-004");
+        }
+
+        let mut leap_day = product_design();
+        leap_day
+            .product
+            .catalog
+            .as_mut()
+            .expect("product catalog fixture exists")
+            .evaluated_on = "2024-02-29".to_owned();
+        assert_eq!(leap_day.validate(), Ok(()));
+    }
+
+    #[test]
+    fn variants_require_positive_unique_paths_and_total_physical_assignment() {
+        let mut missing_variant = product_design();
+        missing_variant.product.variants.clear();
+        assert_rejected(missing_variant, "CC-PRODUCT-VARIANT-001");
+
+        let mut invalid_path = product_design();
+        variant_mut(&mut invalid_path).path = "bad path".to_owned();
+        assert_rejected(invalid_path, "CC-PRODUCT-VARIANT-002");
+
+        let mut duplicate_path = product_design();
+        let duplicate = variant_mut(&mut duplicate_path).clone();
+        duplicate_path.product.variants.push(duplicate);
+        assert_rejected(duplicate_path, "CC-PRODUCT-VARIANT-003");
+
+        let mut zero_quantity = product_design();
+        variant_mut(&mut zero_quantity).build_quantity = 0;
+        assert_rejected(zero_quantity, "CC-PRODUCT-VARIANT-004");
+
+        let mut invalid_component_path = product_design();
+        variant_mut(&mut invalid_component_path).components[0].component_path =
+            "bad path".to_owned();
+        assert_rejected(invalid_component_path, "CC-PRODUCT-VARIANT-005");
+
+        let mut duplicate_assignment = product_design();
+        let duplicate = variant_mut(&mut duplicate_assignment).components[0].clone();
+        variant_mut(&mut duplicate_assignment)
+            .components
+            .push(duplicate);
+        assert_rejected(duplicate_assignment, "CC-PRODUCT-VARIANT-006");
+
+        let mut unknown = product_design();
+        variant_mut(&mut unknown).components.push(VariantComponent {
+            component_path: "divider.unknown".to_owned(),
+            state: PopulationState::NotFitted,
+        });
+        assert_rejected(unknown, "CC-PRODUCT-VARIANT-007");
+
+        let mut virtual_component = product_design();
+        variant_mut(&mut virtual_component)
+            .components
+            .push(VariantComponent {
+                component_path: "divider.analysis.input".to_owned(),
+                state: PopulationState::Fitted,
+            });
+        assert_rejected(virtual_component, "CC-PRODUCT-VARIANT-008");
+
+        let mut missing_component = product_design();
+        variant_mut(&mut missing_component).components.pop();
+        assert_rejected(missing_component, "CC-PRODUCT-VARIANT-009");
+    }
+
+    #[test]
+    fn product_variant_count_accepts_the_boundary_and_skips_one_over() {
+        let template = product_design().product.variants[0].clone();
+        let variants = (0..MAX_PRODUCT_VARIANTS)
+            .map(|index| {
+                let mut variant = template.clone();
+                variant.path = format!("product.variants.boundary.{index}");
+                variant
+            })
+            .collect::<Vec<_>>();
+        let mut boundary = product_design();
+        boundary.product.variants = variants;
+        assert_eq!(boundary.validate(), Ok(()));
+
+        let mut one_over = product_design();
+        one_over.product.variants = vec![template; MAX_PRODUCT_VARIANTS + 1];
+        let diagnostics = rejected_diagnostics(one_over);
+        assert!(has_code(&diagnostics, "CC-PRODUCT-VARIANT-011"));
+        assert!(!has_code(&diagnostics, "CC-PRODUCT-VARIANT-003"));
+    }
+
+    #[test]
+    fn aggregate_variant_work_accepts_the_boundary_and_skips_one_over() {
+        let repeated_assignment = VariantComponent {
+            component_path: "divider.r_bottom".to_owned(),
+            state: PopulationState::Fitted,
+        };
+        let mut boundary = product_design();
+        boundary
+            .components
+            .iter_mut()
+            .find(|component| component.reference == "R1")
+            .expect("manufacturer-identified fixture component exists")
+            .physical = None;
+        variant_mut(&mut boundary).components =
+            vec![repeated_assignment.clone(); MAX_PRODUCT_VARIANT_WORK - 2];
+        let diagnostics = rejected_diagnostics(boundary);
+        assert!(!has_code(&diagnostics, "CC-PRODUCT-VARIANT-012"));
+        assert!(has_code(&diagnostics, "CC-PRODUCT-VARIANT-006"));
+
+        let mut one_over = product_design();
+        one_over
+            .components
+            .iter_mut()
+            .find(|component| component.reference == "R1")
+            .expect("manufacturer-identified fixture component exists")
+            .physical = None;
+        variant_mut(&mut one_over).components =
+            vec![repeated_assignment; MAX_PRODUCT_VARIANT_WORK - 1];
+        let diagnostics = rejected_diagnostics(one_over);
+        assert!(has_code(&diagnostics, "CC-PRODUCT-VARIANT-012"));
+        assert!(!has_code(&diagnostics, "CC-PRODUCT-VARIANT-006"));
+    }
+
+    #[test]
+    fn alternate_population_requires_an_exact_approved_substitution() {
+        let mut approved = product_design();
+        variant_mut(&mut approved)
+            .components
+            .iter_mut()
+            .find(|component| component.component_path == "divider.r_top")
+            .expect("R1 variant assignment exists")
+            .state = PopulationState::Alternate(approved_substitution());
+        assert_eq!(approved.validate(), Ok(()));
+
+        let mut unapproved = product_design();
+        let mut substitution = approved_substitution();
+        substitution
+            .manufacturer_part_number
+            .push_str("-unapproved");
+        variant_mut(&mut unapproved)
+            .components
+            .iter_mut()
+            .find(|component| component.component_path == "divider.r_top")
+            .expect("R1 variant assignment exists")
+            .state = PopulationState::Alternate(substitution);
+        assert_rejected(unapproved, "CC-PRODUCT-VARIANT-010");
+    }
+
+    #[test]
+    fn configurations_require_canonical_unique_keys_and_text_values() {
+        let mut key = product_design();
+        variant_mut(&mut key).configurations[0].key = "bad key".to_owned();
+        assert_rejected(key, "CC-PRODUCT-CONFIG-001");
+
+        let mut value = product_design();
+        variant_mut(&mut value).configurations[0].value = "".to_owned();
+        assert_rejected(value, "CC-PRODUCT-CONFIG-002");
+
+        let mut duplicate = product_design();
+        let duplicate_configuration = variant_mut(&mut duplicate).configurations[0].clone();
+        variant_mut(&mut duplicate)
+            .configurations
+            .push(duplicate_configuration);
+        assert_rejected(duplicate, "CC-PRODUCT-CONFIG-003");
+    }
+
+    #[test]
+    fn product_configuration_count_accepts_the_boundary_and_skips_one_over() {
+        let configurations = (0..MAX_PRODUCT_CONFIGURATIONS)
+            .map(|index| ProductConfiguration {
+                key: format!("key{index}"),
+                value: format!("value-{index}"),
+            })
+            .collect::<Vec<_>>();
+        let mut boundary = product_design();
+        variant_mut(&mut boundary).configurations = configurations;
+        assert_eq!(boundary.validate(), Ok(()));
+
+        let mut one_over = product_design();
+        let variant = variant_mut(&mut one_over);
+        variant.configurations = vec![
+            ProductConfiguration {
+                key: "bad key".to_owned(),
+                value: "".to_owned(),
+            };
+            MAX_PRODUCT_CONFIGURATIONS + 1
+        ];
+        variant.components = vec![
+            VariantComponent {
+                component_path: "divider.unknown".to_owned(),
+                state: PopulationState::Fitted,
+            },
+            VariantComponent {
+                component_path: "divider.unknown".to_owned(),
+                state: PopulationState::Fitted,
+            },
+        ];
+        let diagnostics = rejected_diagnostics(one_over);
+        assert!(has_code(&diagnostics, "CC-PRODUCT-CONFIG-004"));
+        for suppressed in [
+            "CC-PRODUCT-VARIANT-006",
+            "CC-PRODUCT-VARIANT-007",
+            "CC-PRODUCT-VARIANT-009",
+            "CC-PRODUCT-CONFIG-001",
+            "CC-PRODUCT-CONFIG-002",
+            "CC-PRODUCT-CONFIG-003",
+        ] {
+            assert!(
+                !has_code(&diagnostics, suppressed),
+                "resource preflight must suppress expanded diagnostic {suppressed}: {diagnostics:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn product_configuration_utf8_byte_lengths_are_bounded() {
+        let mut boundary = product_design();
+        variant_mut(&mut boundary).configurations = vec![ProductConfiguration {
+            key: "k".repeat(MAX_PRODUCT_CONFIGURATION_KEY_BYTES),
+            value: "é".repeat(MAX_PRODUCT_CONFIGURATION_VALUE_BYTES / 2),
+        }];
+        assert_eq!(boundary.validate(), Ok(()));
+
+        let mut key_one_over = product_design();
+        let variant = variant_mut(&mut key_one_over);
+        variant.configurations[0].key = "k".repeat(MAX_PRODUCT_CONFIGURATION_KEY_BYTES + 1);
+        variant.configurations.push(ProductConfiguration {
+            key: "bad key".to_owned(),
+            value: "".to_owned(),
+        });
+        variant.components.clear();
+        let diagnostics = rejected_diagnostics(key_one_over);
+        assert!(has_code(&diagnostics, "CC-PRODUCT-CONFIG-005"));
+        for suppressed in [
+            "CC-PRODUCT-VARIANT-009",
+            "CC-PRODUCT-CONFIG-001",
+            "CC-PRODUCT-CONFIG-002",
+        ] {
+            assert!(
+                !has_code(&diagnostics, suppressed),
+                "byte preflight must suppress expanded diagnostic {suppressed}: {diagnostics:#?}"
+            );
+        }
+
+        let mut value_one_over = product_design();
+        variant_mut(&mut value_one_over).configurations[0].value =
+            format!("{}x", "é".repeat(MAX_PRODUCT_CONFIGURATION_VALUE_BYTES / 2));
+        assert_rejected(value_one_over, "CC-PRODUCT-CONFIG-006");
+    }
+
+    #[test]
+    fn manufacturability_analysis_and_assertion_identity_is_fail_closed() {
+        let mut invalid_path = product_design();
+        manufacturability_analysis_mut(&mut invalid_path).path = "bad path".to_owned();
+        assert_rejected(invalid_path, "CC-PRODUCT-ANALYSIS-001");
+
+        let mut duplicate_analysis = product_design();
+        let duplicate = manufacturability_analysis_mut(&mut duplicate_analysis).clone();
+        duplicate_analysis
+            .product
+            .manufacturability_analyses
+            .push(duplicate);
+        assert_rejected(duplicate_analysis, "CC-PRODUCT-ANALYSIS-002");
+
+        for (adapter, version) in [("other", "10"), ("kicad", "11")] {
+            let mut unsupported = product_design();
+            let analysis = manufacturability_analysis_mut(&mut unsupported);
+            analysis.adapter = adapter.to_owned();
+            analysis.version = version.to_owned();
+            assert_rejected(unsupported, "CC-PRODUCT-ANALYSIS-003");
+        }
+
+        let mut invalid_assertion = product_design();
+        manufacturability_analysis_mut(&mut invalid_assertion).assertions[0].path =
+            "bad path".to_owned();
+        assert_rejected(invalid_assertion, "CC-PRODUCT-ASSERTION-001");
+
+        let mut duplicate_assertion = product_design();
+        let duplicate_path = manufacturability_analysis_mut(&mut duplicate_assertion).assertions[0]
+            .path
+            .clone();
+        manufacturability_analysis_mut(&mut duplicate_assertion).assertions[1].path =
+            duplicate_path;
+        assert_rejected(duplicate_assertion, "CC-PRODUCT-ASSERTION-002");
+
+        let mut duplicate_capability = product_design();
+        let duplicate_capability_value =
+            manufacturability_analysis_mut(&mut duplicate_capability).assertions[0].capability;
+        manufacturability_analysis_mut(&mut duplicate_capability).assertions[1].capability =
+            duplicate_capability_value;
+        assert_rejected(duplicate_capability, "CC-PRODUCT-ASSERTION-003");
+    }
+
+    #[test]
+    fn manufacturability_analysis_count_accepts_the_boundary_and_skips_one_over() {
+        let template = product_design().product.manufacturability_analyses[0].clone();
+        let analyses = (0..MAX_MANUFACTURABILITY_ANALYSES)
+            .map(|analysis_index| {
+                let mut analysis = template.clone();
+                analysis.path = format!("product.manufacturability.boundary.{analysis_index}");
+                for (assertion_index, assertion) in analysis.assertions.iter_mut().enumerate() {
+                    assertion.path =
+                        format!("product.assertions.boundary.{analysis_index}.{assertion_index}");
+                }
+                analysis
+            })
+            .collect::<Vec<_>>();
+        let mut boundary = product_design();
+        boundary.product.manufacturability_analyses = analyses;
+        assert_eq!(boundary.validate(), Ok(()));
+
+        let mut one_over = product_design();
+        one_over.product.manufacturability_analyses =
+            vec![template; MAX_MANUFACTURABILITY_ANALYSES + 1];
+        let diagnostics = rejected_diagnostics(one_over);
+        assert!(has_code(&diagnostics, "CC-PRODUCT-ANALYSIS-004"));
+        assert!(!has_code(&diagnostics, "CC-PRODUCT-ANALYSIS-002"));
+    }
+
+    #[test]
+    fn aggregate_manufacturability_assertions_accept_the_boundary_and_skip_one_over() {
+        let assertions = (0..MAX_MANUFACTURABILITY_ASSERTIONS)
+            .map(|index| ManufacturabilityAssertion {
+                path: format!("product.assertions.boundary.{index}"),
+                capability: match index % 5 {
+                    0 => ManufacturabilityCapability::ErcClean,
+                    1 => ManufacturabilityCapability::DrcClean,
+                    2 => ManufacturabilityCapability::UnconnectedClean,
+                    3 => ManufacturabilityCapability::SchematicParityClean,
+                    _ => ManufacturabilityCapability::FabricationInventoryComplete,
+                },
+            })
+            .collect::<Vec<_>>();
+        let mut boundary = product_design();
+        manufacturability_analysis_mut(&mut boundary).assertions = assertions;
+        let diagnostics = rejected_diagnostics(boundary.clone());
+        assert!(!has_code(&diagnostics, "CC-PRODUCT-ASSERTION-004"));
+        assert!(has_code(&diagnostics, "CC-PRODUCT-ASSERTION-003"));
+
+        manufacturability_analysis_mut(&mut boundary)
+            .assertions
+            .push(ManufacturabilityAssertion {
+                path: "product.assertions.one_over".to_owned(),
+                capability: ManufacturabilityCapability::ErcClean,
+            });
+        let diagnostics = rejected_diagnostics(boundary);
+        assert!(has_code(&diagnostics, "CC-PRODUCT-ASSERTION-004"));
+        assert!(!has_code(&diagnostics, "CC-PRODUCT-ASSERTION-003"));
+    }
+
+    #[test]
+    fn canonicalizes_every_product_collection_by_stable_semantic_keys() {
+        let mut expected = product_design();
+        let second_substitution = ApprovedSubstitution {
+            manufacturer: "Vishay".to_owned(),
+            manufacturer_part_number: "CRCW060310K0FKEA".to_owned(),
+            package: "0603".to_owned(),
+        };
+        for component in &mut expected.components {
+            if component.physical.is_some() {
+                component
+                    .part
+                    .approved_substitutions
+                    .push(second_substitution.clone());
+            }
+        }
+        let mut second_variant = expected.product.variants[0].clone();
+        second_variant.path = "product.variants.secondary".to_owned();
+        second_variant.build_quantity = 25;
+        expected.product.variants.push(second_variant);
+
+        let mut second_analysis = expected.product.manufacturability_analyses[0].clone();
+        second_analysis.path = "product.manufacturability.kicad10_secondary".to_owned();
+        for assertion in &mut second_analysis.assertions {
+            assertion.path =
+                assertion
+                    .path
+                    .replacen("product.assertions.", "product.assertions.secondary.", 1);
+        }
+        expected
+            .product
+            .manufacturability_analyses
+            .push(second_analysis);
+        expected.canonicalize();
+        assert_eq!(expected.validate(), Ok(()));
+
+        let mut permuted = expected.clone();
+        for component in &mut permuted.components {
+            component.part.approved_substitutions.reverse();
+        }
+        permuted.product.variants.reverse();
+        for variant in &mut permuted.product.variants {
+            variant.components.reverse();
+            variant.configurations.reverse();
+        }
+        permuted.product.manufacturability_analyses.reverse();
+        for analysis in &mut permuted.product.manufacturability_analyses {
+            analysis.assertions.reverse();
+        }
         permuted.canonicalize();
 
         assert_eq!(permuted, expected);

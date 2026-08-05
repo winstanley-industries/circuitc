@@ -31,25 +31,28 @@ pub(crate) struct SymbolDefinition {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PartDefinition {
-    pub logical_device: &'static str,
+    pub logical_function: &'static str,
     pub manufacturer: Option<&'static str>,
     pub manufacturer_part_number: Option<&'static str>,
+    pub package: Option<&'static str>,
     pub symbol_library_id: &'static str,
     pub footprint_library_id: Option<&'static str>,
 }
 
 const PART_DEFINITIONS: &[PartDefinition] = &[
     PartDefinition {
-        logical_device: "resistor",
+        logical_function: "resistor",
         manufacturer: Some("Yageo"),
         manufacturer_part_number: Some("RC0603FR-0710KL"),
+        package: Some("0603_1608Metric"),
         symbol_library_id: "CircuitC:R",
         footprint_library_id: Some("CircuitC:R_0603_1608Metric"),
     },
     PartDefinition {
-        logical_device: "dc_voltage_source",
+        logical_function: "dc_voltage_source",
         manufacturer: None,
         manufacturer_part_number: None,
+        package: None,
         symbol_library_id: "CircuitC:VDC",
         footprint_library_id: None,
     },
@@ -81,9 +84,10 @@ struct FootprintPadDefinition {
 
 pub(crate) fn part(identity: &PartIdentity) -> Option<PartDefinition> {
     PART_DEFINITIONS.iter().copied().find(|definition| {
-        definition.logical_device == identity.logical_device
+        definition.logical_function == identity.logical_function
             && definition.manufacturer == identity.manufacturer.as_deref()
             && definition.manufacturer_part_number == identity.manufacturer_part_number.as_deref()
+            && definition.package == identity.package.as_deref()
     })
 }
 
@@ -273,14 +277,19 @@ mod tests {
     #[test]
     fn vendored_assets_match_the_catalog() {
         let resistor_identity = PartIdentity {
-            logical_device: "resistor".to_owned(),
+            logical_function: "resistor".to_owned(),
             manufacturer: Some("Yageo".to_owned()),
             manufacturer_part_number: Some("RC0603FR-0710KL".to_owned()),
+            package: Some("0603_1608Metric".to_owned()),
+            lifecycle: None,
+            sourcing: None,
+            approved_substitutions: Vec::new(),
         };
         let resistor = part(&resistor_identity).expect("resistor part binding must exist");
-        assert_eq!(resistor.logical_device, "resistor");
+        assert_eq!(resistor.logical_function, "resistor");
         assert_eq!(resistor.manufacturer, Some("Yageo"));
         assert_eq!(resistor.manufacturer_part_number, Some("RC0603FR-0710KL"));
+        assert_eq!(resistor.package, Some("0603_1608Metric"));
         assert_eq!(resistor.symbol_library_id, "CircuitC:R");
         assert_eq!(
             resistor.footprint_library_id,
@@ -288,9 +297,13 @@ mod tests {
         );
         assert_eq!(
             part(&PartIdentity {
-                logical_device: "dc_voltage_source".to_owned(),
+                logical_function: "dc_voltage_source".to_owned(),
                 manufacturer: None,
                 manufacturer_part_number: None,
+                package: None,
+                lifecycle: None,
+                sourcing: None,
+                approved_substitutions: Vec::new(),
             })
             .expect("voltage source part binding must exist")
             .footprint_library_id,
@@ -474,14 +487,22 @@ mod tests {
     fn catalog_lookup_rejects_incoherent_exact_part_identities() {
         for identity in [
             PartIdentity {
-                logical_device: "resistor".to_owned(),
+                logical_function: "resistor".to_owned(),
                 manufacturer: Some("Acme".to_owned()),
                 manufacturer_part_number: Some("banana".to_owned()),
+                package: Some("0603_1608Metric".to_owned()),
+                lifecycle: None,
+                sourcing: None,
+                approved_substitutions: Vec::new(),
             },
             PartIdentity {
-                logical_device: "dc_voltage_source".to_owned(),
+                logical_function: "dc_voltage_source".to_owned(),
                 manufacturer: Some("Acme".to_owned()),
                 manufacturer_part_number: Some("VIRTUAL".to_owned()),
+                package: Some("virtual".to_owned()),
+                lifecycle: None,
+                sourcing: None,
+                approved_substitutions: Vec::new(),
             },
         ] {
             assert_eq!(part(&identity), None);
