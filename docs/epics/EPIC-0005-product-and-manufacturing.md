@@ -308,9 +308,13 @@ The stack merged atomically with squash commits
 `44122c355730d606eba3288774223fbd13e0bdcc`,
 `6af193bc18a2a94a12d70caf8e91ff05546f03ba`,
 `2f88dbf0ed12bb0e34712297cae654c9f897169a`, and
-`e0f509696a1dcd4af4e1a7bce1e9ae2fb70eb3ba`. The final reviewed PR tree and
-the integrated `main` tree were both
-`41e2c9b94bcc7aea191290aaca19cae213970ad5`.
+`e0f509696a1dcd4af4e1a7bce1e9ae2fb70eb3ba`. The post-merge completion and
+publication-hardening audit merged through
+[#32](https://github.com/winstanley-industries/circuitc/pull/32). Its exact
+approved head was `6c5c06d12986908cd366782f002ffe8aa2e02762` and the final integrated
+implementation commit on `main` was `761ae0bacb3841272847f79e3c2723fffefe477c`;
+both have tree
+`be14da5da875ee4c0fae9a0a8e8a7950438b07bd`.
 
 | Requirements | Durable implementation evidence |
 | --- | --- |
@@ -321,10 +325,15 @@ the integrated `main` tree were both
 
 The integrated implementation and completion audit passed `bazel lint //...`,
 ordinary and strict-lockfile repository builds, strict module graph
-resolution, the complete 372-test Rust harness serialized and uncached, the
+resolution, the complete 373-test Rust harness serialized and uncached, the
 three uncached KiCad 10 analysis/DRC/manufacturing host gates, and the checked
 simulation, checked routing, and route-acceptance manifest gates. Two initial
 post-merge macOS parallel runs each made one of the two Ohmnivore-spawning
 tests exceed its wall-clock allowance under concurrent host load. The final
 completion head passed both required repository-wide invocations, the complete
 serialized harness, and every protected exact-head Linux test gate.
+PR #32 passed exact-head Linux, workflow-security, and Claude review, received
+an exact-head approval, and had zero unresolved review threads. The
+implementation-complete `main` push passed Linux and workflow-security on
+`761ae0bacb3841272847f79e3c2723fffefe477c`; the PR-only Claude job was
+correctly skipped on that push event.
