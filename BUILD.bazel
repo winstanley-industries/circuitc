@@ -340,9 +340,23 @@ rust_binary(
     ],
 )
 
+rust_binary(
+    name = "board_analysis_gate",
+    testonly = True,
+    srcs = ["tools/product_analysis/analysis_gate.rs"],
+    crate_name = "board_analysis_gate",
+    edition = "2024",
+    rustc_flags = RUSTC_FLAGS,
+    deps = [
+        ":circuitc",
+        "@crates//libc",
+    ],
+)
+
 rustfmt_test(
     name = "rustfmt_test",
     targets = [
+        ":board_analysis_gate",
         ":circuitc",
         ":fabrication_gate",
         ":frontend_equivalence",
@@ -363,6 +377,7 @@ rust_clippy(
     testonly = True,
     deps = [
         ":apgar_route_provenance_writer",
+        ":board_analysis_gate",
         ":circuitc",
         ":fabrication_gate",
         ":frontend_equivalence",
@@ -553,5 +568,68 @@ sh_test(
         "tools/simulation/fixtures/checked_voltage_divider.circuitc",
         ":fabrication_gate",
         "//cmd/circuitc",
+    ],
+)
+
+sh_test(
+    name = "kicad_analysis_runner_test",
+    srcs = ["tools/product_analysis/run_kicad_analysis_test.sh"],
+    args = [
+        "$(location tools/product_analysis/run_kicad_analysis.py)",
+        "$(location tools/product_analysis/fixtures/fake_kicad_10.py)",
+        "$(location tools/product_analysis/fixtures/fake_analysis_host.py)",
+        "$(location tools/product_analysis/fixtures/fake_analysis_host_stdout_over.py)",
+        "$(location tools/product_analysis/fixtures/fake_analysis_host_stdout_exact.py)",
+        "$(location tools/product_analysis/fixtures/make_analysis_request.py)",
+        "$(location tools/product_analysis/fixtures/mutate_analysis_request.py)",
+        "$(location tools/product_analysis/fixtures/fake_analysis_normalizer.py)",
+    ],
+    data = [
+        "tools/product_analysis/fixtures/fake_analysis_host.py",
+        "tools/product_analysis/fixtures/fake_analysis_host_stdout_exact.py",
+        "tools/product_analysis/fixtures/fake_analysis_host_stdout_over.py",
+        "tools/product_analysis/fixtures/fake_analysis_normalizer.py",
+        "tools/product_analysis/fixtures/fake_kicad_10.py",
+        "tools/product_analysis/fixtures/make_analysis_request.py",
+        "tools/product_analysis/fixtures/mutate_analysis_request.py",
+        "tools/product_analysis/run_kicad_analysis.py",
+    ],
+)
+
+sh_test(
+    name = "kicad_host_validation_runner_test",
+    srcs = ["tools/kicad/run_host_validation_test.sh"],
+    args = ["$(location tools/kicad/run_host_validation.py)"],
+    data = ["tools/kicad/run_host_validation.py"],
+)
+
+sh_test(
+    name = "kicad10_analysis_test",
+    srcs = ["tools/product_analysis/kicad10_analysis_test.sh"],
+    args = [
+        "$(location //cmd/circuitc)",
+        "$(location tools/manufacturing/run_kicad_fabrication.py)",
+        "$(location :fabrication_gate)",
+        "$(location :board_analysis_gate)",
+        "$(location tools/product_analysis/run_kicad_analysis.py)",
+        "$(location tools/kicad/normalize_drc.py)",
+        "$(location tools/kicad/run_host_validation.py)",
+        "$(location examples/voltage_divider.circuitc)",
+        "$(location catalogs/reference-catalog.json)",
+    ],
+    data = [
+        "catalogs/reference-catalog.json",
+        "examples/voltage_divider.circuitc",
+        "tools/kicad/normalize_drc.py",
+        "tools/kicad/run_host_validation.py",
+        "tools/manufacturing/run_kicad_fabrication.py",
+        "tools/product_analysis/run_kicad_analysis.py",
+        ":board_analysis_gate",
+        ":fabrication_gate",
+        "//cmd/circuitc",
+    ],
+    tags = [
+        "local",
+        "manual",
     ],
 )

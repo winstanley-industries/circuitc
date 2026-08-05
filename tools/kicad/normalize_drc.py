@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import pathlib
 import re
 import stat
@@ -30,11 +31,56 @@ class ValidationError(Exception):
     pass
 
 
+def _strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValidationError(f"duplicate JSON object key {key!r}")
+        result[key] = value
+    return result
+
+
+def _bounded_json(path: pathlib.Path, label: str) -> Any:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(path, flags)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > MAX_SOURCE_BYTES:
+            raise ValidationError(f"{label} is not a bounded regular file")
+        chunks: list[bytes] = []
+        total = 0
+        while chunk := os.read(descriptor, 8192):
+            total += len(chunk)
+            if total > MAX_SOURCE_BYTES:
+                raise ValidationError(f"{label} exceeds the 64 MiB byte limit")
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if (
+            total != before.st_size
+            or before.st_dev != after.st_dev
+            or before.st_ino != after.st_ino
+            or before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+            or before.st_ctime_ns != after.st_ctime_ns
+        ):
+            raise ValidationError(f"{label} changed while it was read")
+    finally:
+        os.close(descriptor)
+    try:
+        return json.loads(b"".join(chunks), object_pairs_hook=_strict_object)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValidationError(f"{label} is invalid JSON: {error}") from error
+
+
 def _require_list(report: dict[str, Any], key: str) -> list[Any]:
     value = report.get(key)
     if not isinstance(value, list):
         raise ValidationError(f"KiCad report field {key!r} must be a list")
     return value
+
+
+def _canonical_sort_key(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
 def _canonical_items(
@@ -55,10 +101,7 @@ def _canonical_items(
                 raise ValidationError(f"KiCad finding UUID {uuid} is absent from the identity map")
             normalized_item["circuitc"] = identity_map[uuid]
         normalized.append(normalized_item)
-    return sorted(
-        normalized,
-        key=lambda value: json.dumps(value, sort_keys=True, separators=(",", ":")),
-    )
+    return sorted(normalized, key=_canonical_sort_key)
 
 
 def _canonical_findings(
@@ -76,10 +119,7 @@ def _canonical_findings(
         normalized_finding = dict(finding)
         normalized_finding["items"] = _canonical_items(raw_items, identity_map)
         normalized.append(normalized_finding)
-    return sorted(
-        normalized,
-        key=lambda value: json.dumps(value, sort_keys=True, separators=(",", ":")),
-    )
+    return sorted(normalized, key=_canonical_sort_key)
 
 
 def _validate_report_policy(
@@ -125,6 +165,7 @@ def normalize(
     allowed_library_references: list[str],
     allowed_ignored_checks: list[str],
     identity_map: dict[str, dict[str, Any]] | None = None,
+    retain_findings: bool = False,
 ) -> dict[str, Any]:
     if report.get("$schema") != DRC_SCHEMA:
         raise ValidationError(f"unsupported KiCad DRC schema {report.get('$schema')!r}")
@@ -149,7 +190,7 @@ def normalize(
         identity_map,
         "schematic-parity",
     )
-    if normalized_unconnected or normalized_schematic_parity:
+    if not retain_findings and (normalized_unconnected or normalized_schematic_parity):
         raise ValidationError(
             "unexpected KiCad connectivity findings: "
             + json.dumps(
@@ -199,20 +240,19 @@ def normalize(
             }
         )
 
-    if unexpected_violations:
+    if unexpected_violations and not retain_findings:
         raise ValidationError(
             "unexpected KiCad violations: "
             + json.dumps(
-                sorted(
-                    unexpected_violations,
-                    key=lambda value: json.dumps(value, sort_keys=True, separators=(",", ":")),
-                ),
+                sorted(unexpected_violations, key=_canonical_sort_key),
                 sort_keys=True,
                 separators=(",", ":"),
             )
         )
 
-    if sorted(observed_library_references) != sorted(allowed_library_references):
+    if not retain_findings and sorted(observed_library_references) != sorted(
+        allowed_library_references
+    ):
         raise ValidationError(
             "KiCad library-warning references do not match the allowlist: "
             f"observed {sorted(observed_library_references)!r}, "
@@ -235,11 +275,10 @@ def normalize(
         "coordinate_units": coordinate_units,
         "included_severities": included_severities,
         "ignored_checks": ignored_checks,
-        "schematic_parity": [],
-        "unconnected_items": [],
+        "schematic_parity": normalized_schematic_parity,
+        "unconnected_items": normalized_unconnected,
         "violations": sorted(
-            normalized_violations,
-            key=lambda value: json.dumps(value, sort_keys=True, separators=(",", ":")),
+            normalized_violations + unexpected_violations, key=_canonical_sort_key
         ),
     }
 
@@ -249,6 +288,7 @@ def normalize_erc(
     expected_major: int,
     allowed_ignored_checks: list[str],
     identity_map: dict[str, dict[str, Any]] | None = None,
+    retain_findings: bool = False,
 ) -> dict[str, Any]:
     if report.get("$schema") != ERC_SCHEMA:
         raise ValidationError(f"unsupported KiCad ERC schema {report.get('$schema')!r}")
@@ -287,7 +327,7 @@ def normalize_erc(
         if violations:
             unexpected_sheets.append(normalized_sheet)
 
-    if unexpected_sheets:
+    if unexpected_sheets and not retain_findings:
         raise ValidationError(
             "unexpected KiCad ERC violations: "
             + json.dumps(
@@ -330,8 +370,7 @@ def load_identity_map(
 ) -> tuple[dict[str, dict[str, Any]] | None, str | None]:
     if path is None:
         return None, None
-    with path.open(encoding="utf-8") as source:
-        manifest = json.load(source)
+    manifest = _bounded_json(path, "CircuitC KiCad identity map")
     if (
         not isinstance(manifest, dict)
         or type(manifest.get("schema_version")) is not int
@@ -456,6 +495,7 @@ def main() -> int:
     parser.add_argument("--identity-map", type=pathlib.Path)
     parser.add_argument("--source-artifact", type=pathlib.Path)
     parser.add_argument("--expected-source-sha256")
+    parser.add_argument("--retain-findings", action="store_true")
     args = parser.parse_args()
 
     try:
@@ -467,8 +507,7 @@ def main() -> int:
             r"[0-9a-f]{64}", args.expected_source_sha256
         ):
             raise ValidationError("pre-execution source SHA-256 is not canonical")
-        with args.raw.open(encoding="utf-8") as source:
-            report = json.load(source)
+        report = _bounded_json(args.raw, "KiCad raw report")
         if not isinstance(report, dict):
             raise ValidationError("KiCad DRC report root must be an object")
         identity_map, manifest_source = load_identity_map(args.identity_map)
@@ -481,6 +520,7 @@ def main() -> int:
                 args.expected_major,
                 args.allow_ignored_check,
                 identity_map,
+                args.retain_findings,
             )
         else:
             normalized = normalize(
@@ -489,6 +529,7 @@ def main() -> int:
                 args.allow_library_warning,
                 args.allow_ignored_check,
                 identity_map,
+                args.retain_findings,
             )
         if args.source_artifact is not None:
             source_sha256 = source_artifact_sha256(report, args.source_artifact)

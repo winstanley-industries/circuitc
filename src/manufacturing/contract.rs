@@ -59,12 +59,38 @@ pub struct FabricationFile {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FabricationManifestBundle {
-    pub fabrication_identity_sha256: String,
-    pub request_path: RelativeArtifactPath,
-    pub manifest_path: RelativeArtifactPath,
-    pub request_json: String,
-    pub manifest_json: String,
-    pub files: Vec<FabricationFile>,
+    pub(crate) fabrication_identity_sha256: String,
+    pub(crate) request_path: RelativeArtifactPath,
+    pub(crate) manifest_path: RelativeArtifactPath,
+    pub(crate) request_json: String,
+    pub(crate) manifest_json: String,
+    pub(crate) files: Vec<FabricationFile>,
+}
+
+impl FabricationManifestBundle {
+    pub fn fabrication_identity_sha256(&self) -> &str {
+        &self.fabrication_identity_sha256
+    }
+
+    pub fn request_path(&self) -> &RelativeArtifactPath {
+        &self.request_path
+    }
+
+    pub fn manifest_path(&self) -> &RelativeArtifactPath {
+        &self.manifest_path
+    }
+
+    pub fn request_json(&self) -> &str {
+        &self.request_json
+    }
+
+    pub fn manifest_json(&self) -> &str {
+        &self.manifest_json
+    }
+
+    pub fn files(&self) -> &[FabricationFile] {
+        &self.files
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

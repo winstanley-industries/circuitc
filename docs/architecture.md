@@ -203,6 +203,21 @@ creation dates, and binds every normalized byte into a fabrication manifest.
 Raw host files are transient. Design IR v1 has no drill primitive, so a nonzero
 drill inventory fails unsupported rather than being silently accepted.
 
+The first product-analysis adapter is a separate strict post-compile boundary
+defined by ADR-0012. One request binds the exact schematic, PCB, identity map,
+expected schematic-sheet inventory, complete compiler-emitted KiCad project
+support inventory, and authenticated Layer-4 fabrication predecessor to the
+exact authored KiCad 10 analysis and its five capability assertions. The
+supported host runs from a private project containing only those authenticated
+bytes and emits separate normalized ERC and DRC evidence. CircuitC retains
+structurally valid findings and evaluates ERC
+violations, DRC policy, unconnected items, schematic parity, and fabrication
+completeness as five distinct pass-or-fail outcomes. Completed evidence is
+indivisible and binds the exact KiCad executable, normalizer, and host runner.
+Failed and unsupported executions retain deterministic nonacceptance records
+with no partial evidence. A green process exit or any one green capability
+cannot substitute for the other requested authorities.
+
 The KiCad IPC API is not the primary headless boundary for versions 9 and 10
 because it requires a running GUI. It may later support interactive preview or
 transactional host validation without entering the compiler core.

@@ -848,7 +848,7 @@ fn run_bind(arguments: &[String]) -> Result<(), String> {
     .map_err(|error| error.to_string())?;
     std::io::stdout()
         .lock()
-        .write_all(bundle.manifest_json.as_bytes())
+        .write_all(bundle.manifest_json().as_bytes())
         .map_err(|error| format!("failed to write verified manifest: {error}"))
 }
 
