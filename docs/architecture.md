@@ -76,6 +76,12 @@ cannot represent; it may not silently discard or reinterpret them.
     native inventory, narrow host-date normalization, Design/product joins,
     and fabrication manifest. Native position CSV is parity evidence and may
     not redefine canonical placement or product population.
+12. A release is an independently reverified closure of exact source, complete
+    canonical Design identity, applicable compiler/product/fabrication/
+    analysis/simulation/routing artifacts, and exact tool images. Its manifest
+    records that closure but does not become authority for omitted or stale
+    predecessors. One content-addressed release directory is immutable and is
+    exposed only by atomic no-replace publication.
 
 Edits made only to generated KiCad files are not round-tripped. Code-authored
 placement and routing belong in CircuitC source. A future importer may help

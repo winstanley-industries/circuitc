@@ -976,11 +976,21 @@ pub fn verify_kicad10_board_analysis_noncompletion(
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+    use std::fs;
+    use std::path::PathBuf;
+
     use serde_json::{Value, json};
 
-    use crate::frontend::compile_source;
+    use crate::frontend::{compile_source, compile_source_checked};
     use crate::manufacturing::{FabricationHostFile, bind_kicad10_fabrication};
     use crate::product::compile_product_artifacts;
+    use crate::release::{
+        ReleaseAnalysisEvidence, ReleaseFabricationEvidence, ReleaseInputs, ReleaseRoutingEvidence,
+        ReleaseToolchainEvidence, assemble_release, bind_release, verify_release,
+    };
+    use crate::simulation::assert::evaluate_assertions;
+    use crate::simulation::{canonical_f64, parse_result};
     use crate::{CompiledArtifacts, RelativeArtifactPath};
 
     use super::*;
@@ -1004,6 +1014,14 @@ mod tests {
 
     fn path(value: String) -> RelativeArtifactPath {
         RelativeArtifactPath::try_new(value).unwrap()
+    }
+
+    fn runfile(name: &str) -> Vec<u8> {
+        let root = env::var_os("RUNFILES_DIR")
+            .or_else(|| env::var_os("TEST_SRCDIR"))
+            .map(PathBuf::from)
+            .expect("Bazel test runfiles directory is available");
+        fs::read(root.join("_main").join(name)).expect("required release tool runfile is readable")
     }
 
     fn layer_specs() -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
@@ -1137,16 +1155,22 @@ mod tests {
             .collect()
     }
 
-    fn evidence(fixture: &Fixture) -> BoardAnalysisHostEvidence {
+    fn evidence_for(
+        design: &Design,
+        compiler: FabricationCompilerArtifacts<'_>,
+        product: &ProductArtifactBundle,
+        identity_map: &str,
+        fabrication: &FabricationManifestBundle,
+    ) -> BoardAnalysisHostEvidence {
         let prepared = prepare(
-            &fixture.design,
+            design,
             SNAPSHOT,
             "production",
-            FabricationCompilerArtifacts::Static(&fixture.compiled),
-            &fixture.product,
+            compiler,
+            product,
             ANALYSIS,
-            &fixture.identity_map,
-            &fixture.fabrication,
+            identity_map,
+            fabrication,
         )
         .unwrap();
         let schematic_sha = prepared.request.kicad_schematic.sha256.clone();
@@ -1218,16 +1242,33 @@ mod tests {
         }
     }
 
-    fn refresh_receipt(fixture: &Fixture, evidence: &mut BoardAnalysisHostEvidence) {
-        let prepared = prepare(
+    fn evidence(fixture: &Fixture) -> BoardAnalysisHostEvidence {
+        evidence_for(
             &fixture.design,
-            SNAPSHOT,
-            "production",
             FabricationCompilerArtifacts::Static(&fixture.compiled),
             &fixture.product,
-            ANALYSIS,
             &fixture.identity_map,
             &fixture.fabrication,
+        )
+    }
+
+    fn refresh_receipt_for(
+        design: &Design,
+        compiler: FabricationCompilerArtifacts<'_>,
+        product: &ProductArtifactBundle,
+        identity_map: &str,
+        fabrication: &FabricationManifestBundle,
+        evidence: &mut BoardAnalysisHostEvidence,
+    ) {
+        let prepared = prepare(
+            design,
+            SNAPSHOT,
+            "production",
+            compiler,
+            product,
+            ANALYSIS,
+            identity_map,
+            fabrication,
         )
         .unwrap();
         let receipt = Receipt {
@@ -1244,6 +1285,17 @@ mod tests {
             drc_sha256: sha256_hex(&evidence.drc_report_json),
         };
         evidence.receipt_json = canonical_json(&receipt, "receipt").unwrap().into_bytes();
+    }
+
+    fn refresh_receipt(fixture: &Fixture, evidence: &mut BoardAnalysisHostEvidence) {
+        refresh_receipt_for(
+            &fixture.design,
+            FabricationCompilerArtifacts::Static(&fixture.compiled),
+            &fixture.product,
+            &fixture.identity_map,
+            &fixture.fabrication,
+            evidence,
+        );
     }
 
     fn bind_fixture(
@@ -1355,6 +1407,658 @@ mod tests {
             &first,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn release_closure_reverifies_complete_static_predecessor_graph() {
+        let fixture = fixture();
+        let mut host_evidence = evidence(&fixture);
+        host_evidence.host_executable = FABRICATION_EXECUTABLE.to_vec();
+        refresh_receipt(&fixture, &mut host_evidence);
+        let analysis = bind_fixture(&fixture, &host_evidence);
+        let fabrication_host_files = raw_fabrication_files();
+        let toolchain = ReleaseToolchainEvidence {
+            ohmnivore_executable: None,
+            ohmnivore_provenance: None,
+            apgar_executable: None,
+            apgar_provenance: None,
+        };
+        let inputs = ReleaseInputs {
+            source: SOURCE,
+            design: &fixture.design,
+            catalog_snapshot: SNAPSHOT,
+            variant_path: "production",
+            compiler: FabricationCompilerArtifacts::Static(&fixture.compiled),
+            kicad_identity_map_json: &fixture.identity_map,
+            product: &fixture.product,
+            fabrication: ReleaseFabricationEvidence {
+                analysis_path: ANALYSIS,
+                assertion_path: FABRICATION_ASSERTION,
+                host_version: ADAPTER_VERSION,
+                host_executable: FABRICATION_EXECUTABLE,
+                host_files: &fabrication_host_files,
+                bundle: &fixture.fabrication,
+            },
+            analysis: ReleaseAnalysisEvidence {
+                analysis_path: ANALYSIS,
+                host: &host_evidence,
+                bundle: &analysis,
+            },
+            routing: None,
+            tools: toolchain,
+        };
+
+        let first = bind_release(&inputs).unwrap();
+        let second = bind_release(&inputs).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.files().first().unwrap().path.as_str(), "request.json");
+        assert_eq!(first.files().last().unwrap().path.as_str(), "manifest.json");
+        assert!(first.root().as_str().starts_with("release/"));
+        assert!(first.request_json().ends_with('\n'));
+        assert!(first.manifest_json().ends_with('\n'));
+        verify_release(&inputs, &first).unwrap();
+        let assembled = assemble_release(first.root().clone(), first.files().to_vec()).unwrap();
+        verify_release(&inputs, &assembled).unwrap();
+
+        let mut changed = first.clone();
+        changed.files[1].contents.push(b'x');
+        assert_eq!(
+            verify_release(&inputs, &changed).unwrap_err().code,
+            "CC-RELEASE-VERIFY-001"
+        );
+        let mut omitted_files = first.files().to_vec();
+        omitted_files.remove(1);
+        let omitted = assemble_release(first.root().clone(), omitted_files).unwrap();
+        assert_eq!(
+            verify_release(&inputs, &omitted).unwrap_err().code,
+            "CC-RELEASE-VERIFY-001"
+        );
+
+        let reject_contract_mutation = |path: &str, contents: String| {
+            let mut files = first.files().to_vec();
+            let file = files
+                .iter_mut()
+                .find(|file| file.path.as_str() == path)
+                .expect("release contract file is present");
+            file.contents = contents.into_bytes();
+            let candidate = assemble_release(first.root().clone(), files).unwrap();
+            assert_eq!(
+                verify_release(&inputs, &candidate).unwrap_err().code,
+                "CC-RELEASE-VERIFY-001"
+            );
+        };
+        for contract in [first.request_json(), first.manifest_json()] {
+            let path = if contract == first.request_json() {
+                "request.json"
+            } else {
+                "manifest.json"
+            };
+            reject_contract_mutation(path, format!("{contract} "));
+            reject_contract_mutation(path, contract.replacen('{', "{\"unknown\":0,", 1));
+            reject_contract_mutation(
+                path,
+                contract.replacen(
+                    "\"schema_name\":",
+                    "\"schema_name\":\"duplicate\",\"schema_name\":",
+                    1,
+                ),
+            );
+            let value: Value = serde_json::from_str(contract).unwrap();
+            reject_contract_mutation(
+                path,
+                format!("{}\n", serde_json::to_string_pretty(&value).unwrap()),
+            );
+        }
+
+        let changed_source = format!("// release-significant comment\n{SOURCE}");
+        let stale_source_inputs = ReleaseInputs {
+            source: &changed_source,
+            ..inputs
+        };
+        assert_eq!(
+            bind_release(&stale_source_inputs).unwrap_err().code,
+            "CC-RELEASE-SOURCE-001"
+        );
+        let semantically_changed_source =
+            SOURCE.replacen("resistance 10 kohm", "resistance 11 kohm", 1);
+        let stale_semantic_inputs = ReleaseInputs {
+            source: &semantically_changed_source,
+            ..inputs
+        };
+        assert_eq!(
+            bind_release(&stale_semantic_inputs).unwrap_err().code,
+            "CC-RELEASE-SOURCE-001"
+        );
+
+        let mut stale_compiled = fixture.compiled.clone();
+        stale_compiled.kicad_pcb.push('\n');
+        let stale_compiler_inputs = ReleaseInputs {
+            compiler: FabricationCompilerArtifacts::Static(&stale_compiled),
+            ..inputs
+        };
+        assert_eq!(
+            bind_release(&stale_compiler_inputs).unwrap_err().code,
+            "CC-RELEASE-COMPILER-001"
+        );
+
+        let mut stale_product = fixture.product.clone();
+        let stale_resolution: Value = serde_json::from_str(&stale_product.resolution_json).unwrap();
+        let catalog_snapshot_id = stale_resolution["catalog_snapshot_id"].as_str().unwrap();
+        let catalog_snapshot_token = format!(
+            "\"catalog_snapshot_id\":{}",
+            serde_json::to_string(catalog_snapshot_id).unwrap()
+        );
+        let forged_snapshot_id = format!("{catalog_snapshot_id}-forged");
+        assert_eq!(
+            stale_product
+                .resolution_json
+                .matches(&catalog_snapshot_token)
+                .count(),
+            1
+        );
+        let original_resolution_sha256 = sha256_hex(stale_product.resolution_json.as_bytes());
+        stale_product.resolution_json = stale_product.resolution_json.replacen(
+            &catalog_snapshot_token,
+            &format!(
+                "\"catalog_snapshot_id\":{}",
+                serde_json::to_string(&forged_snapshot_id).unwrap()
+            ),
+            1,
+        );
+        let forged_resolution_sha256 = sha256_hex(stale_product.resolution_json.as_bytes());
+        let resolution_digest_token =
+            format!("\"product_resolution_sha256\":\"{original_resolution_sha256}\"");
+        let forged_resolution_digest =
+            format!("\"product_resolution_sha256\":\"{forged_resolution_sha256}\"");
+        for derived_json in [
+            &mut stale_product.bom_json,
+            &mut stale_product.placement_json,
+            &mut stale_product.assembly_json,
+        ] {
+            assert_eq!(derived_json.matches(&resolution_digest_token).count(), 1);
+            *derived_json =
+                derived_json.replacen(&resolution_digest_token, &forged_resolution_digest, 1);
+        }
+        let stale_product_inputs = ReleaseInputs {
+            product: &stale_product,
+            ..inputs
+        };
+        assert_eq!(
+            bind_release(&stale_product_inputs).unwrap_err().code,
+            "CC-RELEASE-PRODUCT-001"
+        );
+
+        let mut stale_fabrication = fixture.fabrication.clone();
+        let expected_version_token = format!("\"expected_version\":\"{ADAPTER_VERSION}\"");
+        assert_eq!(
+            stale_fabrication
+                .request_json()
+                .matches(&expected_version_token)
+                .count(),
+            1
+        );
+        stale_fabrication.request_json = stale_fabrication.request_json().replacen(
+            &expected_version_token,
+            "\"expected_version\":\"10.0.4\"",
+            1,
+        );
+        let stale_fabrication_inputs = ReleaseInputs {
+            fabrication: ReleaseFabricationEvidence {
+                bundle: &stale_fabrication,
+                ..inputs.fabrication
+            },
+            ..inputs
+        };
+        assert_eq!(
+            bind_release(&stale_fabrication_inputs).unwrap_err().code,
+            "CC-RELEASE-FABRICATION-001"
+        );
+
+        let mut failing_host = host_evidence.clone();
+        let mut drc: Value = serde_json::from_slice(&failing_host.drc_report_json).unwrap();
+        drc["violations"] = Value::Array(vec![dirty_finding(&fixture, "clearance")]);
+        failing_host.drc_report_json = pretty(&drc);
+        refresh_receipt(&fixture, &mut failing_host);
+        let failing_analysis = bind_fixture(&fixture, &failing_host);
+        let failing_analysis_inputs = ReleaseInputs {
+            analysis: ReleaseAnalysisEvidence {
+                analysis_path: ANALYSIS,
+                host: &failing_host,
+                bundle: &failing_analysis,
+            },
+            ..inputs
+        };
+        assert_eq!(
+            bind_release(&failing_analysis_inputs).unwrap_err().code,
+            "CC-RELEASE-ANALYSIS-001"
+        );
+
+        let wrong_analysis_path_inputs = ReleaseInputs {
+            analysis: ReleaseAnalysisEvidence {
+                analysis_path: "release.other",
+                ..inputs.analysis
+            },
+            ..inputs
+        };
+        let diagnostic = bind_release(&wrong_analysis_path_inputs).unwrap_err();
+        assert_eq!(diagnostic.code, "CC-RELEASE-ANALYSIS-001");
+        assert_eq!(diagnostic.path, "analysis_path");
+        assert_eq!(
+            diagnostic.message,
+            "fabrication and board-analysis evidence do not name the same analysis"
+        );
+        let mut mismatched_host = host_evidence.clone();
+        mismatched_host.host_executable.push(b'x');
+        let mismatched_tool_inputs = ReleaseInputs {
+            analysis: ReleaseAnalysisEvidence {
+                host: &mismatched_host,
+                ..inputs.analysis
+            },
+            ..inputs
+        };
+        assert_eq!(
+            bind_release(&mismatched_tool_inputs).unwrap_err().code,
+            "CC-RELEASE-TOOL-001"
+        );
+    }
+
+    fn exercise_checked_release_case(simulation: bool, routing_applicable: bool) {
+        let mut source = SOURCE.to_owned();
+        if simulation {
+            source = source.replacen(
+                "  manufacturability release.manufacturability",
+                "  analysis dc_operating_point simulation.dc;\n  assert net_voltage checks.vout analysis simulation.dc net VOUT sample scalar expected 5 V absolute_tolerance 0.001 V relative_tolerance 0 ratio;\n\n  manufacturability release.manufacturability",
+                1,
+            );
+        }
+        if routing_applicable {
+            source = source.replacen(
+                "route board.routes.vout_bridge net VOUT from (16 mm, 10 mm) to (24 mm, 10 mm) width 0.25 mm layer front;",
+                "autoroute board.autoroute.vout net VOUT width 0.25 mm clearance 0.2 mm grid 1 mm layer front;",
+                1,
+            );
+        }
+        let work_root = env::var_os("TEST_TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(env::temp_dir)
+            .join(format!("release-checked-{simulation}-{routing_applicable}"));
+        let compiled_source =
+            compile_source_checked("input.circuitc", &source, &work_root).unwrap();
+        let design = &compiled_source.elaborated.design;
+        let checked = &compiled_source.artifacts;
+        let identity_map = &compiled_source.kicad_identity_map;
+        assert_eq!(checked.simulations().len(), usize::from(simulation));
+        assert_eq!(checked.routing().is_some(), routing_applicable);
+
+        let product = compile_product_artifacts(design, SNAPSHOT, "production").unwrap();
+        let fabrication_host_files = raw_fabrication_files();
+        let fabrication = bind_kicad10_fabrication(
+            design,
+            SNAPSHOT,
+            "production",
+            FabricationCompilerArtifacts::Checked(checked),
+            &product,
+            ANALYSIS,
+            FABRICATION_ASSERTION,
+            ADAPTER_VERSION,
+            FABRICATION_EXECUTABLE,
+            &fabrication_host_files,
+        )
+        .unwrap();
+        let mut host_evidence = evidence_for(
+            design,
+            FabricationCompilerArtifacts::Checked(checked),
+            &product,
+            identity_map,
+            &fabrication,
+        );
+        host_evidence.host_executable = FABRICATION_EXECUTABLE.to_vec();
+        refresh_receipt_for(
+            design,
+            FabricationCompilerArtifacts::Checked(checked),
+            &product,
+            identity_map,
+            &fabrication,
+            &mut host_evidence,
+        );
+        let analysis = bind_kicad10_board_analysis(
+            design,
+            SNAPSHOT,
+            "production",
+            FabricationCompilerArtifacts::Checked(checked),
+            &product,
+            ANALYSIS,
+            identity_map,
+            &fabrication,
+            &host_evidence,
+        )
+        .unwrap();
+
+        let ohmnivore_executable = runfile("ohmnivore-cpu");
+        let ohmnivore_provenance = runfile("ohmnivore-provenance.txt");
+        let apgar_executable = runfile("apgar_route_adapter");
+        let apgar_provenance = runfile("apgar-route-provenance.txt");
+        let mut acceptance_json = if let Some(routing) = checked.routing() {
+            let verified_apgar_json = crate::routing::evidence::verify(
+                &routing.request_json,
+                &routing.result_json,
+                std::str::from_utf8(&apgar_provenance).unwrap(),
+            )
+            .unwrap();
+            let verified_apgar: Value = serde_json::from_str(&verified_apgar_json).unwrap();
+            let erc = analysis
+                .files()
+                .iter()
+                .find(|file| {
+                    file.path
+                        .as_str()
+                        .ends_with("/evidence/erc.normalized.json")
+                })
+                .unwrap();
+            let drc = analysis
+                .files()
+                .iter()
+                .find(|file| {
+                    file.path
+                        .as_str()
+                        .ends_with("/evidence/drc.normalized.json")
+                })
+                .unwrap();
+            serde_json::to_string(&json!({
+            "authorities": {
+                "apgar_exact_admission": true,
+                "kicad_drc_clean": true,
+                "kicad_erc_clean": true,
+                "kicad_schematic_parity_clean": true,
+                "kicad_unconnected_clean": true
+            },
+            "candidate": {
+                "geometry_signature": verified_apgar["candidate_geometry_signature"],
+                "payload_checksum": verified_apgar["candidate_payload_checksum"],
+                "resource_signature": verified_apgar["candidate_resource_signature"]
+            },
+            "design_name": design.name,
+            "kicad": {
+                "drc_filename": "drc.normalized.json",
+                "drc_sha256": sha256_hex(&drc.contents),
+                "erc_filename": "erc.normalized.json",
+                "erc_sha256": sha256_hex(&erc.contents),
+                "host": {"major": 10, "name": "kicad", "version": ADAPTER_VERSION},
+                "pcb_filename": format!("{}.kicad_pcb", design.name),
+                "pcb_sha256": sha256_hex(checked.static_artifacts().kicad_pcb.as_bytes()),
+                "schematic_filename": format!("{}.kicad_sch", design.name),
+                "schematic_sha256": sha256_hex(checked.static_artifacts().kicad_schematic.as_bytes())
+            },
+            "projection_sha256": routing.projection_sha256,
+            "request_identity_sha256": routing.request_identity_sha256,
+            "request_path": design.board.routing_requests[0].path,
+            "request_sha256": routing.request_sha256,
+            "result_sha256": routing.result_sha256,
+            "schema_name": "circuitc.apgar_route_acceptance",
+            "schema_version": 1,
+            "selected_candidate_id": routing.selected_candidate_id,
+            "tool": verified_apgar["tool"],
+            "tool_provenance_sha256": sha256_hex(&apgar_provenance)
+            }))
+            .unwrap()
+        } else {
+            String::new()
+        };
+        if routing_applicable {
+            acceptance_json.push('\n');
+        }
+
+        let inputs = ReleaseInputs {
+            source: &source,
+            design,
+            catalog_snapshot: SNAPSHOT,
+            variant_path: "production",
+            compiler: FabricationCompilerArtifacts::Checked(checked),
+            kicad_identity_map_json: identity_map,
+            product: &product,
+            fabrication: ReleaseFabricationEvidence {
+                analysis_path: ANALYSIS,
+                assertion_path: FABRICATION_ASSERTION,
+                host_version: ADAPTER_VERSION,
+                host_executable: FABRICATION_EXECUTABLE,
+                host_files: &fabrication_host_files,
+                bundle: &fabrication,
+            },
+            analysis: ReleaseAnalysisEvidence {
+                analysis_path: ANALYSIS,
+                host: &host_evidence,
+                bundle: &analysis,
+            },
+            routing: routing_applicable.then_some(ReleaseRoutingEvidence {
+                acceptance_json: &acceptance_json,
+            }),
+            tools: ReleaseToolchainEvidence {
+                ohmnivore_executable: simulation.then_some(ohmnivore_executable.as_slice()),
+                ohmnivore_provenance: simulation.then_some(ohmnivore_provenance.as_slice()),
+                apgar_executable: routing_applicable.then_some(apgar_executable.as_slice()),
+                apgar_provenance: routing_applicable.then_some(apgar_provenance.as_slice()),
+            },
+        };
+        let release = bind_release(&inputs).unwrap();
+        verify_release(&inputs, &release).unwrap();
+        let request: Value = serde_json::from_str(release.request_json()).unwrap();
+        let mut expected_tools = vec!["kicad", "analysis_normalizer", "analysis_host_runner"];
+        if simulation {
+            expected_tools.push("ohmnivore");
+        }
+        if routing_applicable {
+            expected_tools.push("apgar");
+        }
+        assert_eq!(
+            request["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| tool["role"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            expected_tools
+        );
+        assert_eq!(request["applicability"]["simulation"], simulation);
+        assert_eq!(request["applicability"]["routing"], routing_applicable);
+        let artifact_roles = request["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|artifact| artifact["role"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        for role in [
+            "simulation_netlist",
+            "simulation_request",
+            "simulation_identity_map",
+            "simulation_result",
+            "simulation_report",
+            "ohmnivore_provenance",
+        ] {
+            assert_eq!(artifact_roles.contains(&role), simulation, "{role}");
+        }
+        for role in [
+            "routing_request",
+            "routing_result",
+            "routing_projection",
+            "routing_acceptance",
+            "apgar_provenance",
+        ] {
+            assert_eq!(artifact_roles.contains(&role), routing_applicable, "{role}");
+        }
+        let manifest: Value = serde_json::from_str(release.manifest_json()).unwrap();
+        let validation_capabilities = manifest["validations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|validation| validation["capability"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(validation_capabilities.contains(&"simulation"), simulation);
+        assert_eq!(
+            validation_capabilities.contains(&"routing"),
+            routing_applicable
+        );
+
+        if simulation {
+            let mut stale_checked = (*checked).clone();
+            stale_checked.static_artifacts_mut().kicad_pcb.push('\n');
+            let stale_checked_inputs = ReleaseInputs {
+                compiler: FabricationCompilerArtifacts::Checked(&stale_checked),
+                ..inputs
+            };
+            assert_eq!(
+                bind_release(&stale_checked_inputs).unwrap_err().code,
+                "CC-RELEASE-COMPILER-001"
+            );
+
+            let mut failing_checked = (*checked).clone();
+            let simulation_evidence = &mut failing_checked.simulations_mut()[0];
+            let mut failing_result = parse_result(&simulation_evidence.result_json).unwrap();
+            for signal in &mut failing_result.signals {
+                for value in &mut signal.values {
+                    *value = canonical_f64(6.0).unwrap();
+                }
+            }
+            let failing_result_json = failing_result.to_canonical_json().unwrap();
+            let failing_evaluation = evaluate_assertions(
+                simulation_evidence.request_json.as_bytes(),
+                simulation_evidence.spice_identity_map_json.as_bytes(),
+                failing_result_json.as_bytes(),
+            )
+            .unwrap();
+            assert!(!failing_evaluation.checked_success);
+            simulation_evidence.result_json = failing_result_json;
+            simulation_evidence.report_json = failing_evaluation.report_json;
+            let failing_simulation_inputs = ReleaseInputs {
+                compiler: FabricationCompilerArtifacts::Checked(&failing_checked),
+                ..inputs
+            };
+            assert_eq!(
+                bind_release(&failing_simulation_inputs).unwrap_err().code,
+                "CC-RELEASE-SIMULATION-001"
+            );
+
+            let mut wrong_ohmnivore = ohmnivore_executable.clone();
+            wrong_ohmnivore.push(0);
+            let stale_tool_inputs = ReleaseInputs {
+                tools: ReleaseToolchainEvidence {
+                    ohmnivore_executable: Some(&wrong_ohmnivore),
+                    ..inputs.tools
+                },
+                ..inputs
+            };
+            assert_eq!(
+                bind_release(&stale_tool_inputs).unwrap_err().code,
+                "CC-RELEASE-TOOL-001"
+            );
+            for retained_digest in [None, Some("0".repeat(64))] {
+                let mut substituted_checked = (*checked).clone();
+                substituted_checked.simulations_mut()[0].tool_executable_sha256 = retained_digest;
+                let substituted_tool_inputs = ReleaseInputs {
+                    compiler: FabricationCompilerArtifacts::Checked(&substituted_checked),
+                    ..inputs
+                };
+                assert_eq!(
+                    bind_release(&substituted_tool_inputs).unwrap_err().code,
+                    "CC-RELEASE-TOOL-001"
+                );
+            }
+            let missing_tool_inputs = ReleaseInputs {
+                tools: ReleaseToolchainEvidence {
+                    ohmnivore_executable: None,
+                    ohmnivore_provenance: None,
+                    ..inputs.tools
+                },
+                ..inputs
+            };
+            assert_eq!(
+                bind_release(&missing_tool_inputs).unwrap_err().code,
+                "CC-RELEASE-APPLICABILITY-001"
+            );
+        }
+
+        if routing_applicable {
+            let zero_digest = "0".repeat(64);
+            let apgar_digest = sha256_hex(&apgar_executable);
+            let tool_identity_mutant = acceptance_json.replacen(
+                &format!("\"executable_sha256\":\"{apgar_digest}\""),
+                &format!("\"executable_sha256\":\"{zero_digest}\""),
+                1,
+            );
+            let provenance_digest = sha256_hex(&apgar_provenance);
+            let provenance_identity_mutant = acceptance_json.replacen(
+                &format!("\"tool_provenance_sha256\":\"{provenance_digest}\""),
+                &format!("\"tool_provenance_sha256\":\"{zero_digest}\""),
+                1,
+            );
+            for rejected_acceptance in [
+                acceptance_json.replacen(
+                    "\"apgar_exact_admission\":true",
+                    "\"apgar_exact_admission\":false",
+                    1,
+                ),
+                acceptance_json.replacen(
+                    "\"geometry_signature\":\"",
+                    "\"geometry_signature\":\"0",
+                    1,
+                ),
+                acceptance_json.replacen(
+                    "\"drc_filename\":\"drc.normalized.json\"",
+                    "\"drc_filename\":\"wrong.json\"",
+                    1,
+                ),
+                tool_identity_mutant,
+                provenance_identity_mutant,
+            ] {
+                let rejected_route_inputs = ReleaseInputs {
+                    routing: Some(ReleaseRoutingEvidence {
+                        acceptance_json: &rejected_acceptance,
+                    }),
+                    ..inputs
+                };
+                assert_eq!(
+                    bind_release(&rejected_route_inputs).unwrap_err().code,
+                    "CC-RELEASE-ROUTING-001"
+                );
+            }
+            let mut wrong_apgar = apgar_executable.clone();
+            wrong_apgar.push(0);
+            let stale_apgar_inputs = ReleaseInputs {
+                tools: ReleaseToolchainEvidence {
+                    apgar_executable: Some(&wrong_apgar),
+                    ..inputs.tools
+                },
+                ..inputs
+            };
+            assert_eq!(
+                bind_release(&stale_apgar_inputs).unwrap_err().code,
+                "CC-RELEASE-TOOL-001"
+            );
+            for incomplete_inputs in [
+                ReleaseInputs {
+                    routing: None,
+                    ..inputs
+                },
+                ReleaseInputs {
+                    tools: ReleaseToolchainEvidence {
+                        apgar_provenance: None,
+                        ..inputs.tools
+                    },
+                    ..inputs
+                },
+            ] {
+                assert_eq!(
+                    bind_release(&incomplete_inputs).unwrap_err().code,
+                    "CC-RELEASE-APPLICABILITY-001"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn release_closure_covers_every_checked_applicability_combination() {
+        exercise_checked_release_case(true, false);
+        exercise_checked_release_case(false, true);
+        exercise_checked_release_case(true, true);
     }
 
     #[test]
