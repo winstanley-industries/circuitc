@@ -210,6 +210,63 @@ with tempfile.TemporaryDirectory(dir=sys.argv[2]) as directory:
     assert_exact_flat_tree(output_root, publication_outputs)
     assert not list(parent.glob(f".{output_root.name}.circuitc-*"))
 
+with tempfile.TemporaryDirectory(dir=sys.argv[2]) as directory:
+    parent = pathlib.Path(directory)
+    output_root = parent / "different-final-output"
+    original_rename = runner._rename_noreplace
+
+    def install_different_final(parent_fd, _source, destination):
+        os.mkdir(destination, mode=0o700, dir_fd=parent_fd)
+        final_fd = os.open(destination, runner._directory_flags(), dir_fd=parent_fd)
+        try:
+            marker = os.open(
+                "different-final-marker",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=final_fd,
+            )
+            os.close(marker)
+        finally:
+            os.close(final_fd)
+        raise OSError(errno.EEXIST, os.strerror(errno.EEXIST))
+
+    runner._rename_noreplace = install_different_final
+    try:
+        try:
+            runner._publish(output_root, publication_outputs)
+        except runner.AnalysisHostError as error:
+            assert "already exists" in str(error)
+        else:
+            raise AssertionError("accepted a different final inode after rename failure")
+    finally:
+        runner._rename_noreplace = original_rename
+    assert (output_root / "different-final-marker").is_file()
+    assert not list(parent.glob(f".{output_root.name}.circuitc-*"))
+
+for rejection_errno in sorted(runner._PREEXECUTION_RENAME_ERRORS):
+    with tempfile.TemporaryDirectory(dir=sys.argv[2]) as directory:
+        parent = pathlib.Path(directory)
+        output_root = parent / f"rejected-{rejection_errno}"
+        original_rename = runner._rename_noreplace
+
+        def reject_before_execution(
+            _parent_fd, _source, _destination, value=rejection_errno
+        ):
+            raise OSError(value, os.strerror(value))
+
+        runner._rename_noreplace = reject_before_execution
+        try:
+            try:
+                runner._publish(output_root, publication_outputs)
+            except runner.AnalysisHostError as error:
+                assert "no atomic no-replace" in str(error)
+            else:
+                raise AssertionError(f"accepted primitive rejection {rejection_errno}")
+        finally:
+            runner._rename_noreplace = original_rename
+        assert not output_root.exists()
+        assert not list(parent.glob(f".{output_root.name}.circuitc-*"))
+
 for source_probe in ("stale-identity", "io-error"):
     with tempfile.TemporaryDirectory(dir=sys.argv[2]) as directory:
         parent = pathlib.Path(directory)

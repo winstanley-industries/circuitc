@@ -491,6 +491,88 @@ runner._rename_noreplace = commit_then_error
 runner._publish_exact(committed_output, {"receipt/host.json": b"committed\n"})
 assert (committed_output / "receipt/host.json").read_bytes() == b"committed\n"
 
+for source_probe in ("stale-identity", "io-error"):
+    ambiguous_commit = publish_parent / f"committed-source-{source_probe}"
+    original_probe = runner._probe_named_directory
+    original_cleanup = runner._remove_owned_named_directory
+    rename_state = {}
+
+    def reject_cleanup(*_args):
+        raise AssertionError("cleanup ran after an indeterminate committed rename")
+
+    def commit_with_ambiguous_source(parent_fd, source, destination):
+        rename_state["source"] = source
+        source_metadata = os.stat(source, dir_fd=parent_fd, follow_symlinks=False)
+        rename_state["identity"] = runner._directory_identity(source_metadata)
+        os.rename(
+            source,
+            destination,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        raise OSError(errno.EIO, "simulated post-commit source ambiguity")
+
+    def ambiguous_source_probe(parent_fd, name):
+        if name == rename_state.get("source"):
+            if source_probe == "stale-identity":
+                return runner._NameProbe(
+                    runner._ProbeKind.FOUND,
+                    identity=rename_state["identity"],
+                )
+            return runner._NameProbe(
+                runner._ProbeKind.ERROR,
+                error=OSError(errno.EIO, "simulated source-name probe failure"),
+            )
+        return original_probe(parent_fd, name)
+
+    runner._remove_owned_named_directory = reject_cleanup
+    runner._rename_noreplace = commit_with_ambiguous_source
+    runner._probe_named_directory = ambiguous_source_probe
+    try:
+        try:
+            runner._publish_exact(
+                ambiguous_commit, {"receipt/host.json": b"ambiguous-commit\n"}
+            )
+        except runner.HostExportError as error:
+            assert "indeterminate visibility" in str(error)
+        else:
+            raise AssertionError("accepted an inconclusive committed source-name probe")
+    finally:
+        runner._probe_named_directory = original_probe
+        runner._rename_noreplace = original_rename
+        runner._remove_owned_named_directory = original_cleanup
+    assert (
+        ambiguous_commit / "receipt/host.json"
+    ).read_bytes() == b"ambiguous-commit\n"
+    assert not list(publish_parent.glob(f".{ambiguous_commit.name}.circuitc-*"))
+
+different_final = publish_parent / "different-final-output"
+
+def install_different_final(parent_fd, _source, destination):
+    os.mkdir(destination, mode=0o700, dir_fd=parent_fd)
+    final_fd = os.open(destination, runner._directory_flags(), dir_fd=parent_fd)
+    try:
+        marker = os.open(
+            "different-final-marker",
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=final_fd,
+        )
+        os.close(marker)
+    finally:
+        os.close(final_fd)
+    raise OSError(errno.EEXIST, "simulated different final inode")
+
+runner._rename_noreplace = install_different_final
+try:
+    runner._publish_exact(different_final, {"receipt/host.json": b"not-published\n"})
+except runner.HostExportError as error:
+    assert "already exists" in str(error)
+else:
+    raise AssertionError("accepted a different final inode after rename failure")
+assert (different_final / "different-final-marker").is_file()
+assert not list(publish_parent.glob(".different-final-output.circuitc-*"))
+
 replaced_output = publish_parent / "replaced-output"
 
 def replace_then_error(parent_fd, source, destination):
