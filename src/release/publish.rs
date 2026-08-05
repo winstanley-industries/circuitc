@@ -738,69 +738,88 @@ impl<'a> StagingTransaction<'a> {
     }
 
     fn cleanup(&mut self) -> io::Result<()> {
+        self.cleanup_with(&mut |directory| directory.identity())
+    }
+
+    fn cleanup_with(
+        &mut self,
+        identity: &mut impl FnMut(&Directory) -> io::Result<(u64, u64)>,
+    ) -> io::Result<()> {
         if !self.armed {
             return Ok(());
         }
         let mut errors = Vec::new();
+        let mut cleanup_owned_entries = false;
         match self.parent.open_child(&self.name) {
-            Ok(directory) if directory.identity()? == self.identity => {
-                directory.set_mode(0o700)?;
-            }
-            Ok(_) => {
-                self.armed = false;
-                return Err(io::Error::other(format!(
-                    "preserved replacement transaction {} after identity changed",
-                    self.name.to_string_lossy()
-                )));
-            }
-            Err(error) => {
-                self.armed = false;
-                return Err(io::Error::new(
-                    error.kind(),
-                    format!(
-                        "could not reacquire transaction {} by held parent identity: {error}",
-                        self.name.to_string_lossy()
-                    ),
-                ));
-            }
-        }
-        for entry in &self.directories {
-            match self.directory.open_relative(&entry.path) {
-                Ok(directory) if directory.identity()? == entry.identity => {
+            Ok(directory) => match identity(&directory) {
+                Ok(found) if found == self.identity => {
+                    cleanup_owned_entries = true;
                     if let Err(error) = directory.set_mode(0o700) {
                         errors.push(format!(
-                            "could not restore staged directory {} for cleanup: {error}",
-                            entry.path
+                            "could not restore transaction {} for cleanup: {error}",
+                            self.name.to_string_lossy()
                         ));
                     }
                 }
                 Ok(_) => errors.push(format!(
-                    "preserved replacement staged directory {}",
-                    entry.path
+                    "preserved replacement transaction {} after identity changed",
+                    self.name.to_string_lossy()
                 )),
                 Err(error) => errors.push(format!(
-                    "could not inspect staged directory {} for cleanup: {error}",
-                    entry.path
+                    "could not inspect transaction {} for cleanup: {error}",
+                    self.name.to_string_lossy()
                 )),
-            }
+            },
+            Err(error) => errors.push(format!(
+                "could not reacquire transaction {} by held parent identity: {error}",
+                self.name.to_string_lossy()
+            )),
         }
-        for entry in self.files.iter().rev() {
-            if let Err(error) = remove_file_if_identity(&self.directory, entry) {
+        if cleanup_owned_entries {
+            for entry in &self.directories {
+                match self.directory.open_relative(&entry.path) {
+                    Ok(directory) => match identity(&directory) {
+                        Ok(found) if found == entry.identity => {
+                            if let Err(error) = directory.set_mode(0o700) {
+                                errors.push(format!(
+                                    "could not restore staged directory {} for cleanup: {error}",
+                                    entry.path
+                                ));
+                            }
+                        }
+                        Ok(_) => errors.push(format!(
+                            "preserved replacement staged directory {}",
+                            entry.path
+                        )),
+                        Err(error) => errors.push(format!(
+                            "could not inspect staged directory {} for cleanup: {error}",
+                            entry.path
+                        )),
+                    },
+                    Err(error) => errors.push(format!(
+                        "could not inspect staged directory {} for cleanup: {error}",
+                        entry.path
+                    )),
+                }
+            }
+            for entry in self.files.iter().rev() {
+                if let Err(error) = remove_file_if_identity(&self.directory, entry) {
+                    errors.push(error.to_string());
+                }
+            }
+            for entry in self.directories.iter().rev() {
+                if let Err(error) = remove_directory_if_identity(&self.directory, entry) {
+                    errors.push(error.to_string());
+                }
+            }
+            if let Err(error) = remove_named_directory_if_identity(
+                self.parent,
+                &self.name,
+                self.identity,
+                &self.name.to_string_lossy(),
+            ) {
                 errors.push(error.to_string());
             }
-        }
-        for entry in self.directories.iter().rev() {
-            if let Err(error) = remove_directory_if_identity(&self.directory, entry) {
-                errors.push(error.to_string());
-            }
-        }
-        if let Err(error) = remove_named_directory_if_identity(
-            self.parent,
-            &self.name,
-            self.identity,
-            &self.name.to_string_lossy(),
-        ) {
-            errors.push(error.to_string());
         }
         self.armed = false;
         if errors.is_empty() {
@@ -1550,6 +1569,67 @@ mod tests {
                 },
             ],
         })
+    }
+
+    #[test]
+    fn malformed_verified_shapes_fail_before_publication() {
+        let mut cases = Vec::new();
+
+        let mut wrong_prefix = verified_release();
+        wrong_prefix.0.root =
+            RelativeArtifactPath::try_new(format!("not-release/{IDENTITY}")).unwrap();
+        cases.push(("wrong-prefix", wrong_prefix));
+
+        let uppercase_identity = IDENTITY.to_ascii_uppercase();
+        let mut uppercase = verified_release();
+        uppercase.0.release_identity_sha256 = uppercase_identity.clone();
+        uppercase.0.root =
+            RelativeArtifactPath::try_new(format!("release/{uppercase_identity}")).unwrap();
+        cases.push(("uppercase-identity", uppercase));
+
+        let short_identity = &IDENTITY[..IDENTITY.len() - 1];
+        let mut wrong_length = verified_release();
+        wrong_length.0.release_identity_sha256 = short_identity.to_owned();
+        wrong_length.0.root =
+            RelativeArtifactPath::try_new(format!("release/{short_identity}")).unwrap();
+        cases.push(("wrong-length-identity", wrong_length));
+
+        let non_hex_identity = format!("g{}", &IDENTITY[1..]);
+        let mut non_hex = verified_release();
+        non_hex.0.release_identity_sha256 = non_hex_identity.clone();
+        non_hex.0.root =
+            RelativeArtifactPath::try_new(format!("release/{non_hex_identity}")).unwrap();
+        cases.push(("non-hex-identity", non_hex));
+
+        let mut mismatched_identity = verified_release();
+        mismatched_identity.0.release_identity_sha256 = format!("1{}", &IDENTITY[1..]);
+        cases.push(("identity-mismatch", mismatched_identity));
+
+        let mut wrong_order = verified_release();
+        wrong_order.0.files.swap(0, 1);
+        cases.push(("request-not-first", wrong_order));
+
+        let mut manifest_not_last = verified_release();
+        manifest_not_last.0.files.swap(1, 2);
+        cases.push(("manifest-not-last", manifest_not_last));
+
+        let mut duplicate_path = verified_release();
+        duplicate_path.0.files.insert(
+            1,
+            ReleaseFile {
+                path: RelativeArtifactPath::try_new("request.json").unwrap(),
+                contents: b"duplicate".to_vec(),
+            },
+        );
+        cases.push(("duplicate-path", duplicate_path));
+
+        for (label, release) in cases {
+            let test = TestDirectory::new(label);
+            let destination = ReleaseDestination::open(test.path()).unwrap();
+            let error = publish_release(&destination, &release).unwrap_err();
+            assert_eq!(error.code, "CC-RELEASE-PUBLISH-CONTRACT-001", "{label}");
+            assert!(!test.path().join("release").exists(), "{label}");
+        }
     }
 
     struct TestDirectory(PathBuf);
@@ -2309,6 +2389,77 @@ mod tests {
             vec!["CC-RELEASE-PUBLISH-EXISTS-001"]
         );
         assert_eq!(release_entries(&test), vec![IDENTITY]);
+    }
+
+    #[test]
+    fn cleanup_root_probe_failure_is_reported_once_and_preserves_residue() {
+        let test = TestDirectory::new("cleanup-root-probe");
+        let destination = ReleaseDestination::open(test.path()).unwrap();
+        let release_parent = ensure_private_child(
+            &destination.directory,
+            c"release",
+            &format!("{}/release", test.path().display()),
+        )
+        .unwrap();
+        let mut staging = StagingTransaction::create(&release_parent).unwrap();
+        let transaction_name = staging.name.to_string_lossy().into_owned();
+
+        let error = staging
+            .cleanup_with(&mut |_| Err(io::Error::other("injected root fstat failure")))
+            .unwrap_err();
+        assert!(error.to_string().contains("injected root fstat failure"));
+        assert!(!staging.armed);
+        assert!(test.path().join("release").join(transaction_name).is_dir());
+        assert!(staging.cleanup().is_ok());
+    }
+
+    #[test]
+    fn cleanup_nested_probe_failure_does_not_abort_remaining_cleanup() {
+        let test = TestDirectory::new("cleanup-nested-probe");
+        let destination = ReleaseDestination::open(test.path()).unwrap();
+        let release_parent = ensure_private_child(
+            &destination.directory,
+            c"release",
+            &format!("{}/release", test.path().display()),
+        )
+        .unwrap();
+        let mut staging = StagingTransaction::create(&release_parent).unwrap();
+        let release = verified_release();
+        let directories = required_directories(release.bundle().files()).unwrap();
+        let mut hooks = ProductionHooks;
+        for directory in &directories {
+            staging.create_directory(directory, &mut hooks).unwrap();
+        }
+        for (index, file) in release.bundle().files().iter().enumerate() {
+            staging.create_file(index, file, &mut hooks).unwrap();
+        }
+        staging.seal(&directories).unwrap();
+        let transaction_root = test
+            .path()
+            .join("release")
+            .join(staging.name.to_string_lossy().as_ref());
+
+        let mut probes = 0;
+        let error = staging
+            .cleanup_with(&mut |directory| {
+                probes += 1;
+                if probes == 2 {
+                    Err(io::Error::other("injected nested fstat failure"))
+                } else {
+                    directory.identity()
+                }
+            })
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("injected nested fstat failure"));
+        assert!(!staging.armed);
+        assert!(!transaction_root.join("request.json").exists());
+        assert!(!transaction_root.join("manifest.json").exists());
+        assert_eq!(
+            fs::read(transaction_root.join("artifacts/board.bin")).unwrap(),
+            b"exact-board-bytes"
+        );
+        assert!(staging.cleanup().is_ok());
     }
 
     #[test]
