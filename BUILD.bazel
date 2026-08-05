@@ -41,6 +41,7 @@ rust_library(
     name = "circuitc",
     srcs = glob(["src/**/*.rs"]),
     compile_data = glob(["libraries/**"]) + [
+        "catalogs/reference-catalog.json",
         "examples/physical_no_connect.circuitc",
         "examples/voltage_divider.circuitc",
     ],

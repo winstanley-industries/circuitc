@@ -265,8 +265,8 @@ fn reference_product_intent() -> ProductIntent {
     };
     ProductIntent {
         catalog: Some(CatalogEvidenceRef {
-            snapshot_id: "layer1-contract-fixture".to_owned(),
-            sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned(),
+            snapshot_id: "reference-catalog-2026-08-04".to_owned(),
+            sha256: "1631bcee4da9ee39aa8af85f1f80c79331b22bff390a15d4e02b7e3decc2c69e".to_owned(),
             evaluated_on: "2026-08-04".to_owned(),
         }),
         variants: vec![production, prototype_alternate],
