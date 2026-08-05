@@ -109,6 +109,51 @@ release-manifest closure, and transactional release publication remain later
 implementation layers requiring their own accepted contracts. Layer-2 parsing
 or resolution is not manufacturing execution or completion evidence.
 
+## Layer 3: deterministic product artifact bundle
+
+[ADR-0010](../adr/0010-deterministic-product-artifact-bundle.md) defines a
+public compiler boundary that consumes valid Design IR, exact pinned catalog
+snapshot bytes, and one exact variant path. It re-runs Layer-2 verification and
+emits exactly four strict schemas:
+
+- [`product_resolution` v1](../../schemas/product_resolution/v1.md) contains
+  every physical component exactly once with state, base identity, and nullable
+  selected identity;
+- [`bom` v1](../../schemas/bom/v1.md) groups fitted selected identities and
+  exact typed values with checked per-board and total `u64` quantities;
+- [`placement` v1](../../schemas/placement/v1.md) contains every fitted physical
+  component exactly once with signed integer nanometres, orthogonal rotation,
+  and front/back side; and
+- [`assembly` v1](../../schemas/assembly/v1.md) contains every physical
+  component exactly once with state, nullable selection, checked quantities,
+  build quantity, and exact configurations.
+
+Each artifact is compact canonical JSON plus LF, individually limited to 64
+MiB and 10,000 primary rows. Their checked aggregate complete size is also
+limited to 64 MiB and is preflighted before any path or bytes are returned.
+Paths are exactly
+`product/<variant_identity_sha256>/{resolution,bom,placement,assembly}.json`;
+the digest is domain-separated SHA-256 of the exact variant path.
+
+All roots bind Design name, exact variant path and digest, and one common
+domain-separated `product_input_sha256`. Its canonical preimage covers catalog
+reference, variant path/build/configurations, and every physical component's
+sorted identity, exact value, lifecycle and sourcing constraints, full
+approved substitutions, placement, and selected population state. BOM,
+placement, and assembly also bind the exact resolution digest.
+
+All identities reconcile bidirectionally; not-fitted components have no BOM or
+placement contribution and zero assembly quantities, and virtual components
+never appear. The independent strict verifier recomputes expected joins and
+bytes from Design plus freshly authenticated catalog evidence without sharing
+the emitter's selection, grouping, quantity, placement, or bundle helpers. It
+rejects missing, reordered, duplicate, stale, coordinated-extra, or partially
+valid bundles.
+
+Layer 3 leaves Design IR v1 unchanged and claims no KiCad or manufacturing-host
+authority. Fabrication output, host analysis evidence, release-manifest
+closure, and publication remain later layers.
+
 ## Non-goals
 
 - Operating a live procurement marketplace.
