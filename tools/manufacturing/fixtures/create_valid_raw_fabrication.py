@@ -97,6 +97,8 @@ def main() -> None:
     request = pathlib.Path(sys.argv[3]).read_bytes()
     board = pathlib.Path(sys.argv[4]).read_bytes()
     executable = pathlib.Path(sys.argv[5]).read_bytes()
+    root.mkdir(parents=True, exist_ok=True)
+    root.chmod(0o700)
     outputs: dict[str, bytes] = {}
     for layer in LAYERS:
         filename_layer = layer[4]
@@ -112,7 +114,9 @@ def main() -> None:
     for relative_path, contents in outputs.items():
         destination = root / relative_path
         destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.parent.chmod(0o700)
         destination.write_bytes(contents)
+        destination.chmod(0o600)
     receipt = {
         "schema_name": "circuitc.kicad_fabrication_receipt",
         "schema_version": 1,
@@ -125,10 +129,12 @@ def main() -> None:
     }
     receipt_path = root / "receipt/host.json"
     receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    receipt_path.parent.chmod(0o700)
     receipt_path.write_text(
         json.dumps(receipt, ensure_ascii=False, separators=(",", ":")) + "\n",
         encoding="utf-8",
     )
+    receipt_path.chmod(0o600)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 # EPIC-0005: Product and manufacturing closure
 
-- Status: Active
+- Status: Complete
 - Architecture milestone: M4
 - Depends on: EPIC-0002; routing-dependent releases also depend on EPIC-0004
 
@@ -25,9 +25,9 @@ trace every artifact back to source, constraints, and toolchains.
 ## Layer 1: authored product-intent boundary
 
 [ADR-0008](../adr/0008-product-intent-and-pinned-catalog-evidence.md) defines
-the first product-intent boundary while this epic remains Planned. The active
-unreleased Design IR evolves in place at version 1; no version bump, migration,
-or compatibility adapter is introduced.
+the first product-intent boundary. The active unreleased Design IR evolves in
+place at version 1; no version bump, migration, or compatibility adapter is
+introduced.
 
 - `PartIdentity.logical_device` becomes `logical_function`.
 - Every physical part separately authors manufacturer, manufacturer part
@@ -105,9 +105,9 @@ define the catalog-evidence boundary:
 
 Layer 2 exposes verification and resolution only. BOM, placement, assembly,
 fabrication export, normalized KiCad manufacturing results and reports,
-release-manifest closure, and transactional release publication remain later
-implementation layers requiring their own accepted contracts. Layer-2 parsing
-or resolution is not manufacturing execution or completion evidence.
+release-manifest closure, and transactional release publication are separate
+implemented layers with their own accepted contracts. Layer-2 parsing or
+resolution is not manufacturing execution or completion evidence.
 
 ## Layer 3: deterministic product artifact bundle
 
@@ -152,7 +152,7 @@ valid bundles.
 
 Layer 3 leaves Design IR v1 unchanged and claims no KiCad or manufacturing-host
 authority. Fabrication output, host analysis evidence, release-manifest
-closure, and publication remain later layers.
+closure, and publication remain owned by Layers 4 through 7.
 
 ## Layer 4: deterministic KiCad fabrication evidence
 
@@ -296,22 +296,35 @@ deleting the visible release.
 
 ## Completion evidence
 
-Not yet complete. The seven-layer implementation stack is locally committed
-and validated, but GitHub publication, policy-facing CI, automated review,
-dependency-ordered merge, and the integrated-main audit require separate
-external-write authority and remain pending. Earlier layer evidence is
-historical until the final stack is merged and revalidated on `main`.
+The dependency-ordered implementation stack merged through PRs
+[#24](https://github.com/winstanley-industries/circuitc/pull/24) through
+[#30](https://github.com/winstanley-industries/circuitc/pull/30). Every exact
+PR head passed protected Linux, workflow-security, and automated-review gates,
+had an exact-head approval, and had no unresolved review thread before merge.
+The stack merged atomically with squash commits
+`cf481a0b4949c58ef7c6e99c935442551b21a8ba`,
+`3073e3cbdcf46dcd1e6167193a5bbef8d2d56cc2`,
+`0ebd3db9e3146af7c5e0b07796b62c8b207feb41`,
+`44122c355730d606eba3288774223fbd13e0bdcc`,
+`6af193bc18a2a94a12d70caf8e91ff05546f03ba`,
+`2f88dbf0ed12bb0e34712297cae654c9f897169a`, and
+`e0f509696a1dcd4af4e1a7bce1e9ae2fb70eb3ba`. The final reviewed PR tree and
+the integrated `main` tree were both
+`41e2c9b94bcc7aea191290aaca19cae213970ad5`.
 
-| Requirements | Local implementation evidence |
+| Requirements | Durable implementation evidence |
 | --- | --- |
-| `CC-REQ-PROD-001`, `CC-REQ-PROD-002`, `CC-REQ-PROD-004` | Product intent `5400a36c74b2770469ef16d6d61c63df5536edc3`; pinned catalog verification `8dce8a684ace68beae083649c71865b4253545a8` |
-| `CC-REQ-PROD-002`, `CC-REQ-PROD-003` | Deterministic product artifacts `be09b35c351990a0783eb9a269268f0df32d917e`; normalized KiCad fabrication evidence `41a379eef9609bb533a70073f8b1ab05a879b697` |
-| `CC-REQ-PROD-005` | Capability-declared board analysis `719fdf8a865f2e657be715b10ed1f8177e6484fd` |
-| `CC-REQ-PROD-006`, `CC-REQ-PROD-007` | Independently verified release closure `fa8e41ffb8c3f48f937a5389b7fa2c22beecf59c`; immutable transactional publication `dd6db80b946bba18d142bd1b733c7baa843b22bf` |
+| `CC-REQ-PROD-001`, `CC-REQ-PROD-002`, `CC-REQ-PROD-004` | Product intent and pinned catalog verification in PRs #24 and #25 |
+| `CC-REQ-PROD-002`, `CC-REQ-PROD-003` | Deterministic product bundle and normalized KiCad fabrication evidence in PRs #26 and #27 |
+| `CC-REQ-PROD-005` | Capability-declared board analysis and five-outcome host evidence in PR #28 |
+| `CC-REQ-PROD-006`, `CC-REQ-PROD-007` | Independently verified release closure and immutable transactional materialization in PRs #29 and #30 |
 
-The final local stack passed `bazel lint //...`, repository-wide build and
-test, strict-lockfile build and test, and strict module graph resolution. The
-KiCad 10 host gates for analysis, DRC, and manufacturing ran uncached and
-passed. These results will be rerun and bound to the final committed local head
-before publication, then rerun on integrated `main` before this status changes
-to Complete.
+The integrated implementation and completion audit passed `bazel lint //...`,
+ordinary and strict-lockfile repository builds, strict module graph
+resolution, the complete 372-test Rust harness serialized and uncached, the
+three uncached KiCad 10 analysis/DRC/manufacturing host gates, and the checked
+simulation, checked routing, and route-acceptance manifest gates. Two initial
+post-merge macOS parallel runs each made one of the two Ohmnivore-spawning
+tests exceed its wall-clock allowance under concurrent host load. The final
+completion head passed both required repository-wide invocations, the complete
+serialized harness, and every protected exact-head Linux test gate.

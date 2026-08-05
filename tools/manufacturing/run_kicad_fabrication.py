@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import datetime
+import enum
 import errno
 import hashlib
 import json
@@ -14,13 +15,12 @@ import pathlib
 import re
 import secrets
 import selectors
-import shutil
 import signal
 import stat
 import subprocess
 import sys
-import tempfile
 import time
+import typing
 
 MAX_SOURCE_BYTES = 64 * 1024 * 1024
 MAX_OUTPUT_BYTES = 64 * 1024 * 1024
@@ -225,6 +225,43 @@ def _identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
     return metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns
 
 
+def _directory_identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
+    return metadata.st_dev, metadata.st_ino, metadata.st_uid, metadata.st_mode
+
+
+def _directory_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+
+def _validate_directory(
+    metadata: os.stat_result,
+    path: pathlib.Path,
+    *,
+    protected_namespace: bool,
+    private_terminal: bool,
+) -> None:
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise HostExportError(f"anchored path component is not a directory: {path}")
+    shared_write = metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    if protected_namespace and metadata.st_uid not in {0, os.geteuid()}:
+        raise HostExportError(f"anchored directory has an untrusted owner: {path}")
+    if (
+        protected_namespace
+        and shared_write
+        and (not metadata.st_mode & stat.S_ISVTX or metadata.st_uid not in {0, os.geteuid()})
+    ):
+        raise HostExportError(f"anchored directory permits unsafe shared writes: {path}")
+    if private_terminal and (metadata.st_uid != os.geteuid() or metadata.st_mode & 0o777 != 0o700):
+        raise HostExportError(
+            f"private directory must be owned by the effective uid with mode 0700: {path}"
+        )
+
+
 def _open_regular(path: pathlib.Path, maximum: int) -> tuple[int, tuple[int, int, int, int]]:
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     if nofollow == 0:
@@ -348,10 +385,15 @@ def _run(
     executable_descriptor: int,
     executable_identity: tuple[int, int, int, int],
     executable_path: pathlib.Path,
+    transaction: PrivateTransaction,
 ) -> None:
+    transaction.recheck()
     _verify_open_path(board_descriptor, board_identity, board_path)
     _verify_open_path(executable_descriptor, executable_identity, executable_path)
-    _run_process(command, environment, label)
+    try:
+        _run_process(command, environment, label)
+    finally:
+        transaction.recheck()
     _verify_open_path(board_descriptor, board_identity, board_path)
     _verify_open_path(executable_descriptor, executable_identity, executable_path)
 
@@ -417,24 +459,530 @@ def _checked_aggregate(lengths: list[int]) -> int:
     return total
 
 
-def _open_anchored_directory(path: pathlib.Path) -> int:
+def _open_anchored_directory(
+    path: pathlib.Path,
+    *,
+    protected_namespace: bool = False,
+    private_terminal: bool = False,
+) -> int:
     absolute = path.absolute()
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_CLOEXEC", 0)
-    )
-    descriptor = os.open(absolute.anchor, flags)
+    descriptor = os.open(absolute.anchor, _directory_flags())
     try:
-        for component in absolute.parts[1:]:
-            next_descriptor = os.open(component, flags, dir_fd=descriptor)
+        _validate_directory(
+            os.fstat(descriptor),
+            pathlib.Path(absolute.anchor),
+            protected_namespace=protected_namespace,
+            private_terminal=private_terminal and len(absolute.parts) == 1,
+        )
+        traversed = pathlib.Path(absolute.anchor)
+        for index, component in enumerate(absolute.parts[1:]):
+            traversed /= component
+            next_descriptor = os.open(component, _directory_flags(), dir_fd=descriptor)
+            try:
+                _validate_directory(
+                    os.fstat(next_descriptor),
+                    traversed,
+                    protected_namespace=protected_namespace,
+                    private_terminal=private_terminal and index == len(absolute.parts) - 2,
+                )
+            except BaseException:
+                os.close(next_descriptor)
+                raise
             os.close(descriptor)
             descriptor = next_descriptor
         return descriptor
     except BaseException:
         os.close(descriptor)
         raise
+
+
+class _PreparedAnchoredDirectory:
+    def __init__(
+        self,
+        descriptors: list[int],
+        created_directories: list[tuple[int, str, int, tuple[int, int, int, int], pathlib.Path]],
+    ):
+        self.descriptors = descriptors
+        self.created_directories = created_directories
+        self.active = True
+
+    @property
+    def fd(self) -> int:
+        if not self.active:
+            raise HostExportError("prepared directory capability is no longer active")
+        return self.descriptors[-1]
+
+    def commit(self) -> int:
+        descriptor = self.fd
+        for ancestor in self.descriptors[:-1]:
+            os.close(ancestor)
+        self.descriptors = []
+        self.created_directories = []
+        self.active = False
+        return descriptor
+
+    def rollback(self) -> None:
+        if not self.active:
+            return
+        cleanup_errors: list[str] = []
+        for parent_descriptor, name, descriptor, identity, display_path in reversed(
+            self.created_directories
+        ):
+            try:
+                _remove_owned_empty_named_directory(
+                    parent_descriptor,
+                    name,
+                    descriptor,
+                    identity,
+                    f"fabrication work parent component {display_path}",
+                )
+            except BaseException as cleanup_error:
+                cleanup_errors.append(str(cleanup_error))
+        for descriptor in reversed(self.descriptors):
+            os.close(descriptor)
+        self.descriptors = []
+        self.created_directories = []
+        self.active = False
+        if cleanup_errors:
+            raise HostExportError(
+                "identity-safe fabrication work parent cleanup did not complete: "
+                + "; ".join(cleanup_errors)
+            )
+
+
+def _open_or_create_anchored_directory(
+    path: pathlib.Path,
+    *,
+    protected_namespace: bool,
+) -> _PreparedAnchoredDirectory:
+    absolute = path.absolute()
+    descriptors = [os.open(absolute.anchor, _directory_flags())]
+    created_directories: list[tuple[int, str, int, tuple[int, int, int, int], pathlib.Path]] = []
+    try:
+        _validate_directory(
+            os.fstat(descriptors[0]),
+            pathlib.Path(absolute.anchor),
+            protected_namespace=protected_namespace,
+            private_terminal=False,
+        )
+        traversed = pathlib.Path(absolute.anchor)
+        for component in absolute.parts[1:]:
+            traversed /= component
+            parent_descriptor = descriptors[-1]
+            created = False
+            try:
+                next_descriptor = os.open(component, _directory_flags(), dir_fd=parent_descriptor)
+            except FileNotFoundError:
+                os.mkdir(component, mode=0o700, dir_fd=parent_descriptor)
+                created = True
+                try:
+                    next_descriptor = os.open(
+                        component, _directory_flags(), dir_fd=parent_descriptor
+                    )
+                except BaseException as error:
+                    raise HostExportError(
+                        "fabrication work parent component was created but its identity "
+                        f"could not be authenticated; residue was preserved: {traversed}"
+                    ) from error
+            descriptors.append(next_descriptor)
+            if created:
+                identity = _directory_identity(os.fstat(next_descriptor))
+                created_directories.append(
+                    (
+                        parent_descriptor,
+                        component,
+                        next_descriptor,
+                        identity,
+                        traversed,
+                    )
+                )
+                os.fchmod(next_descriptor, 0o700)
+                created_directories[-1] = (
+                    parent_descriptor,
+                    component,
+                    next_descriptor,
+                    _directory_identity(os.fstat(next_descriptor)),
+                    traversed,
+                )
+            _validate_directory(
+                os.fstat(next_descriptor),
+                traversed,
+                protected_namespace=protected_namespace,
+                private_terminal=False,
+            )
+        return _PreparedAnchoredDirectory(descriptors, created_directories)
+    except BaseException as error:
+        prepared = _PreparedAnchoredDirectory(descriptors, created_directories)
+        try:
+            prepared.rollback()
+        except BaseException as cleanup_error:
+            raise HostExportError(
+                f"failed to prepare fabrication work parent {path}: {error}; {cleanup_error}"
+            ) from error
+        if isinstance(error, HostExportError):
+            raise
+        raise HostExportError(
+            f"failed to prepare fabrication work parent {path}: {error}"
+        ) from error
+
+
+def _recheck_directory_path(
+    path: pathlib.Path,
+    held_fd: int,
+    expected: tuple[int, int, int, int],
+    *,
+    protected_namespace: bool,
+    private_terminal: bool,
+) -> None:
+    current_fd = _open_anchored_directory(
+        path,
+        protected_namespace=protected_namespace,
+        private_terminal=private_terminal,
+    )
+    try:
+        if (
+            _directory_identity(os.fstat(held_fd)) != expected
+            or _directory_identity(os.fstat(current_fd)) != expected
+        ):
+            raise HostExportError(f"anchored directory identity changed: {path}")
+    finally:
+        os.close(current_fd)
+
+
+class _ProbeKind(enum.Enum):
+    FOUND = "found"
+    NOT_FOUND = "not_found"
+    ERROR = "error"
+
+
+class _NameProbe(typing.NamedTuple):
+    kind: _ProbeKind
+    identity: tuple[int, int, int, int] | None = None
+    error: OSError | None = None
+
+
+def _probe_named_directory(parent_fd: int, name: str) -> _NameProbe:
+    try:
+        descriptor = os.open(name, _directory_flags(), dir_fd=parent_fd)
+    except FileNotFoundError:
+        return _NameProbe(_ProbeKind.NOT_FOUND)
+    except OSError as open_error:
+        try:
+            metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return _NameProbe(_ProbeKind.ERROR, error=open_error)
+        except OSError as stat_error:
+            return _NameProbe(_ProbeKind.ERROR, error=stat_error)
+        if stat.S_ISDIR(metadata.st_mode):
+            return _NameProbe(_ProbeKind.ERROR, error=open_error)
+        return _NameProbe(_ProbeKind.FOUND, identity=_directory_identity(metadata))
+    try:
+        return _NameProbe(_ProbeKind.FOUND, identity=_directory_identity(os.fstat(descriptor)))
+    except OSError as error:
+        return _NameProbe(_ProbeKind.ERROR, error=error)
+    finally:
+        os.close(descriptor)
+
+
+def _probe_matches(probe: _NameProbe, expected: tuple[int, int, int, int]) -> bool:
+    return probe.kind is _ProbeKind.FOUND and probe.identity == expected
+
+
+def _probe_matches_inode(probe: _NameProbe, expected: tuple[int, int, int, int]) -> bool:
+    return (
+        probe.kind is _ProbeKind.FOUND
+        and probe.identity is not None
+        and probe.identity[:2] == expected[:2]
+    )
+
+
+def _probe_observes_different_inode(probe: _NameProbe, expected: tuple[int, int, int, int]) -> bool:
+    return (
+        probe.kind is _ProbeKind.FOUND
+        and probe.identity is not None
+        and probe.identity[:2] != expected[:2]
+    )
+
+
+def _probe_description(probe: _NameProbe) -> str:
+    if probe.kind is _ProbeKind.FOUND:
+        return f"identity {probe.identity}"
+    if probe.kind is _ProbeKind.NOT_FOUND:
+        return "not found"
+    return f"probe error: {probe.error}"
+
+
+def _recheck_named_directory(
+    parent_fd: int,
+    name: str,
+    held_fd: int,
+    expected: tuple[int, int, int, int],
+    label: str,
+) -> None:
+    probe = _probe_named_directory(parent_fd, name)
+    if _directory_identity(os.fstat(held_fd)) != expected or not _probe_matches(probe, expected):
+        raise HostExportError(
+            f"{label} name no longer identifies the authenticated directory: "
+            f"{_probe_description(probe)}"
+        )
+
+
+def _entry_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_uid,
+        metadata.st_mode,
+        metadata.st_ctime_ns,
+    )
+
+
+def _remove_directory_contents(directory_fd: int) -> None:
+    for name in os.listdir(directory_fd):
+        before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISDIR(before.st_mode):
+            identity = _directory_identity(before)
+            child_fd = os.open(name, _directory_flags(), dir_fd=directory_fd)
+            try:
+                if _directory_identity(os.fstat(child_fd)) != identity:
+                    raise HostExportError(f"cleanup entry changed before traversal: {name}")
+                _remove_directory_contents(child_fd)
+                if (
+                    _directory_identity(os.fstat(child_fd)) != identity
+                    or _directory_identity(
+                        os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                    )
+                    != identity
+                ):
+                    raise HostExportError(
+                        f"cleanup directory identity changed before removal: {name}"
+                    )
+            finally:
+                os.close(child_fd)
+            os.rmdir(name, dir_fd=directory_fd)
+        else:
+            identity = _entry_identity(before)
+            if (
+                _entry_identity(os.stat(name, dir_fd=directory_fd, follow_symlinks=False))
+                != identity
+            ):
+                raise HostExportError(f"cleanup entry changed before removal: {name}")
+            os.unlink(name, dir_fd=directory_fd)
+
+
+def _remove_owned_named_directory(
+    parent_fd: int,
+    name: str,
+    held_fd: int,
+    expected: tuple[int, int, int, int],
+    label: str,
+) -> None:
+    _recheck_named_directory(parent_fd, name, held_fd, expected, label)
+    _remove_directory_contents(held_fd)
+    _recheck_named_directory(parent_fd, name, held_fd, expected, label)
+    os.rmdir(name, dir_fd=parent_fd)
+
+
+def _remove_owned_empty_named_directory(
+    parent_fd: int,
+    name: str,
+    held_fd: int,
+    expected: tuple[int, int, int, int],
+    label: str,
+) -> None:
+    _recheck_named_directory(parent_fd, name, held_fd, expected, label)
+    if os.listdir(held_fd):
+        raise HostExportError(f"{label} contains preserved residue and was not removed")
+    _recheck_named_directory(parent_fd, name, held_fd, expected, label)
+    os.rmdir(name, dir_fd=parent_fd)
+
+
+def _create_private_named_directory(
+    parent_fd: int,
+    name: str,
+    display_path: pathlib.Path,
+    label: str,
+) -> tuple[int, tuple[int, int, int, int]]:
+    created = False
+    descriptor: int | None = None
+    identity: tuple[int, int, int, int] | None = None
+    try:
+        os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+        created = True
+        descriptor = os.open(name, _directory_flags(), dir_fd=parent_fd)
+        identity = _directory_identity(os.fstat(descriptor))
+        os.fchmod(descriptor, 0o700)
+        identity = _directory_identity(os.fstat(descriptor))
+        _validate_directory(
+            os.fstat(descriptor),
+            display_path,
+            protected_namespace=True,
+            private_terminal=True,
+        )
+        return descriptor, identity
+    except BaseException as error:
+        cleanup_error: BaseException | None = None
+        if descriptor is not None and identity is not None:
+            try:
+                identity = _directory_identity(os.fstat(descriptor))
+                _remove_owned_named_directory(parent_fd, name, descriptor, identity, label)
+            except BaseException as failure:
+                cleanup_error = failure
+        elif created:
+            cleanup_error = HostExportError(
+                f"{label} was created but its identity could not be authenticated; residue was preserved"
+            )
+        if descriptor is not None:
+            os.close(descriptor)
+        if cleanup_error is None:
+            raise HostExportError(f"failed to create {label}: {error}") from error
+        raise HostExportError(
+            f"failed to create {label}: {error}; identity-safe cleanup did not complete: "
+            f"{cleanup_error}"
+        ) from error
+
+
+class PrivateTransaction:
+    def __init__(self, work_path: pathlib.Path):
+        self.work_path = work_path.absolute()
+        if not self.work_path.name:
+            raise HostExportError("fabrication work directory must have a terminal name")
+        self.work_parent_path = self.work_path.parent
+        prepared_parent = _open_or_create_anchored_directory(
+            self.work_parent_path, protected_namespace=True
+        )
+        self.work_parent_fd = prepared_parent.fd
+        self.created_work = False
+        try:
+            self.work_parent_identity = _directory_identity(os.fstat(self.work_parent_fd))
+            try:
+                self.work_fd = os.open(
+                    self.work_path.name, _directory_flags(), dir_fd=self.work_parent_fd
+                )
+            except FileNotFoundError:
+                self.work_fd, self.work_identity = _create_private_named_directory(
+                    self.work_parent_fd,
+                    self.work_path.name,
+                    self.work_path,
+                    "fabrication work directory",
+                )
+                self.created_work = True
+            else:
+                _validate_directory(
+                    os.fstat(self.work_fd),
+                    self.work_path,
+                    protected_namespace=True,
+                    private_terminal=True,
+                )
+                self.work_identity = _directory_identity(os.fstat(self.work_fd))
+            self.name = f"circuitc-fabrication-{secrets.token_hex(12)}"
+            self.fd, self.identity = _create_private_named_directory(
+                self.work_fd,
+                self.name,
+                self.work_path / self.name,
+                "fabrication transaction",
+            )
+            self.path = self.work_path / self.name
+            self.live = True
+            prepared_parent.commit()
+        except BaseException as error:
+            cleanup_error: BaseException | None = None
+            if self.created_work and hasattr(self, "work_fd"):
+                try:
+                    _remove_owned_empty_named_directory(
+                        self.work_parent_fd,
+                        self.work_path.name,
+                        self.work_fd,
+                        self.work_identity,
+                        "fabrication work directory",
+                    )
+                except BaseException as failure:
+                    cleanup_error = failure
+            if hasattr(self, "work_fd"):
+                os.close(self.work_fd)
+            try:
+                prepared_parent.rollback()
+            except BaseException as failure:
+                if cleanup_error is None:
+                    cleanup_error = failure
+                else:
+                    cleanup_error = HostExportError(
+                        f"{cleanup_error}; parent cleanup also failed: {failure}"
+                    )
+            if cleanup_error is None:
+                raise
+            raise HostExportError(
+                f"{error}; identity-safe constructor cleanup did not complete: {cleanup_error}"
+            ) from error
+
+    def recheck(self) -> None:
+        _recheck_directory_path(
+            self.work_parent_path,
+            self.work_parent_fd,
+            self.work_parent_identity,
+            protected_namespace=True,
+            private_terminal=False,
+        )
+        _recheck_named_directory(
+            self.work_parent_fd,
+            self.work_path.name,
+            self.work_fd,
+            self.work_identity,
+            "fabrication work directory",
+        )
+        _recheck_named_directory(
+            self.work_fd,
+            self.name,
+            self.fd,
+            self.identity,
+            "fabrication transaction",
+        )
+
+    def cleanup(self) -> None:
+        if not self.live:
+            return
+        self.recheck()
+        _remove_directory_contents(self.fd)
+        _recheck_named_directory(
+            self.work_fd,
+            self.name,
+            self.fd,
+            self.identity,
+            "fabrication transaction",
+        )
+        os.rmdir(self.name, dir_fd=self.work_fd)
+        self.live = False
+        if self.created_work:
+            _remove_owned_empty_named_directory(
+                self.work_parent_fd,
+                self.work_path.name,
+                self.work_fd,
+                self.work_identity,
+                "fabrication work directory",
+            )
+
+    def close(self) -> None:
+        os.close(self.fd)
+        os.close(self.work_fd)
+        os.close(self.work_parent_fd)
+
+
+class _RenameUnsupported(HostExportError):
+    pass
+
+
+_RENAME_REJECTION_ERRNOS = {
+    errno.EINVAL,
+    errno.ENOSYS,
+    errno.ENOTSUP,
+    errno.EOPNOTSUPP,
+}
+
+
+def _rename_rejected_before_execution(error: BaseException) -> bool:
+    return isinstance(error, _RenameUnsupported) or (
+        isinstance(error, OSError) and error.errno in _RENAME_REJECTION_ERRNOS
+    )
 
 
 def _rename_noreplace(parent_fd: int, source: str, destination: str) -> None:
@@ -456,29 +1004,51 @@ def _rename_noreplace(parent_fd: int, source: str, destination: str) -> None:
             0x00000001,
         )
     else:
-        raise HostExportError("host has no atomic no-replace directory publication primitive")
+        raise _RenameUnsupported("host has no atomic no-replace directory publication primitive")
     if result != 0:
         error_number = ctypes.get_errno()
-        if error_number == errno.EEXIST:
-            raise HostExportError(f"fabrication output already exists: {destination}")
-        raise HostExportError(f"atomic fabrication publication failed: {os.strerror(error_number)}")
+        raise OSError(error_number, os.strerror(error_number))
+
+
+def _publication_failure(error: BaseException, final_name: str) -> HostExportError:
+    if isinstance(error, OSError) and error.errno == errno.EEXIST:
+        return HostExportError(f"fabrication output already exists: {final_name}")
+    return HostExportError(f"atomic fabrication publication failed: {error}")
 
 
 def _publish_exact(output_root: pathlib.Path, outputs: dict[str, bytes]) -> None:
-    parent_fd = _open_anchored_directory(output_root.parent)
-    final_name = output_root.name
-    temporary_name = f".{final_name}.circuitc-{secrets.token_hex(12)}"
-    os.mkdir(temporary_name, mode=0o700, dir_fd=parent_fd)
-    root_fd = os.open(
-        temporary_name,
-        os.O_RDONLY
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_CLOEXEC", 0),
-        dir_fd=parent_fd,
+    parent_fd = _open_anchored_directory(
+        output_root.parent,
+        protected_namespace=True,
+        private_terminal=True,
     )
+    try:
+        parent_identity = _directory_identity(os.fstat(parent_fd))
+    except BaseException as error:
+        os.close(parent_fd)
+        raise HostExportError(
+            f"failed to authenticate fabrication output parent: {error}"
+        ) from error
+    final_name = output_root.name
+    if not final_name or final_name in {".", ".."}:
+        os.close(parent_fd)
+        raise HostExportError("fabrication output directory must have a terminal name")
+    temporary_name = f".{final_name}.circuitc-{secrets.token_hex(12)}"
+    try:
+        root_fd, root_identity = _create_private_named_directory(
+            parent_fd,
+            temporary_name,
+            output_root.parent / temporary_name,
+            "fabrication publication transaction",
+        )
+    except BaseException:
+        os.close(parent_fd)
+        raise
     directory_fds: dict[str, int] = {}
     published = False
+    preserve_identity = False
+    rename_attempted = False
+    primitive_rejected = False
     try:
         for directory in sorted({path.split("/", 1)[0] for path in outputs}):
             os.mkdir(directory, mode=0o700, dir_fd=root_fd)
@@ -490,6 +1060,7 @@ def _publish_exact(output_root: pathlib.Path, outputs: dict[str, bytes]) -> None
                 | getattr(os, "O_CLOEXEC", 0),
                 dir_fd=root_fd,
             )
+            os.fchmod(directory_fds[directory], 0o700)
         for relative, contents in sorted(outputs.items()):
             directory, basename = relative.split("/", 1)
             descriptor = os.open(
@@ -503,6 +1074,7 @@ def _publish_exact(output_root: pathlib.Path, outputs: dict[str, bytes]) -> None
                 dir_fd=directory_fds[directory],
             )
             try:
+                os.fchmod(descriptor, 0o600)
                 view = memoryview(contents)
                 while view:
                     written = os.write(descriptor, view)
@@ -513,17 +1085,109 @@ def _publish_exact(output_root: pathlib.Path, outputs: dict[str, bytes]) -> None
         for descriptor in directory_fds.values():
             os.fsync(descriptor)
         os.fsync(root_fd)
-        _rename_noreplace(parent_fd, temporary_name, final_name)
+        _recheck_directory_path(
+            output_root.parent,
+            parent_fd,
+            parent_identity,
+            protected_namespace=True,
+            private_terminal=True,
+        )
+        _recheck_named_directory(
+            parent_fd,
+            temporary_name,
+            root_fd,
+            root_identity,
+            "fabrication publication transaction",
+        )
+        initial_final = _probe_named_directory(parent_fd, final_name)
+        if initial_final.kind is _ProbeKind.FOUND:
+            raise HostExportError(f"fabrication output already exists: {final_name}")
+        if initial_final.kind is _ProbeKind.ERROR:
+            raise HostExportError(
+                "fabrication output absence could not be authenticated: "
+                f"{_probe_description(initial_final)}"
+            )
+        rename_attempted = True
+        try:
+            _rename_noreplace(parent_fd, temporary_name, final_name)
+        except BaseException as error:
+            if _rename_rejected_before_execution(error):
+                primitive_rejected = True
+                if isinstance(error, _RenameUnsupported):
+                    raise
+                raise _RenameUnsupported(
+                    f"host rejected the atomic no-replace directory publication primitive: {error}"
+                ) from error
+            source_probe = _probe_named_directory(parent_fd, temporary_name)
+            final_probe = _probe_named_directory(parent_fd, final_name)
+            if _probe_matches_inode(final_probe, root_identity) and (
+                source_probe.kind is _ProbeKind.NOT_FOUND
+            ):
+                published = True
+            elif _probe_matches_inode(
+                source_probe, root_identity
+            ) and _probe_observes_different_inode(final_probe, root_identity):
+                raise _publication_failure(error, final_name) from error
+            else:
+                preserve_identity = True
+                raise HostExportError(
+                    "atomic fabrication publication has indeterminate visibility; "
+                    "the authenticated directory was retained; "
+                    f"source {_probe_description(source_probe)}; "
+                    f"final {_probe_description(final_probe)}"
+                ) from error
+        else:
+            published = True
         os.fsync(parent_fd)
-        published = True
+        _recheck_directory_path(
+            output_root.parent,
+            parent_fd,
+            parent_identity,
+            protected_namespace=True,
+            private_terminal=True,
+        )
+        _recheck_named_directory(
+            parent_fd,
+            final_name,
+            root_fd,
+            root_identity,
+            "published fabrication output",
+        )
     finally:
         for descriptor in directory_fds.values():
             os.close(descriptor)
-        os.close(root_fd)
-        if not published:
-            temporary_path = output_root.parent / temporary_name
-            shutil.rmtree(temporary_path, ignore_errors=True)
-        os.close(parent_fd)
+        try:
+            if not published and not preserve_identity:
+                try:
+                    _recheck_directory_path(
+                        output_root.parent,
+                        parent_fd,
+                        parent_identity,
+                        protected_namespace=True,
+                        private_terminal=True,
+                    )
+                except (OSError, HostExportError):
+                    preserve_identity = True
+                source_probe = _probe_named_directory(parent_fd, temporary_name)
+                final_probe = _probe_named_directory(parent_fd, final_name)
+                cleanup_authorized = _probe_matches_inode(source_probe, root_identity) and (
+                    primitive_rejected
+                    or _probe_observes_different_inode(final_probe, root_identity)
+                    or (not rename_attempted and final_probe.kind is _ProbeKind.NOT_FOUND)
+                )
+                if not cleanup_authorized:
+                    preserve_identity = True
+                if not preserve_identity:
+                    _remove_owned_named_directory(
+                        parent_fd,
+                        temporary_name,
+                        root_fd,
+                        root_identity,
+                        "fabrication publication transaction",
+                    )
+        finally:
+            os.close(root_fd)
+            os.close(parent_fd)
 
 
 def run(args: argparse.Namespace) -> None:
@@ -531,6 +1195,7 @@ def run(args: argparse.Namespace) -> None:
     executable_path = args.kicad_cli.absolute()
     board_descriptor, board_identity = _open_regular(board_path, MAX_SOURCE_BYTES)
     executable_descriptor, executable_identity = _open_regular(executable_path, 512 * 1024 * 1024)
+    private_transaction: PrivateTransaction | None = None
     try:
         board_bytes = _read_descriptor(board_descriptor, MAX_SOURCE_BYTES)
         executable_bytes = _read_descriptor(executable_descriptor, 512 * 1024 * 1024)
@@ -539,11 +1204,8 @@ def run(args: argparse.Namespace) -> None:
         if not isinstance(design_name, str):
             raise HostExportError("fabrication request Design name has the wrong type")
         _verify_open_path(board_descriptor, board_identity, board_path)
-        args.work_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        transaction = pathlib.Path(
-            tempfile.mkdtemp(prefix="circuitc-fabrication-", dir=args.work_dir)
-        )
-        transaction.chmod(0o700)
+        private_transaction = PrivateTransaction(args.work_dir)
+        transaction = private_transaction.path
         if (
             executable_path.parent.name == "MacOS"
             and executable_path.parent.parent.name == "Contents"
@@ -627,11 +1289,15 @@ def run(args: argparse.Namespace) -> None:
                 "PATH": "/usr/bin:/bin",
                 "TMPDIR": str(temp),
             }
-            version_stdout, _ = _run_process(
-                [str(staged_executable), "--version"],
-                environment,
-                "KiCad version probe",
-            )
+            private_transaction.recheck()
+            try:
+                version_stdout, _ = _run_process(
+                    [str(staged_executable), "--version"],
+                    environment,
+                    "KiCad version probe",
+                )
+            finally:
+                private_transaction.recheck()
             _verify_open_path(
                 staged_executable_descriptor,
                 staged_executable_identity,
@@ -646,6 +1312,7 @@ def run(args: argparse.Namespace) -> None:
                 staged_executable_descriptor,
                 staged_executable_identity,
                 staged_executable,
+                private_transaction,
             )
             _run(
                 [
@@ -734,9 +1401,16 @@ def run(args: argparse.Namespace) -> None:
                 f"{design_name}-PTH.drl",
                 f"{design_name}-NPTH.drl",
             }
-            gerber_fd = _open_anchored_directory(gerber)
-            drill_fd = _open_anchored_directory(drill)
-            position_fd = _open_anchored_directory(position)
+            private_transaction.recheck()
+            gerber_fd = _open_anchored_directory(
+                gerber, protected_namespace=True, private_terminal=True
+            )
+            drill_fd = _open_anchored_directory(
+                drill, protected_namespace=True, private_terminal=True
+            )
+            position_fd = _open_anchored_directory(
+                position, protected_namespace=True, private_terminal=True
+            )
             try:
                 if set(os.listdir(gerber_fd)) != gerber_names:
                     raise HostExportError("KiCad Gerber output inventory is not exact")
@@ -769,6 +1443,7 @@ def run(args: argparse.Namespace) -> None:
                     raise HostExportError(
                         "KiCad output inventory changed while it was authenticated"
                     )
+                private_transaction.recheck()
             finally:
                 os.close(gerber_fd)
                 os.close(drill_fd)
@@ -787,14 +1462,20 @@ def run(args: argparse.Namespace) -> None:
             outputs["receipt/host.json"] = (
                 json.dumps(receipt, ensure_ascii=False, separators=(",", ":")) + "\n"
             ).encode()
+            private_transaction.recheck()
             _publish_exact(args.output_dir.absolute(), outputs)
         finally:
             os.close(staged_descriptor)
             os.close(staged_executable_descriptor)
-        shutil.rmtree(transaction)
     finally:
-        os.close(board_descriptor)
-        os.close(executable_descriptor)
+        try:
+            if private_transaction is not None:
+                private_transaction.cleanup()
+        finally:
+            if private_transaction is not None:
+                private_transaction.close()
+            os.close(board_descriptor)
+            os.close(executable_descriptor)
 
 
 def main() -> int:

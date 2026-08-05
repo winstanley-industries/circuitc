@@ -39,6 +39,10 @@ fi
 
 first_project="${TEST_TMPDIR}/first-project"
 second_project="${TEST_TMPDIR}/second-project"
+fabrication_namespace="${TEST_TMPDIR}/private-fabrication"
+analysis_namespace="${TEST_TMPDIR}/private-analysis"
+mkdir "${fabrication_namespace}" "${analysis_namespace}"
+chmod 700 "${fabrication_namespace}" "${analysis_namespace}"
 "${frontend}" compile "${source_fixture}" --output-dir "${first_project}"
 "${frontend}" compile "${source_fixture}" --output-dir "${second_project}"
 diff -r "${first_project}" "${second_project}"
@@ -53,22 +57,22 @@ python3 "${fabrication_runner}" \
   --kicad-cli "${kicad_cli}" \
   --request "${TEST_TMPDIR}/fabrication-request.json" \
   --board "${first_project}/voltage_divider.kicad_pcb" \
-  --output-dir "${TEST_TMPDIR}/fabrication-raw" \
-  --work-dir "${TEST_TMPDIR}/fabrication-work"
+  --output-dir "${fabrication_namespace}/raw" \
+  --work-dir "${fabrication_namespace}/work"
 
 "${fabrication_gate}" bind \
   "${source_fixture}" \
   "${catalog}" \
   production \
   "${first_project}/voltage_divider.kicad_pcb" \
-  "${TEST_TMPDIR}/fabrication-raw" \
+  "${fabrication_namespace}/raw" \
   "${kicad_cli}" >"${TEST_TMPDIR}/fabrication-manifest.json"
 
 "${analysis_gate}" prepare \
   "${source_fixture}" \
   "${catalog}" \
   production \
-  "${TEST_TMPDIR}/fabrication-raw" \
+  "${fabrication_namespace}/raw" \
   "${kicad_cli}" >"${TEST_TMPDIR}/analysis-request.json"
 
 for pass in first second; do
@@ -83,24 +87,24 @@ for pass in first second; do
     --kicad-cli "${kicad_cli}" \
     --normalizer "${normalizer}" \
     --host-runner "${host_runner}" \
-    --work-dir "${TEST_TMPDIR}/analysis-work" \
-    --output-root "${TEST_TMPDIR}/${pass}-analysis-raw"
+    --work-dir "${analysis_namespace}/work" \
+    --output-root "${analysis_namespace}/${pass}-raw"
 
   "${analysis_gate}" bind \
     "${source_fixture}" \
     "${catalog}" \
     production \
-    "${TEST_TMPDIR}/fabrication-raw" \
+    "${fabrication_namespace}/raw" \
     "${kicad_cli}" \
     "${normalizer}" \
     "${host_runner}" \
-    "${TEST_TMPDIR}/${pass}-analysis-raw" >"${TEST_TMPDIR}/${pass}-analysis-report.json"
+    "${analysis_namespace}/${pass}-raw" >"${TEST_TMPDIR}/${pass}-analysis-report.json"
 done
 
-cmp "${TEST_TMPDIR}/first-analysis-raw/erc.normalized.json" \
-  "${TEST_TMPDIR}/second-analysis-raw/erc.normalized.json"
-cmp "${TEST_TMPDIR}/first-analysis-raw/drc.normalized.json" \
-  "${TEST_TMPDIR}/second-analysis-raw/drc.normalized.json"
+cmp "${analysis_namespace}/first-raw/erc.normalized.json" \
+  "${analysis_namespace}/second-raw/erc.normalized.json"
+cmp "${analysis_namespace}/first-raw/drc.normalized.json" \
+  "${analysis_namespace}/second-raw/drc.normalized.json"
 cmp "${TEST_TMPDIR}/first-analysis-report.json" \
   "${TEST_TMPDIR}/second-analysis-report.json"
 python3 - "${TEST_TMPDIR}/first-analysis-report.json" <<'PY'
@@ -127,7 +131,7 @@ assert [outcome["evidence_role"] for outcome in report["outcomes"]] == [
     "fabrication_manifest",
 ]
 PY
-if find "${TEST_TMPDIR}/analysis-work" -name 'analysis-*' -print -quit | grep -q .; then
+if find "${analysis_namespace}/work" -name 'analysis-*' -print -quit | grep -q .; then
   echo "board-analysis transactions were not cleaned up" >&2
   exit 1
 fi

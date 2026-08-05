@@ -226,6 +226,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 struct FileIdentity {
     device: u64,
     inode: u64,
+    owner: u32,
     length: u64,
     mode: u32,
     links: u64,
@@ -239,6 +240,7 @@ fn file_identity(metadata: &Metadata) -> FileIdentity {
     FileIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
+        owner: metadata.uid(),
         length: metadata.len(),
         mode: metadata.mode(),
         links: metadata.nlink(),
@@ -247,6 +249,17 @@ fn file_identity(metadata: &Metadata) -> FileIdentity {
         changed_seconds: metadata.ctime(),
         changed_nanoseconds: metadata.ctime_nsec(),
     }
+}
+
+fn validate_private_raw_directory(label: &str, metadata: &Metadata) -> Result<(), String> {
+    // SAFETY: `geteuid` has no preconditions and reads process state.
+    let effective_uid = unsafe { libc::geteuid() };
+    if !metadata.is_dir() || metadata.uid() != effective_uid || metadata.mode() & 0o777 != 0o700 {
+        return Err(format!(
+            "raw fabrication directory is not effective-uid-owned and private: {label}"
+        ));
+    }
+    Ok(())
 }
 
 struct BoundedFile {
@@ -454,6 +467,13 @@ fn open_regular_at(
             "raw input is not a bounded single-link regular file: {directory}/{basename}"
         ));
     }
+    // SAFETY: `geteuid` has no preconditions and reads process state.
+    let effective_uid = unsafe { libc::geteuid() };
+    if metadata.uid() != effective_uid || metadata.mode() & 0o777 != 0o600 {
+        return Err(format!(
+            "raw input is not effective-uid-owned and private: {directory}/{basename}"
+        ));
+    }
     Ok(HeldInput {
         directory,
         basename: basename.to_owned(),
@@ -514,6 +534,8 @@ impl RawDirectories {
         expected_paths: &[circuitc::RelativeArtifactPath],
     ) -> Result<Self, String> {
         let root = open_anchored_directory(&raw_root)?;
+        let root_metadata = root.metadata().map_err(|error| error.to_string())?;
+        validate_private_raw_directory(".", &root_metadata)?;
         if directory_names(&root)? != ["drill", "gerber", "position", "receipt"] {
             return Err("raw fabrication root inventory is not exact".to_owned());
         }
@@ -521,9 +543,20 @@ impl RawDirectories {
         let drill = open_directory_at(&root, "drill")?;
         let position = open_directory_at(&root, "position")?;
         let receipt = open_directory_at(&root, "receipt")?;
+        for (name, directory) in [
+            ("gerber", &gerber),
+            ("drill", &drill),
+            ("position", &position),
+            ("receipt", &receipt),
+        ] {
+            validate_private_raw_directory(
+                name,
+                &directory.metadata().map_err(|error| error.to_string())?,
+            )?;
+        }
         let directories = Self {
             root_path: raw_root,
-            root_identity: file_identity(&root.metadata().map_err(|error| error.to_string())?),
+            root_identity: file_identity(&root_metadata),
             gerber_identity: file_identity(&gerber.metadata().map_err(|error| error.to_string())?),
             drill_identity: file_identity(&drill.metadata().map_err(|error| error.to_string())?),
             position_identity: file_identity(

@@ -1,5 +1,37 @@
 # Process retrospective notes
 
+## EPIC-0005 product and manufacturing closure (2026-08-04)
+
+- The seven-layer split held: authored product intent, pinned catalog evidence,
+  deterministic product artifacts, fabrication evidence, board analysis,
+  release closure, and materialization each retained one authority. Review
+  fixes stayed within their owning layer, so the mandatory split trigger did
+  not fire.
+- Most correction rounds again concentrated at external trust boundaries.
+  The post-merge adversarial audit found that all three filesystem publishers
+  needed the same two-name proof after an ambiguous no-replace rename: the
+  final name must identify the authenticated staging inode and the old staging
+  name must be explicitly absent before publication can be treated as
+  committed.
+- Namespace constructors are transactions too. Hold every parent and child
+  descriptor until construction succeeds, record each created identity, and
+  roll back deepest-first on failure. Testing only the terminal directory
+  missed both intermediate residue and a descriptor leak.
+- Typed filesystem probes must preserve transport failures. An `open` error
+  followed by an `lstat` absence is indeterminate, not proof that a name is
+  absent; cleanup authority requires a conclusive observation.
+- The default parallel macOS test suite can make one of two
+  Ohmnivore-spawning tests exceed its wall-clock allowance. The full 372-test
+  harness passes uncached with one test thread, while exact-head Linux CI
+  remains the policy-facing parallel authority.
+- Local `gh stack` metadata lagged the live GitHub bases after the final review
+  updates. The merge therefore used live expected-head checks and the atomic
+  bottom-up stack operation, then proved that the integrated `main` tree was
+  byte-identical to the final reviewed PR tree.
+- The durable ledger change is to enumerate every constructor failure point
+  and every post-rename source/final probe combination for each filesystem
+  publication boundary before cleanup is authorized.
+
 ## EPIC-0004 APGAR routing integration (2026-08-04)
 
 - The six-layer split was directionally correct: source intent, wire contracts,

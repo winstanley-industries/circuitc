@@ -733,12 +733,61 @@ def _rename_noreplace(parent_fd: int, source: str, destination: str) -> None:
             0x00000001,
         )
     else:
-        raise AnalysisHostError("host has no atomic no-replace publication primitive")
+        raise OSError(errno.ENOSYS, "host has no atomic no-replace publication primitive")
     if result != 0:
         error_number = ctypes.get_errno()
-        if error_number == errno.EEXIST:
-            raise AnalysisHostError("analysis output already exists")
-        raise AnalysisHostError(f"analysis publication failed: {os.strerror(error_number)}")
+        raise OSError(error_number, os.strerror(error_number))
+
+
+_PREEXECUTION_RENAME_ERRORS = frozenset(
+    error_number
+    for error_number in (
+        errno.EINVAL,
+        errno.ENOSYS,
+        getattr(errno, "ENOTSUP", None),
+        getattr(errno, "EOPNOTSUPP", None),
+    )
+    if error_number is not None
+)
+
+
+def _probe_publication_identity(parent_fd: int, name: str) -> tuple[int, int, int, int] | OSError:
+    try:
+        return _directory_identity(os.stat(name, dir_fd=parent_fd, follow_symlinks=False))
+    except OSError as error:
+        return error
+
+
+def _probe_description(probe: tuple[int, int, int, int] | OSError) -> str:
+    if isinstance(probe, OSError):
+        return str(probe)
+    return f"identity {probe[0]}:{probe[1]}"
+
+
+def _rename_failure(error: OSError) -> AnalysisHostError:
+    if error.errno == errno.EEXIST:
+        return AnalysisHostError("analysis output already exists")
+    if error.errno in _PREEXECUTION_RENAME_ERRORS:
+        return AnalysisHostError("host has no atomic no-replace publication primitive")
+    return AnalysisHostError(f"analysis publication failed: {error}")
+
+
+def _cleanup_staged_publication(
+    parent_fd: int,
+    temporary: str,
+    root_fd: int,
+    root_identity: tuple[int, int, int, int],
+) -> None:
+    if _directory_identity(os.fstat(root_fd)) != root_identity:
+        raise AnalysisHostError("analysis publication directory was replaced")
+    named_root = os.stat(temporary, dir_fd=parent_fd, follow_symlinks=False)
+    if _directory_identity(named_root) != root_identity:
+        raise AnalysisHostError("analysis publication directory was replaced")
+    _remove_directory_contents(root_fd)
+    named_root = os.stat(temporary, dir_fd=parent_fd, follow_symlinks=False)
+    if _directory_identity(named_root) != root_identity:
+        raise AnalysisHostError("analysis publication directory was replaced")
+    os.rmdir(temporary, dir_fd=parent_fd)
 
 
 def _publish(output_root: pathlib.Path, outputs: dict[str, bytes]) -> None:
@@ -746,7 +795,7 @@ def _publish(output_root: pathlib.Path, outputs: dict[str, bytes]) -> None:
     parent_fd = _open_anchored_directory(parent, require_private_owner=True)
     parent_identity = _directory_identity(os.fstat(parent_fd))
     temporary = f".{output_root.name}.circuitc-{secrets.token_hex(12)}"
-    published = False
+    cleanup_staging = True
     root_fd: int | None = None
     root_identity: tuple[int, int, int, int] | None = None
     try:
@@ -786,22 +835,42 @@ def _publish(output_root: pathlib.Path, outputs: dict[str, bytes]) -> None:
                 raise AnalysisHostError("analysis publication directory was replaced")
         except BaseException:
             raise
-        _rename_noreplace(parent_fd, temporary, output_root.name)
-        published = True
+        try:
+            _rename_noreplace(parent_fd, temporary, output_root.name)
+        except OSError as error:
+            final_probe = _probe_publication_identity(parent_fd, output_root.name)
+            source_probe = _probe_publication_identity(parent_fd, temporary)
+            if final_probe == root_identity and isinstance(source_probe, FileNotFoundError):
+                cleanup_staging = False
+            elif source_probe == root_identity and (
+                (not isinstance(final_probe, OSError) and final_probe != root_identity)
+                or error.errno in _PREEXECUTION_RENAME_ERRORS
+            ):
+                raise _rename_failure(error) from error
+            else:
+                cleanup_staging = False
+                raise AnalysisHostError(
+                    "analysis publication visibility is indeterminate; "
+                    f"final probe: {_probe_description(final_probe)}; "
+                    f"source probe: {_probe_description(source_probe)}; rename: {error}"
+                ) from error
+        else:
+            cleanup_staging = False
         named_root = os.stat(output_root.name, dir_fd=parent_fd, follow_symlinks=False)
         if _directory_identity(named_root) != root_identity:
             raise AnalysisHostError("published analysis directory was replaced")
         os.fsync(parent_fd)
         _recheck_directory_path(parent, parent_fd, parent_identity, require_private_owner=True)
     finally:
-        if not published:
+        if cleanup_staging:
             try:
-                if root_fd is not None:
-                    _remove_directory_contents(root_fd)
-                    named_root = os.stat(temporary, dir_fd=parent_fd, follow_symlinks=False)
-                    if root_identity is None or _directory_identity(named_root) != root_identity:
-                        raise AnalysisHostError("analysis publication directory was replaced")
-                    os.rmdir(temporary, dir_fd=parent_fd)
+                if root_fd is not None and root_identity is not None:
+                    _cleanup_staged_publication(
+                        parent_fd,
+                        temporary,
+                        root_fd,
+                        root_identity,
+                    )
             except OSError:
                 pass
         if root_fd is not None:
