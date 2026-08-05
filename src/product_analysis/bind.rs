@@ -1610,6 +1610,28 @@ mod tests {
     fn receipt_tool_report_and_identity_drift_fail_closed() {
         let fixture = fixture();
         let baseline = evidence(&fixture);
+        for version in ["10.0.4", "10.0.6", "10.0.5-extra"] {
+            let mut host_version = baseline.clone();
+            host_version.host_version = version.to_owned();
+            assert_eq!(
+                bind_kicad10_board_analysis(
+                    &fixture.design,
+                    SNAPSHOT,
+                    "production",
+                    FabricationCompilerArtifacts::Static(&fixture.compiled),
+                    &fixture.product,
+                    ANALYSIS,
+                    &fixture.identity_map,
+                    &fixture.fabrication,
+                    &host_version,
+                )
+                .unwrap_err()
+                .code,
+                "CC-BOARD-ANALYSIS-HOST-001",
+                "version {version} must not weaken exact KiCad identity"
+            );
+        }
+
         let mut mutations = Vec::new();
         let mut executable = baseline.clone();
         executable.host_executable.push(b'x');
