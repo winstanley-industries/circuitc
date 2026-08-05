@@ -103,7 +103,7 @@ pub fn compile_source_checked(
         &syntax.source,
         &logical_source_name,
         &elaborated.provenance,
-        &artifacts.static_artifacts.kicad_identities,
+        &artifacts.static_artifacts().kicad_identities,
     );
     Ok(CheckedCompiledSource {
         elaborated,

@@ -66,10 +66,10 @@ fn run(arguments: Vec<OsString>) -> Result<(), u8> {
             append_static_outputs(
                 &mut outputs,
                 &compiled.elaborated.design.name,
-                &compiled.artifacts.static_artifacts,
+                compiled.artifacts.static_artifacts(),
                 &compiled.kicad_identity_map,
             );
-            if let Some(routing) = &compiled.artifacts.routing {
+            if let Some(routing) = compiled.artifacts.routing() {
                 append_routing_output_chain(
                     &mut outputs,
                     [
@@ -85,7 +85,7 @@ fn run(arguments: Vec<OsString>) -> Result<(), u8> {
                     ],
                 );
             }
-            for simulation in &compiled.artifacts.simulations {
+            for simulation in compiled.artifacts.simulations() {
                 append_simulation_output_chain(
                     &mut outputs,
                     [

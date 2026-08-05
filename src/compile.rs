@@ -4,9 +4,10 @@ use std::path::Path;
 
 use crate::design::{Design, Diagnostic};
 use crate::routing::contract::{
-    ContractDiagnostic as RouteContractDiagnostic, sha256_hex as route_sha256_hex,
+    ContractDiagnostic as RouteContractDiagnostic, parse_result as parse_route_result,
+    sha256_hex as route_sha256_hex,
 };
-use crate::routing::import::import_result;
+use crate::routing::import::{expected_cpu_tool, import_result};
 use crate::routing::lower::lower_request;
 use crate::routing::project::{
     project_imported_route, project_imported_route_with_static_artifacts,
@@ -142,9 +143,27 @@ pub struct CompiledRouting {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CheckedCompiledArtifacts {
-    pub static_artifacts: CompiledArtifacts,
-    pub routing: Option<CompiledRouting>,
-    pub simulations: Vec<CompiledSimulation>,
+    static_artifacts: CompiledArtifacts,
+    routing: Option<CompiledRouting>,
+    simulations: Vec<CompiledSimulation>,
+}
+
+impl CheckedCompiledArtifacts {
+    pub fn static_artifacts(&self) -> &CompiledArtifacts {
+        &self.static_artifacts
+    }
+
+    pub fn routing(&self) -> Option<&CompiledRouting> {
+        self.routing.as_ref()
+    }
+
+    pub fn simulations(&self) -> &[CompiledSimulation] {
+        &self.simulations
+    }
+
+    pub fn into_simulations(self) -> Vec<CompiledSimulation> {
+        self.simulations
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -242,6 +261,172 @@ fn compile_static_validated(design: &Design) -> Result<CompiledArtifacts, Compil
         spice: lowered_spice.netlist,
         spice_name_map: lowered_spice.name_map,
     })
+}
+
+fn checked_authentication_error(
+    path: impl Into<String>,
+    message: impl Into<String>,
+) -> Vec<Diagnostic> {
+    vec![Diagnostic {
+        code: "CC-CHECKED-AUTH-001",
+        path: path.into(),
+        related_path: None,
+        message: message.into(),
+    }]
+}
+
+fn authenticate_checked_simulations(
+    expected: &[SimulationInputBundle],
+    supplied: &[CompiledSimulation],
+) -> Result<(), Vec<Diagnostic>> {
+    if supplied.len() != expected.len() {
+        return Err(checked_authentication_error(
+            "checked.simulations",
+            "checked simulation evidence does not match the current Design analysis inventory",
+        ));
+    }
+    for (index, (expected, supplied)) in expected.iter().zip(supplied).enumerate() {
+        if supplied.analysis_path != expected.analysis_path
+            || supplied.netlist_path != expected.netlist_path
+            || supplied.request_path != expected.request_path
+            || supplied.map_path != expected.map_path
+            || supplied.result_path != expected.result_path
+            || supplied.report_path != expected.report_path
+            || supplied.netlist != expected.netlist
+            || supplied.request_json != expected.request_json
+            || supplied.spice_identity_map_json != expected.spice_identity_map_json
+        {
+            return Err(checked_authentication_error(
+                format!("checked.simulations[{index}]"),
+                "checked simulation inputs do not equal deterministic lowering of the current Design",
+            ));
+        }
+        let evaluation = evaluate_assertions(
+            expected.request_json.as_bytes(),
+            expected.spice_identity_map_json.as_bytes(),
+            supplied.result_json.as_bytes(),
+        )
+        .map_err(|error| {
+            checked_authentication_error(
+                format!("checked.simulations[{index}]"),
+                format!(
+                    "checked simulation result does not authenticate against the current Design: {}: {}",
+                    error.code, error.message
+                ),
+            )
+        })?;
+        if !evaluation.checked_success || supplied.report_json != evaluation.report_json {
+            return Err(checked_authentication_error(
+                format!("checked.simulations[{index}]"),
+                "checked simulation report does not equal successful authenticated reevaluation",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn authenticate_checked_compilation<'a>(
+    design: &Design,
+    checked: &'a CheckedCompiledArtifacts,
+) -> Result<&'a CompiledArtifacts, Vec<Diagnostic>> {
+    design.validate()?;
+    let expected_analysis_paths: Vec<_> = design
+        .analyses
+        .iter()
+        .map(|analysis| analysis.path.as_str())
+        .collect();
+    let supplied_analysis_paths: Vec<_> = checked
+        .simulations
+        .iter()
+        .map(|simulation| simulation.analysis_path.as_str())
+        .collect();
+    if supplied_analysis_paths != expected_analysis_paths {
+        return Err(checked_authentication_error(
+            "checked.simulations",
+            "checked simulation evidence does not match the current Design analysis inventory",
+        ));
+    }
+
+    if design.board.routing_requests.is_empty() {
+        if checked.routing.is_some() {
+            return Err(checked_authentication_error(
+                "checked.routing",
+                "checked compilation unexpectedly contains routing evidence",
+            ));
+        }
+        let expected_simulations = lower::lower_inputs(design)?;
+        authenticate_checked_simulations(&expected_simulations, &checked.simulations)?;
+        let expected = compile_static_validated(design).map_err(|error| error.diagnostics)?;
+        if checked.static_artifacts != expected {
+            return Err(checked_authentication_error(
+                "checked.static_artifacts",
+                "checked static artifacts do not equal deterministic compilation of the current Design",
+            ));
+        }
+        return Ok(&checked.static_artifacts);
+    }
+
+    let routing = checked.routing.as_ref().ok_or_else(|| {
+        checked_authentication_error(
+            "checked.routing",
+            "routed Design is missing checked routing evidence",
+        )
+    })?;
+    let current = lower_request(design)?.ok_or_else(|| {
+        checked_authentication_error(
+            "design.board.routing_requests",
+            "routed Design lost its canonical routing request",
+        )
+    })?;
+    if routing.request_path != current.request_path
+        || routing.request_identity_sha256 != current.request.request_identity_sha256
+        || routing.request_json != current.request_json
+        || routing.request_sha256 != current.request_sha256
+    {
+        return Err(checked_authentication_error(
+            "checked.routing.request",
+            "checked routing request is stale relative to the current Design",
+        ));
+    }
+    let parsed_result = parse_route_result(&routing.result_json).map_err(|error| {
+        checked_authentication_error(
+            error.path,
+            format!("checked routing result is invalid: {}", error.message),
+        )
+    })?;
+    let expected_tool = expected_cpu_tool(parsed_result.tool.executable_sha256.clone());
+    let imported = import_result(design, &current, &routing.result_json, &expected_tool)
+        .map_err(|error| checked_authentication_error(error.path, error.message))?;
+    let projected = if imported.design.analyses.is_empty() {
+        project_imported_route(&imported)
+    } else {
+        let static_artifacts =
+            compile_static_validated(&imported.design).map_err(|error| error.diagnostics)?;
+        project_imported_route_with_static_artifacts(&imported, static_artifacts)
+    }
+    .map_err(|error| checked_authentication_error(error.path, error.message))?;
+    let expected_routing = CompiledRouting {
+        request_path: imported.request_path.clone(),
+        result_path: imported.result_path.clone(),
+        projection_path: projected.projection_path.clone(),
+        request_identity_sha256: current.request.request_identity_sha256.clone(),
+        request_json: imported.request_json.clone(),
+        request_sha256: imported.request_sha256.clone(),
+        result_json: imported.result_json.clone(),
+        result_sha256: route_sha256_hex(imported.result_json.as_bytes()),
+        selected_candidate_id: imported.selected_candidate_id.clone(),
+        projection_json: projected.projection_json.clone(),
+        projection_sha256: projected.projection_sha256.clone(),
+    };
+    if *routing != expected_routing || checked.static_artifacts != projected.static_artifacts {
+        return Err(checked_authentication_error(
+            "checked.routing",
+            "checked routed artifacts do not equal deterministic replay of current Design evidence",
+        ));
+    }
+    let expected_simulations = lower::lower_inputs(&imported.design)?;
+    authenticate_checked_simulations(&expected_simulations, &checked.simulations)?;
+    Ok(&checked.static_artifacts)
 }
 
 const MAX_AGGREGATE_RESULT_BYTES: usize = MAX_CONTRACT_BYTES;
@@ -763,8 +948,9 @@ mod tests {
     use super::{
         CHECK_EXECUTION, CHECK_FAILURE, CHECK_INTERNAL, CHECK_INTERNAL_RESULT_MESSAGE,
         CHECK_RESOURCE, CHECK_RESOURCE_MESSAGE, CompiledArtifacts, SimulationInputBundle,
-        axis_kind, canonical_failure_result, compile, compile_checked, execute_checked,
-        execute_checked_with_result_limit, prepare_checked, route_sha256_hex,
+        authenticate_checked_compilation, axis_kind, canonical_failure_result, compile,
+        compile_checked, evaluate_assertions, execute_checked, execute_checked_with_result_limit,
+        prepare_checked, route_sha256_hex,
     };
 
     fn checked_dc_design(paths: &[&str], assertions: bool) -> crate::design::Design {
@@ -878,6 +1064,45 @@ mod tests {
         let second = compile_checked(&design, &root.join("second")).unwrap();
 
         assert_eq!(first, second);
+        assert_eq!(
+            authenticate_checked_compilation(&design, &first).unwrap(),
+            &first.static_artifacts
+        );
+        let mut changed_board = first.clone();
+        changed_board.static_artifacts.kicad_pcb.push('\n');
+        assert!(authenticate_checked_compilation(&design, &changed_board).is_err());
+        let mut changed_projection = first.clone();
+        changed_projection
+            .routing
+            .as_mut()
+            .unwrap()
+            .projection_json
+            .push('\n');
+        assert!(authenticate_checked_compilation(&design, &changed_projection).is_err());
+        let mut missing_routing = first.clone();
+        missing_routing.routing = None;
+        let diagnostics = authenticate_checked_compilation(&design, &missing_routing)
+            .expect_err("routed Design must require checked routing evidence");
+        assert_eq!(diagnostics[0].code, "CC-CHECKED-AUTH-001");
+        assert_eq!(diagnostics[0].path, "checked.routing");
+        assert_eq!(
+            diagnostics[0].message,
+            "routed Design is missing checked routing evidence"
+        );
+        let mut non_routed_design = design.clone();
+        non_routed_design.board.routing_requests.clear();
+        non_routed_design.canonicalize();
+        let diagnostics = authenticate_checked_compilation(&non_routed_design, &first)
+            .expect_err("static Design must reject checked routing evidence");
+        assert_eq!(diagnostics[0].code, "CC-CHECKED-AUTH-001");
+        assert_eq!(diagnostics[0].path, "checked.routing");
+        assert_eq!(
+            diagnostics[0].message,
+            "checked compilation unexpectedly contains routing evidence"
+        );
+        let mut changed_design = design.clone();
+        changed_design.board.routing_requests[0].clearance_nm += 1;
+        assert!(authenticate_checked_compilation(&changed_design, &first).is_err());
         assert_eq!(first.simulations.len(), 1);
         let routing = first.routing.as_ref().unwrap();
         assert_eq!(
@@ -896,6 +1121,19 @@ mod tests {
             first.static_artifacts.kicad_pcb.as_bytes()
         )));
         assert!(first.static_artifacts.kicad_pcb.contains("(segment"));
+
+        let mut routing_only_design = design.clone();
+        routing_only_design.analyses.clear();
+        routing_only_design.assertions.clear();
+        routing_only_design.canonicalize();
+        let routing_only =
+            compile_checked(&routing_only_design, &root.join("routing-only")).unwrap();
+        assert!(routing_only.simulations.is_empty());
+        assert!(routing_only.routing.is_some());
+        assert_eq!(
+            authenticate_checked_compilation(&routing_only_design, &routing_only).unwrap(),
+            &routing_only.static_artifacts
+        );
     }
 
     fn completed_dc_result(bundle: &SimulationInputBundle, actual: f64) -> SimulationResult {
@@ -988,11 +1226,82 @@ mod tests {
     fn checked_execution_publishes_a_fully_bound_five_file_chain() {
         let design = checked_dc_design(&["simulation.dc"], true);
         let (static_artifacts, bundles) = prepare_checked(&design).unwrap();
+        let bundle = bundles[0].clone();
         let checked = execute_checked(static_artifacts, bundles, |bundle| {
             Ok(completed_dc_result(bundle, 5.0))
         })
         .unwrap();
 
+        assert_eq!(
+            authenticate_checked_compilation(&design, &checked).unwrap(),
+            &checked.static_artifacts
+        );
+        let mut changed_board = checked.clone();
+        changed_board.static_artifacts.kicad_pcb.push('\n');
+        assert!(authenticate_checked_compilation(&design, &changed_board).is_err());
+        let mut changed_inventory = checked.clone();
+        changed_inventory.simulations[0].analysis_path = "simulation.stale".to_owned();
+        let diagnostics = authenticate_checked_compilation(&design, &changed_inventory)
+            .expect_err("stale checked simulation inventory must fail closed");
+        assert_eq!(diagnostics[0].code, "CC-CHECKED-AUTH-001");
+        assert_eq!(diagnostics[0].path, "checked.simulations");
+        assert_eq!(
+            diagnostics[0].message,
+            "checked simulation evidence does not match the current Design analysis inventory"
+        );
+        let mut changed_intent = design.clone();
+        changed_intent.assertions[0].expected = Quantity::new(6, 0, Unit::Volt);
+        changed_intent.canonicalize();
+        let diagnostics = authenticate_checked_compilation(&changed_intent, &checked)
+            .expect_err("same-path simulation semantic drift must fail closed");
+        assert_eq!(diagnostics[0].code, "CC-CHECKED-AUTH-001");
+        assert_eq!(diagnostics[0].path, "checked.simulations[0]");
+        assert_eq!(
+            diagnostics[0].message,
+            "checked simulation inputs do not equal deterministic lowering of the current Design"
+        );
+        let mut malformed_result = checked.clone();
+        malformed_result.simulations[0].result_json.push('x');
+        let diagnostics = authenticate_checked_compilation(&design, &malformed_result)
+            .expect_err("malformed checked result bytes must fail closed");
+        assert_eq!(diagnostics[0].code, "CC-CHECKED-AUTH-001");
+        assert_eq!(diagnostics[0].path, "checked.simulations[0]");
+
+        let (_, failed_result_json) = canonical_failure_result(
+            &bundle,
+            "CC-SIM-EXECUTION-TEST",
+            "deterministic injected execution failure",
+        )
+        .unwrap();
+        let failed_evaluation = evaluate_assertions(
+            bundle.request_json.as_bytes(),
+            bundle.spice_identity_map_json.as_bytes(),
+            failed_result_json.as_bytes(),
+        )
+        .unwrap();
+        assert!(!failed_evaluation.checked_success);
+        let mut unsuccessful = checked.clone();
+        unsuccessful.simulations[0].result_json = failed_result_json;
+        unsuccessful.simulations[0].report_json = failed_evaluation.report_json;
+        let diagnostics = authenticate_checked_compilation(&design, &unsuccessful)
+            .expect_err("authenticated unsuccessful checked evidence must fail closed");
+        assert_eq!(diagnostics[0].code, "CC-CHECKED-AUTH-001");
+        assert_eq!(diagnostics[0].path, "checked.simulations[0]");
+        assert_eq!(
+            diagnostics[0].message,
+            "checked simulation report does not equal successful authenticated reevaluation"
+        );
+
+        let mut changed_report = checked.clone();
+        changed_report.simulations[0].report_json.push('\n');
+        let diagnostics = authenticate_checked_compilation(&design, &changed_report)
+            .expect_err("checked report byte drift must fail closed");
+        assert_eq!(diagnostics[0].code, "CC-CHECKED-AUTH-001");
+        assert_eq!(diagnostics[0].path, "checked.simulations[0]");
+        assert_eq!(
+            diagnostics[0].message,
+            "checked simulation report does not equal successful authenticated reevaluation"
+        );
         assert_eq!(checked.simulations.len(), 1);
         let simulation = &checked.simulations[0];
         let directory = simulation

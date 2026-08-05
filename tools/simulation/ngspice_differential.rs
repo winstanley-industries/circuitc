@@ -330,7 +330,7 @@ fn compile_fixture(fixture: &Path, scratch: &Path) -> Result<Vec<CompiledSimulat
     create_private_directory(&work_root)?;
     let checked = compile_source_checked("ngspice_differential.circuitc", source, &work_root)
         .map_err(|_| "the checked CircuitC fixture did not compile successfully".to_owned())?;
-    Ok(checked.artifacts.simulations)
+    Ok(checked.artifacts.into_simulations())
 }
 
 fn compare_simulations(

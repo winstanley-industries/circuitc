@@ -154,6 +154,44 @@ Layer 3 leaves Design IR v1 unchanged and claims no KiCad or manufacturing-host
 authority. Fabrication output, host analysis evidence, release-manifest
 closure, and publication remain later layers.
 
+## Layer 4: deterministic KiCad fabrication evidence
+
+[ADR-0011](../adr/0011-deterministic-kicad-fabrication-evidence.md), the
+[`circuitc.fabrication_request` v1 schema](../../schemas/fabrication_request/v1.md),
+and the
+[`circuitc.fabrication_manifest` v1 schema](../../schemas/fabrication_manifest/v1.md)
+define the first fabrication-host boundary:
+
+- one request binds exact Design/analysis/assertion/variant identity, verified
+  Layer-3 product roots, exact generated PCB bytes, a fixed KiCad 10.0.5 export
+  profile, and an exact 13-file native inventory under a digest-derived safe
+  path;
+- static compiler artifacts are independently reproduced, simulation-bearing
+  checked boards are independently lowered, and routed checked boards are
+  deterministically replayed from current Design plus opaque route evidence;
+- KiCad exports nine Gerber X2 manufacturing layers plus its job file, separate
+  PTH and NPTH Excellon files, and one both-side all-footprint position CSV;
+- Design IR v1 has no hole construct, so v1 requires explicit zero-tool,
+  zero-hit PTH and NPTH files and fails on nonzero drill output;
+- the strict parser proves Gerber/job file-function parity, host/project
+  identity, Excellon policy, and full physical-reference/coordinate/side/
+  rotation equality with Design; product population remains Layer-3 authority,
+  so not-fitted footprints may appear only as full-board parity rows;
+- KiCad 10.0.5 embeds wall-clock creation fields despite
+  `SOURCE_DATE_EPOCH`; CircuitC validates and rewrites only those exact fields
+  to the authenticated catalog evaluation date at midnight, keeps raw host
+  files transient, and binds every normalized byte; and
+- a private no-follow host snapshot and exact explicit inventory prevent source
+  replacement, symlink substitution, user configuration, or directory scans
+  from defining accepted outputs; the validated request drives the host,
+  executable identity is computed from exact bytes, raw publication is one
+  atomic no-replace rename, and the transient request/board/executable/output
+  receipt and held no-follow directory namespace are rechecked before the
+  verified manifest is emitted.
+
+Layer 4 does not evaluate ERC, DRC, unconnected, or schematic-parity assertions
+and does not close or publish a release. Those remain later layers.
+
 ## Non-goals
 
 - Operating a live procurement marketplace.

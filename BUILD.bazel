@@ -324,10 +324,27 @@ rust_binary(
     deps = [":circuitc"],
 )
 
+rust_binary(
+    name = "fabrication_gate",
+    testonly = True,
+    srcs = ["tools/manufacturing/fabrication_gate.rs"],
+    crate_name = "fabrication_gate",
+    edition = "2024",
+    rustc_flags = RUSTC_FLAGS,
+    deps = [
+        ":circuitc",
+        "@crates//libc",
+        "@crates//serde",
+        "@crates//serde_json",
+        "@crates//sha2",
+    ],
+)
+
 rustfmt_test(
     name = "rustfmt_test",
     targets = [
         ":circuitc",
+        ":fabrication_gate",
         ":frontend_equivalence",
         ":ngspice_differential_fake",
         ":ngspice_differential_gate",
@@ -347,6 +364,7 @@ rust_clippy(
     deps = [
         ":apgar_route_provenance_writer",
         ":circuitc",
+        ":fabrication_gate",
         ":frontend_equivalence",
         ":ngspice_differential_fake",
         ":ngspice_differential_gate",
@@ -479,5 +497,61 @@ sh_test(
     tags = [
         "local",
         "manual",
+    ],
+)
+
+sh_test(
+    name = "kicad10_manufacturing_test",
+    srcs = ["tools/manufacturing/kicad10_manufacturing_test.sh"],
+    args = [
+        "$(location //cmd/circuitc)",
+        "$(location tools/manufacturing/run_kicad_fabrication.py)",
+        "$(location :fabrication_gate)",
+        "$(location examples/voltage_divider.circuitc)",
+        "$(location catalogs/reference-catalog.json)",
+    ],
+    data = [
+        "catalogs/reference-catalog.json",
+        "examples/voltage_divider.circuitc",
+        "tools/manufacturing/run_kicad_fabrication.py",
+        ":fabrication_gate",
+        "//cmd/circuitc",
+    ],
+    tags = [
+        "local",
+        "manual",
+    ],
+)
+
+sh_test(
+    name = "kicad_fabrication_runner_test",
+    srcs = ["tools/manufacturing/run_kicad_fabrication_test.sh"],
+    args = [
+        "$(location tools/manufacturing/run_kicad_fabrication.py)",
+        "$(location tools/manufacturing/fixtures/fake_kicad_mutate.py)",
+        "$(location tools/manufacturing/fixtures/fake_kicad_wrong_version.py)",
+        "$(location tools/manufacturing/fixtures/fake_kicad_stdout_exact.py)",
+        "$(location tools/manufacturing/fixtures/fake_kicad_stdout_over.py)",
+        "$(location //cmd/circuitc)",
+        "$(location :fabrication_gate)",
+        "$(location examples/voltage_divider.circuitc)",
+        "$(location catalogs/reference-catalog.json)",
+        "$(location tools/simulation/fixtures/checked_voltage_divider.circuitc)",
+        "$(location tools/routing/fixtures/routed_voltage_divider.circuitc)",
+        "$(location tools/manufacturing/fixtures/create_valid_raw_fabrication.py)",
+    ],
+    data = [
+        "catalogs/reference-catalog.json",
+        "examples/voltage_divider.circuitc",
+        "tools/manufacturing/fixtures/create_valid_raw_fabrication.py",
+        "tools/manufacturing/fixtures/fake_kicad_mutate.py",
+        "tools/manufacturing/fixtures/fake_kicad_stdout_exact.py",
+        "tools/manufacturing/fixtures/fake_kicad_stdout_over.py",
+        "tools/manufacturing/fixtures/fake_kicad_wrong_version.py",
+        "tools/manufacturing/run_kicad_fabrication.py",
+        "tools/routing/fixtures/routed_voltage_divider.circuitc",
+        "tools/simulation/fixtures/checked_voltage_divider.circuitc",
+        ":fabrication_gate",
+        "//cmd/circuitc",
     ],
 )
