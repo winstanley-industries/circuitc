@@ -1877,6 +1877,18 @@ mod tests {
                 bind_release(&stale_tool_inputs).unwrap_err().code,
                 "CC-RELEASE-TOOL-001"
             );
+            for retained_digest in [None, Some("0".repeat(64))] {
+                let mut substituted_checked = (*checked).clone();
+                substituted_checked.simulations_mut()[0].tool_executable_sha256 = retained_digest;
+                let substituted_tool_inputs = ReleaseInputs {
+                    compiler: FabricationCompilerArtifacts::Checked(&substituted_checked),
+                    ..inputs
+                };
+                assert_eq!(
+                    bind_release(&substituted_tool_inputs).unwrap_err().code,
+                    "CC-RELEASE-TOOL-001"
+                );
+            }
             let missing_tool_inputs = ReleaseInputs {
                 tools: ReleaseToolchainEvidence {
                     ohmnivore_executable: None,
