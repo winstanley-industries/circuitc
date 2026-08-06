@@ -91,6 +91,12 @@ cannot represent; it may not silently discard or reinterpret them.
     of the immutable root. The destination's effective-UID owner is this
     boundary's security authority; isolation from malicious code with that
     same UID requires a separate account or operating-system sandbox.
+13. A checksum-pinned third-party hardware design may serve as a qualification
+    oracle for a CircuitC-authored reference product. Its license, provenance,
+    and exact source bytes define the claimed comparison surface, but it is not
+    compiler input or a second source of truth. CircuitC source owns the
+    transcribed design; intentional deviations must be explicit, and generated
+    output must be accepted by CircuitC's normal backend and host authorities.
 
 Edits made only to generated KiCad files are not round-tripped. Code-authored
 placement and routing belong in CircuitC source. A future importer may help
@@ -424,6 +430,21 @@ silently redefine them.
 - an initial capability-declared KiCad 10 manufacturability analysis; and
 - reproducible release manifests tying every artifact to source and toolchain
   identities.
+
+### M5: open reference-product qualification
+
+- one checksum-pinned, attributed open-hardware design as a bounded functional
+  and mechanical qualification oracle;
+- general physical components with arbitrary pin cardinality, exact optional
+  values, explicit symbols and footprints, and a distinction between procured
+  parts and non-procured fabricated board features;
+- a reviewed multi-part vendored catalog and offline product snapshot covering
+  the selected reference product;
+- exact two-layer physical intent including surface-mount and plated-through
+  pads, vias, and copper zones; and
+- a deterministic KiCad 10 project, product bundle, nonempty drill evidence,
+  board-analysis report, and immutable release that satisfy the reference
+  contract and supported-host gates.
 
 ## 10. Immediate non-goals
 

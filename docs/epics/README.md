@@ -15,6 +15,7 @@ lists or implementation assignments.
 | [EPIC-0003](EPIC-0003-simulation-closure.md) | Complete | M2 | Simulation models, analyses, and assertions as checked compiler phases |
 | [EPIC-0004](EPIC-0004-apgar-routing-integration.md) | Complete | M3 | APGAR route generation imported with exact validation and provenance |
 | [EPIC-0005](EPIC-0005-product-and-manufacturing.md) | Complete | M4 | Reproducible product, BOM, fabrication, assembly, and release outputs |
+| [EPIC-0006](EPIC-0006-hx711-reference-product.md) | Planned | M5 | SparkFun HX711 reference board reproduced as a verified CircuitC product release |
 
 ## Document authority
 
